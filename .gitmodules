@@ -1,0 +1,5 @@
+[submodule "libs/JUCE"]
+	path = libs/JUCE
+	url = https://github.com/juce-framework/JUCE.git
+	branch = 9.0.2
+	shallow = true
