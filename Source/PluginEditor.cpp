@@ -27,12 +27,22 @@ void MidiDelayEditor::paint (juce::Graphics& g)
     g.drawText ("MIDI Delay", getLocalBounds().removeFromTop (90),
                 juce::Justification::centredBottom, false);
 
+    // Текст интерфейса — только ASCII: juce::String трактует обычный литерал
+    // как ASCII, и любая кириллица превращается в мусор. См. CLAUDE.md.
     const auto count = juce::jmax (0, lastCount);
+    auto area = getLocalBounds().withTrimmedTop (95);
 
     g.setColour (count > 0 ? juce::Colours::limegreen : juce::Colours::grey);
-    g.setFont (juce::FontOptions (14.0f));
-    g.drawText (count > 0 ? "MIDI доходит — нот принято: " + juce::String (count)
-                          : "MIDI не приходит",
-                getLocalBounds().withTrimmedTop (95),
-                juce::Justification::centredTop, false);
+    g.setFont (juce::FontOptions (15.0f));
+    g.drawText (count > 0 ? "MIDI OK - notes received: " + juce::String (count)
+                          : "No MIDI input",
+                area.removeFromTop (24), juce::Justification::centredTop, false);
+
+    if (count == 0)
+    {
+        g.setColour (juce::Colours::grey.withAlpha (0.7f));
+        g.setFont (juce::FontOptions (12.0f));
+        g.drawText ("Set the same MIDI port in MIDI Out and in the wrapper settings",
+                    area.removeFromTop (20), juce::Justification::centredTop, false);
+    }
 }
