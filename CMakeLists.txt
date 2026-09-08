@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.22)
+project(MidiDelay VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Universal binary на macOS: плагин должен грузиться и в arm64-, и в x86_64-хостах.
+if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
+    set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
+endif()
+
+add_subdirectory(libs/JUCE)
+
+juce_add_plugin(MidiDelay
+    COMPANY_NAME            "mke"
+    PLUGIN_MANUFACTURER_CODE Mkev
+    PLUGIN_CODE             Mdly
+    PRODUCT_NAME            "MIDI Delay"
+    FORMATS                 VST3 AU Standalone
+
+    IS_SYNTH                FALSE
+    IS_MIDI_EFFECT          FALSE
+    # Без этого FL Studio не покажет у плагина MIDI-вход, и вся идея не заработает.
+    NEEDS_MIDI_INPUT        TRUE
+    NEEDS_MIDI_OUTPUT       FALSE
+
+    COPY_PLUGIN_AFTER_BUILD TRUE
+    VST3_CATEGORIES         "Fx" "Delay"
+    # aumf, а не aufx: AU-эффект, принимающий MIDI. С aufx Logic не даст роутить MIDI
+    # на плагин, и auval ругается. Для VST3 разницы нет, для AU — принципиально.
+    AU_MAIN_TYPE            kAudioUnitType_MusicEffect)
+
+target_sources(MidiDelay PRIVATE
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp)
+
+target_compile_definitions(MidiDelay PUBLIC
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_VST3_CAN_REPLACE_VST2=0
+    JUCE_DISPLAY_SPLASH_SCREEN=0)
+
+target_link_libraries(MidiDelay PRIVATE
+    juce::juce_audio_utils
+    PUBLIC
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_lto_flags
+    juce::juce_recommended_warning_flags)

@@ -1,0 +1,25 @@
+# Сборка
+build/
+cmake-build-*/
+*.o
+*.a
+*.dylib
+
+# Артефакты плагина
+*.vst3
+*.component
+*.app
+
+# macOS
+.DS_Store
+*.dSYM/
+
+# IDE
+.vscode/
+.idea/
+*.xcodeproj/
+*.xcworkspace/
+
+# Разное
+.remember/
+compile_commands.json

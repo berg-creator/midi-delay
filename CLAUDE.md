@@ -37,12 +37,18 @@
   Подробности: [docs/ANALYSIS.md](docs/ANALYSIS.md) §5.
 - Кроссфейды — **equal-power**, не линейные.
 - `NEEDS_MIDI_INPUT TRUE` в CMake — без него FL Studio не покажет MIDI-вход.
+- `AU_MAIN_TYPE kAudioUnitType_MusicEffect` — AU-эффект с MIDI-входом это `aumf`, не `aufx`.
 - Каждая нетривиальная DSP-единица оставляет один запускаемый офлайн-тест. Без фреймворков.
 
 ## Среда разработки
-macOS 26, arm64, clang 21, cmake 4.4, gh 2.96.
-**Полного Xcode нет — только Command Line Tools.** Это может помешать AU-таргету,
-подписи и нотаризации (задачи #2 и #33). Проверять, а не предполагать.
+macOS 26, arm64, clang 21, cmake 4.4, ninja, gh 2.96. JUCE 9.0.2 в `libs/JUCE`.
+**Полного Xcode нет — только Command Line Tools.** Проверено: VST3, AU и Standalone
+собираются, universal binary собирается, `auval` проходит. Под вопросом осталась только
+подпись Developer ID и нотаризация — задача #33.
+
+Сборка: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build`.
+Плагины копируются в `~/Library/Audio/Plug-Ins/` автоматически.
+Валидация AU: `auval -v aumf Mdly Mkev`.
 
 ## Стиль
 Ponytail: самое простое решение, которое действительно работает. Не строить абстракций
