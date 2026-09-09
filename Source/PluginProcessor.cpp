@@ -315,9 +315,14 @@ void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
     {
         midiNoteCount.fetch_add (1, std::memory_order_relaxed);
 
+        const int note = message.getNoteNumber();
+        const float ratio = ratioForNote (note);
+
+        lastNote.store (note, std::memory_order_relaxed);
+        lastRatio.store (ratio, std::memory_order_relaxed);
+
         // Пан по голосам — #23, поэтому все в центре.
-        voiceManager.noteOn (message.getNoteNumber(), message.getFloatVelocity(),
-                             ratioForNote (message.getNoteNumber()), 0.0f);
+        voiceManager.noteOn (note, message.getFloatVelocity(), ratio, 0.0f);
     }
     else if (message.isNoteOff())
     {

@@ -52,6 +52,11 @@ public:
         отсюда atomic. Нужно, чтобы сразу видеть, доехал ли MIDI из хоста. */
     std::atomic<int> midiNoteCount { 0 };
 
+    /** Последняя принятая нота и посчитанный для неё ratio. Только для окна плагина:
+        по ним видно, что маппинг #15 сработал, не подключая отладчик к хосту. */
+    std::atomic<int> lastNote { -1 };
+    std::atomic<float> lastRatio { 1.0f };
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 

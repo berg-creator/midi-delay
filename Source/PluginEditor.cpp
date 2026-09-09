@@ -10,10 +10,12 @@ MidiDelayEditor::MidiDelayEditor (MidiDelayProcessor& p)
 void MidiDelayEditor::timerCallback()
 {
     const auto count = proc.midiNoteCount.load (std::memory_order_relaxed);
+    const auto note  = proc.lastNote.load (std::memory_order_relaxed);
 
-    if (count != lastCount)
+    if (count != lastCount || note != shownNote)
     {
         lastCount = count;
+        shownNote = note;
         repaint();
     }
 }
@@ -43,6 +45,27 @@ void MidiDelayEditor::paint (juce::Graphics& g)
         g.setColour (juce::Colours::grey.withAlpha (0.7f));
         g.setFont (juce::FontOptions (12.0f));
         g.drawText ("Set the same MIDI port in MIDI Out and in the wrapper settings",
+                    area.removeFromTop (20), juce::Justification::centredTop, false);
+        return;
+    }
+
+    // Последняя нота и её ratio: видно, что транспонирование посчиталось и каким.
+    // Ratio 1.00 на ноте, равной Root Key, — это норма, а не отсутствие эффекта.
+    const auto note = juce::jmax (-1, shownNote);
+
+    if (note >= 0)
+    {
+        const auto ratio = proc.lastRatio.load (std::memory_order_relaxed);
+        const auto semitones = juce::roundToInt (12.0f * std::log2 (ratio));
+
+        g.setColour (juce::Colours::white.withAlpha (0.8f));
+        g.setFont (juce::FontOptions (12.0f));
+        g.drawText ("Last note " + juce::String (note)
+                        // Октава по-фловски: в FL Studio средняя до — C5, а не C3,
+                        // и имя из другой конвенции сбивало бы с толку сильнее, чем помогало.
+                        + " (" + juce::MidiMessage::getMidiNoteName (note, true, true, 5) + ")"
+                        + "   ratio " + juce::String (ratio, 3)
+                        + "   " + (semitones >= 0 ? "+" : "") + juce::String (semitones) + " st",
                     area.removeFromTop (20), juce::Justification::centredTop, false);
     }
 }
