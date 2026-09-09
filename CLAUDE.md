@@ -9,6 +9,7 @@
 под приходящие MIDI-ноты. Целевая DAW — FL Studio.
 Полный разбор: [docs/ANALYSIS.md](docs/ANALYSIS.md). План: [docs/ROADMAP.md](docs/ROADMAP.md).
 Задачи: [docs/ISSUES.md](docs/ISSUES.md).
+Зачем он и куда растёт: [docs/VISION.md](docs/VISION.md). Продаём ли: [docs/STRATEGY.md](docs/STRATEGY.md).
 Зачем это делается и что считается успехом: [docs/STRATEGY.md](docs/STRATEGY.md) —
 плагин выходит бесплатно, деньги со второго. Не переспрашивать, не переизобретать.
 
