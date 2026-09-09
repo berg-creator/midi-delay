@@ -38,6 +38,7 @@ juce_add_plugin(MidiDelay
 target_sources(MidiDelay PRIVATE
     Source/PluginProcessor.cpp
     Source/DSP/DelayBuffer.cpp
+    Source/DSP/PitchShifter.cpp
     Source/DSP/Voice.cpp
     Source/DSP/VoiceManager.cpp
     Source/PluginEditor.cpp)
@@ -66,6 +67,7 @@ target_sources(ProcessorTest PRIVATE
     Source/PluginProcessor.cpp
     Source/PluginEditor.cpp
     Source/DSP/DelayBuffer.cpp
+    Source/DSP/PitchShifter.cpp
     Source/DSP/Voice.cpp
     Source/DSP/VoiceManager.cpp
     Source/test_processor.cpp)

@@ -73,6 +73,10 @@ private:
     int note = -1;
     unsigned age = 0;
     bool sustained = false;
+
+    // Питчер держит своё окно истории, и после reset оно пустое. Без заливки голос
+    // молчал бы первые getLatencySamples() сэмплов — 30 мс дырки на каждой ноте.
+    bool needsPrime = false;
     float gain[2] { 1.0f, 1.0f };
 
     // Нота, ждущая конца fade-out внутри этого же голоса. Очередь на один элемент.

@@ -5,8 +5,9 @@
 #include "DSP/VoiceManager.h"
 
 /** MIDI-Driven Pitch Delay. Хвост существует только пока звучит MIDI-нота: wet
-    собирается из голосов, а не из постоянного отвода. На вехе M2 голоса сидят
-    на заглушке UnityShifter и звучат в исходной высоте — транспонирование это #14/#15. */
+    собирается из голосов, а не из постоянного отвода. Каждый голос транспонирует
+    свой хвост под нажатую ноту (#14, #15): ratio считается от Root Key в момент
+    note on и живёт в голосе до конца ноты. */
 class MidiDelayProcessor final : public juce::AudioProcessor
 {
 public:
@@ -63,6 +64,15 @@ private:
     /** Ноты, педаль и all-notes-off. Всё незнакомое молча мимо. */
     void handleMidiMessage (const juce::MidiMessage& message);
 
+    /** Транспонирование хвоста для ноты (#15): 2^((note - root) / 12) с клампом
+        по Pitch Range. Считается один раз в момент note on и живёт в голосе до
+        конца ноты — смена Root Key на лету не трогает уже звучащие голоса. */
+    float ratioForNote (int midiNote) const;
+
+    /** Октава опорной ноты. Параметр Root Key задаёт только класс высоты (C..B),
+        и без фиксированной октавы вычитать было бы не из чего. C3 = MIDI 60. */
+    static constexpr int rootOctaveBase = 60;
+
     /** Запас кольца: максимальный delay time MVP (2 с) плюс место под латентность
         питчера и под длину хвоста. 4 с при 96 кГц — ~4 МБ на два канала. */
     static constexpr double maxDelaySeconds = 4.0;
@@ -106,6 +116,8 @@ private:
     std::atomic<float>* pAttack     = nullptr;
     std::atomic<float>* pRelease    = nullptr;
     std::atomic<float>* pVoices     = nullptr;
+    std::atomic<float>* pRootKey    = nullptr;
+    std::atomic<float>* pPitchRange = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 

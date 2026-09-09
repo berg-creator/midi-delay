@@ -10,6 +10,15 @@ namespace
         на низах, длиннее слышно как проглоченную ноту. */
     constexpr double stealFadeMs = 5.0;
 
+    /** Окно varispeed, оно же удвоенная латентность движка. Середина рекомендованного
+        ANALYSIS §5 диапазона 50-80 мс. Константа, а не параметр: латентность обязана
+        быть неизменной между вызовами prepare (ADR 0002), а окно её и задаёт. */
+    constexpr double pitchWindowMs = 60.0;
+
+    /** Заливка окна питчера идёт порциями через стек: одна виртуальная process()
+        на сэмпл обошлась бы в полторы тысячи вызовов на каждую ноту. */
+    constexpr int primeChunk = 64;
+
     constexpr float pi = 3.14159265358979323846f;
     constexpr float sqrt2 = 1.41421356237309504880f;
 }
@@ -18,8 +27,9 @@ void Voice::prepare (double sampleRate, int maxBlockSamples)
 {
     const double sr = sampleRate > 0.0 ? sampleRate : 44100.0;
 
-    // Единственная строка, которую поменяет #14: обвязка голоса от движка не зависит.
-    shifter = std::make_unique<UnityShifter>();
+    // Обвязка голоса от движка не зависит: UnityShifter остаётся эталоном в тестах,
+    // на нём голос обязан быть бит-в-бит равен обычному дилею.
+    shifter = std::make_unique<VarispeedShifter> (pitchWindowMs);
     shifter->prepare (sr, std::max (1, maxBlockSamples));
 
     stealSamples = std::max (1.0, sr * stealFadeMs * 0.001);
@@ -36,6 +46,7 @@ void Voice::reset()
     note = -1;
     pendingNote = -1;
     sustained = false;
+    needsPrime = false;
 
     if (shifter != nullptr)
         shifter->reset();
@@ -52,7 +63,8 @@ void Voice::setDelaySamples (double newDelaySamples)
     delaySamples = newDelaySamples;
 
     // Латентность питчера прячется в delay time, а не репортится хосту (ANALYSIS §5).
-    // У UnityShifter она нулевая, так что сейчас это тождество — но #17 получает её даром.
+    // Кламп нулём — не защита, а граница: при delay time меньше латентности движка
+    // хвост придёт позже заказанного. Нижний предел на параметр — задача #17.
     const double latency = shifter != nullptr ? shifter->getLatencySamples() : 0;
     readOffset = std::max (0.0, newDelaySamples - latency);
 }
@@ -85,6 +97,9 @@ void Voice::noteOn (int midiNote, float velocity, float ratio, double newDelaySa
 
     if (shifter != nullptr)
         shifter->reset();
+
+    // Окно питчера сейчас пустое, залить его нечем: источник знает только addTo.
+    needsPrime = true;
 
     start (midiNote, velocity, ratio, pan);
 }
@@ -140,8 +155,10 @@ float Voice::nextEnvelope()
                 if (stage == Stage::stealing && pendingNote >= 0)
                 {
                     // Голос перезапускается сам, посреди сегмента. Питчер при этом не
-                    // сбрасывается: огибающая здесь ровно ноль, разрыва не слышно,
-                    // а ratio доедет к следующему сегменту.
+                    // сбрасывается, и с varispeed это уже не удобство, а необходимость:
+                    // его окно хранит валидную историю по тому же readOffset, а сброс
+                    // открыл бы 30 мс тишины, залить которые отсюда нечем — источника
+                    // здесь нет. Огибающая тут ровно ноль, ratio доедет к сегменту.
                     setDelaySamples (delaySamples);
                     start (pendingNote, pendingVelocity, pendingRatio, pendingPan);
                 }
@@ -172,16 +189,39 @@ void Voice::addTo (float* const* out, int numOutChannels, int startSample, int n
     const float sourceScale = numSourceChannels > 0 ? 1.0f / static_cast<float> (numSourceChannels) : 0.0f;
 
     // Голос читает моно-сумму: питчер у него один, стерео он делает паном (ADR 0001).
-    for (int k = 0; k < numSamples; ++k)
+    const auto readMono = [&source, numSourceChannels, sourceScale] (double d)
     {
-        const double d = readOffset + static_cast<double> (numSamples - k);
         float s = 0.0f;
 
         for (int ch = 0; ch < numSourceChannels; ++ch)
             s += source.read (ch, d);
 
-        scratchIn[k] = s * sourceScale;
+        return s * sourceScale;
+    };
+
+    // Заливка окна питчера историей, которая предшествует первому сэмплу сегмента.
+    // Без неё нота открывалась бы тишиной длиной в латентность движка — 30 мс.
+    // Выход выбрасывается: он и есть та самая тишина.
+    if (needsPrime)
+    {
+        float primeIn[primeChunk], primeOut[primeChunk];
+
+        for (int j = shifter->getLatencySamples(); j > 0; )
+        {
+            const int n = std::min (j, primeChunk);
+
+            for (int k = 0; k < n; ++k)
+                primeIn[k] = readMono (readOffset + static_cast<double> (numSamples + j - k));
+
+            shifter->process (primeIn, primeOut, n);
+            j -= n;
+        }
+
+        needsPrime = false;
     }
+
+    for (int k = 0; k < numSamples; ++k)
+        scratchIn[k] = readMono (readOffset + static_cast<double> (numSamples - k));
 
     shifter->process (scratchIn, scratchOut, numSamples);
 

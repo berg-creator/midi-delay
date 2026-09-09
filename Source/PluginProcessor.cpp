@@ -15,6 +15,8 @@ MidiDelayProcessor::MidiDelayProcessor()
     pAttack     = apvts.getRawParameterValue ("attack");
     pRelease    = apvts.getRawParameterValue ("release");
     pVoices     = apvts.getRawParameterValue ("voices");
+    pRootKey    = apvts.getRawParameterValue ("rootKey");
+    pPitchRange = apvts.getRawParameterValue ("pitchRange");
     bypassParam = apvts.getParameter ("bypass");
 }
 
@@ -288,6 +290,23 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
                           startSample, numSamples, delayBuffer);
 }
 
+float MidiDelayProcessor::ratioForNote (int midiNote) const
+{
+    // Root Key задан классом высоты без октавы, октава зафиксирована на C3 = MIDI 60.
+    // Альтернатива — считать ближайшее расстояние к нажатой ноте, но тогда нота на
+    // октаву выше Root дала бы ratio 1.0, то есть ровно ничего: критерий приёмки #15
+    // требует обратного. Фиксированная октава — единственный вариант, где октава слышна.
+    const int rootNote = rootOctaveBase + static_cast<int> (pRootKey->load (std::memory_order_relaxed));
+    const int range    = static_cast<int> (pPitchRange->load (std::memory_order_relaxed));
+
+    // За границей Pitch Range — clamp, а не перенос октавами внутрь диапазона. Перенос
+    // сохранил бы интервалы, но соседние клавиши разъезжались бы на октаву, и на слух
+    // это читается как сбой, а не как настройка. Clamp просто упирается в потолок.
+    const int semitones = juce::jlimit (-range, range, midiNote - rootNote);
+
+    return std::exp2 (static_cast<float> (semitones) / 12.0f);
+}
+
 void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
 {
     // isNoteOn() по умолчанию не считает нотой velocity 0, а isNoteOff() — считает.
@@ -296,9 +315,9 @@ void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
     {
         midiNoteCount.fetch_add (1, std::memory_order_relaxed);
 
-        // #15: ratio считается из ноты и root key. Пока хвост звучит в исходной высоте.
         // Пан по голосам — #23, поэтому все в центре.
-        voiceManager.noteOn (message.getNoteNumber(), message.getFloatVelocity(), 1.0f, 0.0f);
+        voiceManager.noteOn (message.getNoteNumber(), message.getFloatVelocity(),
+                             ratioForNote (message.getNoteNumber()), 0.0f);
     }
     else if (message.isNoteOff())
     {

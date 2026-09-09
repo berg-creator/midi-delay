@@ -1,6 +1,6 @@
-// Офлайн-тест процессора (#9-#13): ноль аллокаций в аудиопотоке, точность смещения
-// дилея, смена sample rate, раскладки шин, живучесть состояния, sample-accurate MIDI
-// и пул голосов. Без фреймворков.
+// Офлайн-тест процессора (#9-#15): ноль аллокаций в аудиопотоке, точность смещения
+// дилея, смена sample rate, раскладки шин, живучесть состояния, sample-accurate MIDI,
+// пул голосов и маппинг ноты в pitch ratio. Без фреймворков.
 // Собирается и запускается так (в CI намеренно не собирается, см. CMakeLists.txt):
 //   cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Release/ProcessorTest
 
@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <thread>
 #include <vector>
 
 // Не assert: сборка Release определяет NDEBUG, и assert превратился бы в пустоту —
@@ -21,12 +22,19 @@
 
 // Счётчик аллокаций включается только вокруг processBlock: JUCE снаружи выделяет
 // память постоянно, и это нормально. Проверка должна быть измерением, а не обещанием.
+//
+// Фильтр по потоку обязателен. JUCE держит живой message thread, тот изредка выделяет
+// свои 16 байт, и без фильтра они попадали в счётчик просто по совпадению во времени:
+// проверка краснела примерно на трети прогонов и указывала каждый раз на разную строку.
+// Ловили не плагин, а соседний поток. Пишется id один раз в начале main, дальше только
+// читается, поэтому гонки нет.
 static std::atomic<bool> counting { false };
 static std::atomic<long> allocations { 0 };
+static std::thread::id countedThread;
 
 void* operator new (std::size_t n)
 {
-    if (counting.load (std::memory_order_relaxed))
+    if (counting.load (std::memory_order_relaxed) && std::this_thread::get_id() == countedThread)
         allocations.fetch_add (1, std::memory_order_relaxed);
 
     return std::malloc (n);
@@ -63,6 +71,37 @@ namespace
         return midi;
     }
 
+    /** Амплитуда синусоиды частоты f: ДПФ в одной точке, без БПФ и без окна. */
+    double amplitudeAt (const juce::AudioBuffer<float>& x, int from, int count, double f, double sr)
+    {
+        double re = 0.0, im = 0.0;
+
+        for (int i = 0; i < count; ++i)
+        {
+            const double a = -juce::MathConstants<double>::twoPi * f * i / sr;
+            re += x.getSample (0, from + i) * std::cos (a);
+            im += x.getSample (0, from + i) * std::sin (a);
+        }
+
+        return 2.0 * std::sqrt (re * re + im * im) / count;
+    }
+
+    /** Частота самой сильной составляющей в окрестности: перебор сетки в 1 Гц. */
+    double dominantFrequency (const juce::AudioBuffer<float>& x, int from, int count,
+                              double centre, double span, double sr)
+    {
+        double best = centre, bestAmp = -1.0;
+
+        for (double f = centre - span; f <= centre + span; f += 1.0)
+        {
+            const double a = amplitudeAt (x, from, count, f, sr);
+
+            if (a > bestAmp) { bestAmp = a; best = f; }
+        }
+
+        return best;
+    }
+
     void fillDC (juce::AudioBuffer<float>& buffer, float value = 1.0f)
     {
         for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
@@ -73,6 +112,8 @@ namespace
 
 int main()
 {
+    countedThread = std::this_thread::get_id();
+
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     // --- Раскладки шин ---------------------------------------------------------
@@ -99,11 +140,16 @@ int main()
     {
         MidiDelayProcessor proc;
         constexpr double sr = 48000.0;
-        constexpr int blockSize = 512;
-        // 10 мс — ровно 480 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
+        constexpr int blockSize = 4096;
+        // 50 мс — ровно 2400 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
         // Некруглое время село бы между сэмплами, и импульс размазался бы интерполяцией.
-        constexpr float delayMs = 10.0f;
-        constexpr int delaySamples = 480;
+        //
+        // Не 10 мс, как было до #14: латентность varispeed — полокна, 1442 сэмпла
+        // (30 мс), и она вычитается из позиции чтения. При delay time 10 мс смещение
+        // ушло бы в минус, упёрлось в кламп, и голос звучал бы позже заказанного.
+        // Минимальный осмысленный delay time = латентность движка; это #17.
+        constexpr float delayMs = 50.0f;
+        constexpr int delaySamples = 2400;
 
         // Параметры выставляются до prepareToPlay: тогда сглаживание стартует уже
         // в нужной точке и не размазывает импульс рампой.
@@ -178,12 +224,13 @@ int main()
     {
         MidiDelayProcessor proc;
         constexpr double sr = 48000.0;
-        constexpr int blockSize = 512;
-        constexpr int delaySamples = 480;   // 10 мс на 48 кГц, ровно на сетке параметра
+        constexpr int blockSize = 4096;
+        constexpr int delaySamples = 2400;   // 50 мс на 48 кГц, ровно на сетке параметра
 
-        // 250 Гц выбрано не случайно: период ровно 192 сэмпла, а 480 — это 2,5 периода.
+        // 250 Гц выбрано не случайно: период ровно 192 сэмпла, а 2400 — это 12,5 периода.
         // Значит wet приходит в противофазе к dry, и любой кроссфейд между ними —
-        // настоящий переход, а не переход сигнала в самого себя.
+        // настоящий переход, а не переход сигнала в самого себя. Нота — 60, то есть
+        // ровно Root Key по умолчанию: ratio 1, и питчер вырождается в чистую задержку.
         constexpr float freq = 250.0f;
         constexpr float amp  = 0.25f;
 
@@ -238,7 +285,7 @@ int main()
 
         // 1. mix = 0 — бит-в-бит. Первый блок холостой: пока сглаживание едет
         //    к своей цели, равенства нет, и это не баг.
-        setParam (proc, "delayTime", 10.0f);
+        setParam (proc, "delayTime", 50.0f);
         setParam (proc, "feedback", 0.0f);
         setParam (proc, "outputGain", 0.0f);
         setParam (proc, "mix", 0.0f);
@@ -256,7 +303,9 @@ int main()
         CHECK (sameAsReference());
 
         // 2. Выравнивание dry и wet: при mix = 50 % пик dry на нуле, пик wet ровно
-        //    на delaySamples. Когда появится латентность питчера, ломаться будет здесь.
+        //    на delaySamples. Именно здесь видно, что латентность питчера спрятана
+        //    в delay time: движок задерживает на 1442 сэмпла, голос читает кольцо
+        //    на 1442 ближе, и снаружи хвост приходит ровно на 2400-м.
         setParam (proc, "mix", 50.0f);
         prepare();
 
@@ -350,7 +399,7 @@ int main()
     // --- Sample-accurate MIDI и голоса (#12, #13) ------------------------------
     {
         constexpr double sr = 48000.0;
-        constexpr int delaySamples = 480;   // 10 мс на 48 кГц, ровно на сетке параметра
+        constexpr int delaySamples = 2400;   // 50 мс на 48 кГц, больше латентности питчера
 
         // Общая настройка: слышны только голоса (mix 100 %), огибающая короткая.
         // Параметры выставляются до prepareToPlay — тогда сглаживание стоит на цели
@@ -358,7 +407,7 @@ int main()
         const auto setup = [] (MidiDelayProcessor& proc, int blockSize,
                                float attackMs = 1.0f, float releaseMs = 300.0f)
         {
-            setParam (proc, "delayTime", 10.0f);
+            setParam (proc, "delayTime", 50.0f);
             setParam (proc, "feedback", 0.0f);
             setParam (proc, "mix", 100.0f);
             setParam (proc, "outputGain", 0.0f);
@@ -373,6 +422,10 @@ int main()
         // 1. Голос стартует ровно на сэмпле события. Вход — постоянная единица, поэтому
         //    на выходе видно ровно огибающую: до события она обязана быть нулём, а на
         //    самом событии — уже нет. Точность проверки — один сэмпл.
+        //
+        //    Прогрев кольца теперь длиннее одного блока: голос читает не только на
+        //    delay time назад, но и ещё на латентность движка сверх того — питчер при
+        //    старте ноты заливает своё окно историей. Итого 2400 + 1442 сэмпла.
         {
             MidiDelayProcessor proc;
             constexpr int blockSize = 512;
@@ -389,7 +442,10 @@ int main()
             for (const int onset : { 100, 300 })
             {
                 setup (proc, blockSize);            // сброс кольца и голосов
-                fillDC (buffer); runBlock (proc, buffer);                    // прогрев кольца
+
+                for (int b = 0; b < 8; ++b)         // прогрев: 4096 сэмплов истории
+                    { fillDC (buffer); runBlock (proc, buffer); }
+
                 fillDC (buffer); runBlock (proc, buffer, noteOnAt (onset));
 
                 for (int i = 0; i < onset; ++i)
@@ -485,6 +541,15 @@ int main()
         //    живой голос добавляет к выходу ровно свою огибающую, и число голосов
         //    читается прямо с выхода. Атака 10 мс, чтобы шаг одновременных атак
         //    оставался мелким и порог на щелчки мерил кражу, а не игру аккордом.
+        //
+        //    Все ноты — 60, то есть Root Key: ratio 1, и постоянный вход доезжает
+        //    до выхода нетронутым. С транспонированием так больше нельзя. Два ридера
+        //    varispeed читают одно и то же, и на постоянном сигнале они полностью
+        //    коррелированы: equal-power складывает их не в 1, а в gA + gB, то есть
+        //    до +3 dB в середине кроссфейда. Это не баг — это цена equal-power на
+        //    коррелированном входе, и DC как пробник для сдвинутого голоса не годится.
+        //    Раздача голосов от номера ноты всё равно не зависит (findVoiceFor его
+        //    игнорирует), так что унисон здесь ничего не теряет.
         {
             MidiDelayProcessor proc;
             constexpr int blockSize = 512;
@@ -508,11 +573,11 @@ int main()
                 }
             };
 
-            dcBlock();   // прогрев кольца
+            for (int b = 0; b < 8; ++b) dcBlock();   // прогрев кольца, 4096 сэмплов
 
             juce::MidiBuffer chord;
             for (int n = 0; n < 4; ++n)
-                chord.addEvent (juce::MidiMessage::noteOn (1, 60 + n * 4, 1.0f), n * 10);
+                chord.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), n * 10);
 
             dcBlock (chord);
             dcBlock();
@@ -521,7 +586,7 @@ int main()
             // Ещё пять нот: девятая обязана украсть голос, а не упасть и не потеряться.
             juce::MidiBuffer more;
             for (int n = 0; n < 5; ++n)
-                more.addEvent (juce::MidiMessage::noteOn (1, 40 + n, 1.0f), n * 10);
+                more.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), n * 10);
 
             maxStep = 0.0f;
             dcBlock (more, true);
@@ -559,7 +624,7 @@ int main()
                 runBlock (proc, buffer, midi);
             };
 
-            dcBlock();
+            for (int b = 0; b < 8; ++b) dcBlock();   // прогрев кольца, 4096 сэмплов
 
             juce::MidiBuffer pedalAndNote;
             pedalAndNote.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
@@ -603,6 +668,90 @@ int main()
             for (int i = 0; i < blockSize; ++i)
                 CHECK (std::isfinite (buffer.getSample (0, i)));
         }
+    }
+
+    // --- Маппинг ноты в pitch ratio (#15) --------------------------------------
+    // Пробный тон — 500 Гц. Это не произвол: в полуокне питчера (1440 сэмплов при
+    // 48 кГц и окне 60 мс) укладывается ровно 15 его периодов, и только на таких
+    // частотах varispeed сдвигает без расстройки квантования. Разбор механизма —
+    // в Source/DSP/test_pitch_shifter.cpp, раздел 4.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 2048;
+        constexpr int blocks = 32;
+        constexpr int total = blockSize * blocks;
+        constexpr int measureFrom = total / 2;
+        constexpr double f0 = 500.0;
+
+        /** Частота хвоста для ноты. rootKeyAfter крутится на лету посреди прогона,
+            ровно в начале измеряемой половины: уже звучащий голос обязан этого не
+            заметить — ratio считается в момент note on и живёт в голосе до её конца. */
+        const auto tailFrequency = [&] (int note, float rootKey, float range,
+                                        float rootKeyAfter, double expected)
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "delayTime", 50.0f);   // больше латентности движка (30 мс)
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);        // на выходе только хвост, без dry
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "release", 300.0f);
+            setParam (proc, "rootKey", rootKey);
+            setParam (proc, "pitchRange", range);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            juce::AudioBuffer<float> out (2, total);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    // Фаза считается в double нарочно: 500 * 65535 уже не помещается
+                    // в мантиссу float, и синус на хвосте прогона поехал бы по частоте.
+                    const auto value = (float) (0.5 * std::sin (juce::MathConstants<double>::twoPi
+                                                                * f0 * (b * blockSize + i) / sr));
+                    block.setSample (0, i, value);
+                    block.setSample (1, i, value);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0, note) : juce::MidiBuffer {});
+
+                for (int ch = 0; ch < 2; ++ch)
+                    out.copyFrom (ch, b * blockSize, block, ch, 0, blockSize);
+
+                if (b * blockSize == measureFrom - blockSize)
+                    setParam (proc, "rootKey", rootKeyAfter);
+            }
+
+            // Хвост обязан быть слышен: иначе искали бы пик в тишине.
+            CHECK (out.getMagnitude (0, measureFrom, total - measureFrom) > 0.1f);
+
+            return dominantFrequency (out, measureFrom, total - measureFrom, expected, 60.0, sr);
+        };
+
+        // Нота, равная Root Key: хвост без транспонирования.
+        CHECK (std::abs (tailFrequency (60, 0.0f, 12.0f, 0.0f, f0) - f0) < 2.0);
+
+        // Октава вверх — ровно удвоение частоты, октава вниз — ровно половина.
+        CHECK (std::abs (tailFrequency (72, 0.0f, 12.0f, 0.0f, 2.0 * f0) - 2.0 * f0) < 2.0);
+        CHECK (std::abs (tailFrequency (48, 0.0f, 12.0f, 0.0f, 0.5 * f0) - 0.5 * f0) < 2.0);
+
+        // За границей Pitch Range — clamp: две октавы вверх при диапазоне 12 дают ту же
+        // высоту, что и одна. Перенос октавами внутрь диапазона дал бы здесь f0.
+        CHECK (std::abs (tailFrequency (84, 0.0f, 12.0f, 0.0f, 2.0 * f0) - 2.0 * f0) < 2.0);
+
+        // Root Key реально участвует: та же нота от D (индекс 2) даёт +10 полутонов.
+        const double tenSemitones = f0 * std::pow (2.0, 10.0 / 12.0);
+        CHECK (std::abs (tailFrequency (72, 2.0f, 12.0f, 2.0f, tenSemitones) - tenSemitones) < 2.0);
+
+        // И главное: смена Root Key на лету не трогает уже звучащий голос. Нота 72
+        // взята от C, потом Root уезжает на F — от F она дала бы +7 полутонов, но
+        // голос обязан продолжать петь свои +12.
+        CHECK (std::abs (tailFrequency (72, 0.0f, 12.0f, 5.0f, 2.0 * f0) - 2.0 * f0) < 2.0);
     }
 
     // --- Состояние -------------------------------------------------------------
