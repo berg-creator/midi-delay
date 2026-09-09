@@ -13,7 +13,7 @@ namespace
         "attack",   "release",
     };
 
-    constexpr int headerHeight = 96;
+    constexpr int headerHeight = 114;
     constexpr int cellWidth = 152;
     constexpr int cellHeight = 96;
     constexpr int columns = 4;
@@ -157,12 +157,23 @@ void MidiDelayEditor::paint (juce::Graphics& g)
                   + "   ratio " + juce::String (ratio, 3);
 
         g.drawText (text, midiLine, juce::Justification::centredLeft, false);
+
     }
     else
     {
         g.drawText ("No MIDI input - set the same port in MIDI Out and in the wrapper",
                     midiLine, juce::Justification::centredLeft, false);
     }
+
+    // Где унисон. Без этой строки узнать неоткуда: Root Key показывает класс высоты
+    // без октавы, и на живом прогоне в FL мелодия была нарисована октавой выше —
+    // хвост пел на октаву вверх, а слышалось это как расслоение голоса.
+    g.setColour (juce::Colours::grey);
+    g.setFont (juce::FontOptions (12.0f));
+    g.drawText ("Unison (ratio 1.000) at "
+                    + juce::MidiMessage::getMidiNoteName (proc.getUnisonNote(), true, true, 5)
+                    + " - notes above it transpose the tail up",
+                header.removeFromTop (17), juce::Justification::centredLeft, false);
 
     // В Follow движок свой и предела на время нет: там показывается то, что важно
     // именно в этом режиме, — сколько плагин просит скомпенсировать у хоста.

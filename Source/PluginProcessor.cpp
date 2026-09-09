@@ -226,6 +226,11 @@ void MidiDelayProcessor::handleAsyncUpdate()
     updateLatency();
 }
 
+int MidiDelayProcessor::getUnisonNote() const
+{
+    return rootOctaveBase + static_cast<int> (pRootKey->load (std::memory_order_relaxed));
+}
+
 bool MidiDelayProcessor::isFollowMode() const
 {
     return pTimeMode->load (std::memory_order_relaxed) > 0.5f;
