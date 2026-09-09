@@ -159,16 +159,13 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
 
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
-    voiceManager.setEngine (pTimeMode->load() > 0.5f ? PitchEngine::follow
-                                                     : (pQuality->load() > 0.5f ? PitchEngine::hq
-                                                                                : PitchEngine::fast));
+    voiceManager.setEngine (pQuality->load() > 0.5f ? PitchEngine::hq : PitchEngine::fast);
 
     // Нижний предел delay time — латентность движка (#17). Спрашивается у движка сразу
     // после его подготовки: зашитое число разъехалось бы с окном при первой же правке.
     const double msPerSample = 1000.0 / currentSampleRate;
-    minDelayFastMs  = voiceManager.getLatencySamples (PitchEngine::fast)   * msPerSample;
-    minDelayHqMs    = voiceManager.getLatencySamples (PitchEngine::hq)     * msPerSample;
-    followLatencyMs = voiceManager.getLatencySamples (PitchEngine::follow) * msPerSample;
+    minDelayFastMs = voiceManager.getLatencySamples (PitchEngine::fast) * msPerSample;
+    minDelayHqMs   = voiceManager.getLatencySamples (PitchEngine::hq)   * msPerSample;
 
     delaySamplesSmoothed.reset (currentSampleRate, smoothingSeconds);
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
@@ -203,13 +200,19 @@ void MidiDelayProcessor::releaseResources()
 }
 
 //==============================================================================
+double MidiDelayProcessor::engineLatencyMs() const
+{
+    return (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs : minDelayFastMs)
+        .load (std::memory_order_relaxed);
+}
+
 int MidiDelayProcessor::alignmentSamples() const
 {
     // Follow: питчеру негде спрятать своё окно, дилея под ним нет. Отрицательный
     // офсет: событие раньше сухого сигнала сделать нельзя, можно только придержать
     // сухой. Оба слагаемых складываются, и сумма уходит хосту (ADR 0006).
     const double followLatency = isFollowMode()
-        ? followLatencyMs.load (std::memory_order_relaxed) * 0.001 * currentSampleRate : 0.0;
+        ? engineLatencyMs() * 0.001 * currentSampleRate : 0.0;
 
     const double offset = pMidiOffset->load (std::memory_order_relaxed) * 0.001 * currentSampleRate;
 
@@ -286,8 +289,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     const bool follow = isFollowMode();
     const bool wantHq = pQuality->load (std::memory_order_relaxed) > 0.5f;
 
-    voiceManager.setEngine (follow ? PitchEngine::follow
-                                   : (wantHq ? PitchEngine::hq : PitchEngine::fast));
+    voiceManager.setEngine (wantHq ? PitchEngine::hq : PitchEngine::fast);
     voiceManager.setWidth (pWidth->load (std::memory_order_relaxed));
 
     // Выравнивание: на сколько сэмплов весь плагин отстаёт от собственного входа.
@@ -304,7 +306,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     // именно задержка события, а не смещение позиции чтения: на слух слышно то,
     // когда хвост начался, а сдвиг чтения этого как раз не трогает (ADR 0006).
     const int midiShift = static_cast<int> (std::lround (
-        (follow ? followLatencyMs.load (std::memory_order_relaxed) * 0.001 * currentSampleRate : 0.0)
+        (follow ? engineLatencyMs() * 0.001 * currentSampleRate : 0.0)
         + std::max (0.0, offsetSamples)));
 
     // Хост узнаёт о смене выравнивания из потока сообщений: setLatencySamples дёргает
@@ -507,9 +509,7 @@ double MidiDelayProcessor::getMinDelayMs() const
     if (isFollowMode())
         return 0.0;
 
-    const double latency = (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs
-                                                                              : minDelayFastMs)
-        .load (std::memory_order_relaxed);
+    const double latency = engineLatencyMs();
 
     // Отрицательный офсет придерживает сухой сигнал, а значит освобождает ровно
     // столько же в бюджете позиции чтения — предел едет вниз вместе с ним.

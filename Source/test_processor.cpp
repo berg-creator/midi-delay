@@ -1183,7 +1183,9 @@ int main (int argc, char* argv[])
         constexpr int blockSize = 8192;
         constexpr int blocks = 6;                  // 49152 сэмпла
         constexpr int total = blockSize * blocks;
-        constexpr int followLatency = 4320;        // окно 0,09 с при 48 кГц
+        // Латентность в Follow — это латентность движка, выбранного Quality. Отдельного
+        // короткого движка под Follow нет: он был и оказался браком, замер в ADR 0006.
+        constexpr int followLatency = 8640;        // HQ, окно 0,18 с при 48 кГц
 
         // Прогон с импульсом в pulse и нотой в note. Возвращает весь выход.
         const auto render = [] (std::vector<float>& out, bool follow, float delayMs,
@@ -1192,6 +1194,7 @@ int main (int argc, char* argv[])
         {
             MidiDelayProcessor proc;
             setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+            setParam (proc, "quality", 1.0f);      // HQ: от него считается выравнивание
             setParam (proc, "delayTime", delayMs);
             setParam (proc, "midiOffset", offsetMs);
             setParam (proc, "mix", mix);
@@ -1286,6 +1289,7 @@ int main (int argc, char* argv[])
             {
                 MidiDelayProcessor proc;
                 setParam (proc, "timeMode", 0.0f);
+                setParam (proc, "quality", 1.0f);
                 setParam (proc, "delayTime", 200.0f);
                 setParam (proc, "midiOffset", offsetMs);
                 setParam (proc, "mix", 100.0f);

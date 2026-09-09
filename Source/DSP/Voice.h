@@ -31,8 +31,8 @@ public:
     /** Возраст присваивает менеджер: счётчик один на весь пул, голосу его не вывести. */
     void setAge (unsigned newAge);
 
-    /** Какой движок должен звучать со следующей ноты: Quality выбирает между
-        fast и hq (#38), режим Follow навязывает свой короткий (ADR 0006). Латчится
+    /** Какой движок должен звучать со следующей ноты: выбирает Quality (#38).
+        Режим Time Mode на это не влияет — почему, в ADR 0006. Латчится
         в момент старта ноты, звучащие голоса переключение не трогает — почему
         именно так, написано в Voice.cpp у самого латча. */
     void setEngine (PitchEngine engine);
@@ -71,10 +71,10 @@ private:
     float nextEnvelope();
     void start (int midiNote, float velocity, float ratio, float pan);
 
-    // Все три движка живут всё время работы плагина и все готовы: создать нужный
+    // Оба движка живут всё время работы плагина и оба готовы: создать нужный
     // в момент переключения нельзя, это аллокация из аудиопотока. Цена — память
-    // неиспользуемых движков, около 250 КБ на голос каждый.
-    std::unique_ptr<PitchShifter> fastShifter, hqShifter, followShifter;
+    // неиспользуемого движка, около 250 КБ на голос.
+    std::unique_ptr<PitchShifter> fastShifter, hqShifter;
     PitchShifter* engineFor (PitchEngine engine) const;
 
     PitchShifter* shifter = nullptr;   // активный; чей именно, решает старт ноты

@@ -23,15 +23,6 @@ namespace
         в prompts/PROGRESS.md, находки сессии 08. */
     constexpr double pitchWindowMs = 240.0;
 
-    /** Окно движка режима Follow. Там дилея нет, прятать латентность некуда, и она
-        репортится хосту — значит должна быть маленькой (ADR 0006). Секунды, потому
-        что окно у Signalsmith и есть вся его латентность.
-
-        0,09, а не меньше: на 0,06 худшая расстройка доходит до 58 центов, а в Follow
-        хвост звучит одновременно с сухим сигналом и обязан стоять с ним в унисон.
-        Замер и пороги — test_pitch_shifter, проверка 7. */
-    constexpr float followWindowSeconds = 0.09f;
-
     /** Заливка окна питчера идёт порциями через стек: одна виртуальная process()
         на сэмпл обошлась бы в полторы тысячи вызовов на каждую ноту. */
     constexpr int primeChunk = 64;
@@ -54,9 +45,6 @@ void Voice::prepare (double sampleRate, int maxBlockSamples)
     hqShifter = std::make_unique<SignalsmithShifter>();
     hqShifter->prepare (sr, block);
 
-    followShifter = std::make_unique<SignalsmithShifter> (followWindowSeconds);
-    followShifter->prepare (sr, block);
-
     shifter = engineFor (wantEngine);
 
     stealSamples = std::max (1.0, sr * stealFadeMs * 0.001);
@@ -77,21 +65,19 @@ void Voice::reset()
     sustained = false;
     needsPrime = false;
 
-    // Все: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
-    // выдать чужой хвост при следующем переключении Quality или режима.
-    if (fastShifter   != nullptr) fastShifter->reset();
-    if (hqShifter     != nullptr) hqShifter->reset();
-    if (followShifter != nullptr) followShifter->reset();
+    // Оба: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
+    // выдать чужой хвост при следующем переключении Quality.
+    if (fastShifter != nullptr) fastShifter->reset();
+    if (hqShifter   != nullptr) hqShifter->reset();
 }
 
 PitchShifter* Voice::engineFor (PitchEngine engine) const
 {
     switch (engine)
     {
-        case PitchEngine::fast:   return fastShifter.get();
-        case PitchEngine::follow: return followShifter.get();
+        case PitchEngine::fast: return fastShifter.get();
         case PitchEngine::hq:
-        default:                  return hqShifter.get();
+        default:                return hqShifter.get();
     }
 }
 

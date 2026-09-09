@@ -181,7 +181,12 @@ private:
     // Предел из getMinDelayMs, посчитанный в prepareToPlay. Пишется в подготовке,
     // читается редактором — отсюда atomic. Два числа, потому что переключение
     // Quality обязано менять показ мгновенно, а не ждать следующего prepare.
-    std::atomic<double> minDelayFastMs { 0.0 }, minDelayHqMs { 0.0 }, followLatencyMs { 0.0 };
+    std::atomic<double> minDelayFastMs { 0.0 }, minDelayHqMs { 0.0 };
+
+    /** Латентность движка, выбранного параметром Quality, в миллисекундах.
+        Одно число для трёх вещей: нижний предел delay time, выравнивание Follow
+        и сдвиг MIDI-очереди. */
+    double engineLatencyMs() const;
 
     /** Выравнивание, о котором хост уже знает. Пишется и читается аудиопотоком;
         расхождение с посчитанным — единственный повод разбудить поток сообщений. */

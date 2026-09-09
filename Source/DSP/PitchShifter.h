@@ -3,11 +3,10 @@
 
 #include "DelayBuffer.h"
 
-/** Какой движок питчинга звучит. fast и hq выбираются параметром Quality,
-    follow навязывается режимом Time Mode = Follow: там латентность питчера уходит
-    в репорт хосту, а не прячется в delay time, и потому обязана быть короткой.
-    См. ADR 0006. */
-enum class PitchEngine { fast, hq, follow };
+/** Какой движок питчинга звучит. Выбирается параметром Quality и только им:
+    режим Time Mode на выбор движка не влияет. Короткий движок специально под Follow
+    был и оказался браком — замер на живом вокале в ADR 0006. */
+enum class PitchEngine { fast, hq };
 
 /** Транспонирование одного моно-голоса. Потоковый: сколько сэмплов подали, столько
     и получили. Абстракция существует ради одной конкретной цели — подменить движок
@@ -67,10 +66,7 @@ private:
 class SignalsmithShifter final : public PitchShifter
 {
 public:
-    /** windowSeconds — длина окна анализа, она же вся латентность движка. 0,18 с
-        для дилея, где латентность прячется в delay time; короткое окно нужно
-        режиму Follow, который платит за неё репортом хосту (ADR 0006). */
-    explicit SignalsmithShifter (float windowSeconds = 0.18f);
+    SignalsmithShifter();
     ~SignalsmithShifter() override;
 
     void prepare (double sampleRate, int maxBlockSamples) override;
@@ -83,7 +79,6 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl;
 
-    float window;          // длина окна в секундах, задаётся в конструкторе
     int latency = 0;       // inputLatency + outputLatency, константа между вызовами prepare
     float ratio = 1.0f;    // последнее заданное значение: движок дёргаем только на смене
 };

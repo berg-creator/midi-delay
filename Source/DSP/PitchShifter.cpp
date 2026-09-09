@@ -109,8 +109,7 @@ struct SignalsmithShifter::Impl
     signalsmith::stretch::SignalsmithStretch<float> stretch { 0x5713C4 };
 };
 
-SignalsmithShifter::SignalsmithShifter (float windowSeconds)
-    : impl (std::make_unique<Impl>()), window (std::max (0.01f, windowSeconds)) {}
+SignalsmithShifter::SignalsmithShifter() : impl (std::make_unique<Impl>()) {}
 SignalsmithShifter::~SignalsmithShifter() = default;
 
 void SignalsmithShifter::prepare (double sampleRate, int)
@@ -129,9 +128,7 @@ void SignalsmithShifter::prepare (double sampleRate, int)
     // 0,18 — колено: вдвое точнее presetDefault за 60 мс, дальше та же цена покупает
     // вдвое меньше. Латентность здесь платится минимальным delay time, а не задержкой
     // хоста (ANALYSIS §5), поэтому такое окно вообще можно себе позволить. См. ADR 0005.
-    // Окно и шаг задаются полем, а не литералом: тот же класс обслуживает и дилей
-    // с окном 0,18 с, и режим Follow с коротким окном. Перекрытие всегда четырёхкратное.
-    impl->stretch.configure (1, static_cast<int> (sr * window), static_cast<int> (sr * window * 0.25f));
+    impl->stretch.configure (1, static_cast<int> (sr * 0.18f), static_cast<int> (sr * 0.045f));
     impl->stretch.setTransposeFactor (1.0f);
     ratio = 1.0f;
 
