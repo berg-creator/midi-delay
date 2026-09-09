@@ -6,6 +6,8 @@
 
 #include "PluginProcessor.h"
 
+#include <juce_audio_formats/juce_audio_formats.h>
+
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -110,11 +112,100 @@ namespace
     }
 }
 
-int main()
+/** Офлайн-рендер для проверки на слух: пила 220 Гц на вход, короткая мелодия в MIDI,
+    результат в WAV. Не тест — тесты не умеют сказать «звучит убедительно». Зародыш #19.
+    Запуск: ProcessorTest --render out.wav */
+static int renderDemo (const juce::String& path)
+{
+    constexpr double sr = 48000.0;
+    constexpr int blockSize = 512;
+    constexpr double seconds = 8.0;
+    const int total = static_cast<int> (sr * seconds);
+
+    MidiDelayProcessor proc;
+    setParam (proc, "delayTime", 400.0f);
+    setParam (proc, "feedback", 0.0f);
+    setParam (proc, "mix", 60.0f);
+    setParam (proc, "outputGain", 0.0f);
+    setParam (proc, "bypass", 0.0f);
+    setParam (proc, "attack", 10.0f);
+    setParam (proc, "release", 300.0f);
+    setParam (proc, "rootKey", 0.0f);       // C
+    setParam (proc, "pitchRange", 12.0f);
+
+    proc.setPlayConfigDetails (2, 2, sr, blockSize);
+    proc.prepareToPlay (sr, blockSize);
+
+    // Пила 220 Гц: у неё много гармоник, и транспонирование на ней слышно сразу.
+    // Ноты — C5, E5, G5, C6 по номерам FL Studio, то есть MIDI 60, 64, 67, 72:
+    // унисон, большая терция, квинта, октава от Root Key.
+    const int notes[] { 60, 64, 67, 72 };
+    const int noteLength = static_cast<int> (sr * 1.5);
+
+    juce::AudioBuffer<float> out (2, total);
+    juce::AudioBuffer<float> block (2, blockSize);
+    double phase = 0.0;
+
+    for (int start = 0; start < total; start += blockSize)
+    {
+        const int n = juce::jmin (blockSize, total - start);
+
+        for (int i = 0; i < n; ++i)
+        {
+            phase += 220.0 / sr;
+            if (phase >= 1.0) phase -= 1.0;
+
+            const auto value = static_cast<float> (0.25 * (2.0 * phase - 1.0));
+            block.setSample (0, i, value);
+            block.setSample (1, i, value);
+        }
+
+        juce::MidiBuffer midi;
+
+        for (int k = 0; k < 4; ++k)
+        {
+            const int on  = static_cast<int> (sr * 0.5) + k * noteLength;
+            const int off = on + noteLength - static_cast<int> (sr * 0.1);
+
+            if (on  >= start && on  < start + n) midi.addEvent (juce::MidiMessage::noteOn  (1, notes[k], 0.9f), on  - start);
+            if (off >= start && off < start + n) midi.addEvent (juce::MidiMessage::noteOff (1, notes[k]), off - start);
+        }
+
+        juce::AudioBuffer<float> view (block.getArrayOfWritePointers(), 2, n);
+        proc.processBlock (view, midi);
+
+        for (int ch = 0; ch < 2; ++ch)
+            out.copyFrom (ch, start, block, ch, 0, n);
+    }
+
+    juce::File file (juce::File::getCurrentWorkingDirectory().getChildFile (path));
+    file.deleteFile();
+
+    juce::WavAudioFormat wav;
+    std::unique_ptr<juce::AudioFormatWriter> writer (
+        wav.createWriterFor (new juce::FileOutputStream (file), sr, 2, 24, {}, 0));
+
+    if (writer == nullptr)
+    {
+        std::printf ("cannot write %s\n", file.getFullPathName().toRawUTF8());
+        return 1;
+    }
+
+    writer->writeFromAudioSampleBuffer (out, 0, total);
+    writer.reset();
+
+    std::printf ("rendered %s (%.1f s)\n", file.getFullPathName().toRawUTF8(), seconds);
+    return 0;
+}
+
+int main (int argc, char* argv[])
 {
     countedThread = std::this_thread::get_id();
 
     juce::ScopedJuceInitialiser_GUI juceInit;
+
+    if (argc >= 3 && juce::String (argv[1]) == "--render")
+        return renderDemo (juce::String (argv[2]));
 
     // --- Раскладки шин ---------------------------------------------------------
     {
@@ -140,16 +231,16 @@ int main()
     {
         MidiDelayProcessor proc;
         constexpr double sr = 48000.0;
-        constexpr int blockSize = 4096;
-        // 50 мс — ровно 2400 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
+        constexpr int blockSize = 16384;
+        // 200 мс — ровно 9600 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
         // Некруглое время село бы между сэмплами, и импульс размазался бы интерполяцией.
         //
-        // Не 10 мс, как было до #14: латентность varispeed — полокна, 1442 сэмпла
-        // (30 мс), и она вычитается из позиции чтения. При delay time 10 мс смещение
-        // ушло бы в минус, упёрлось в кламп, и голос звучал бы позже заказанного.
+        // Не 10 мс, как было до #14: латентность varispeed — полокна, 5762 сэмпла
+        // (120 мс), и она вычитается из позиции чтения. При delay time меньше неё
+        // смещение уходит в минус, упирается в кламп, и голос звучит позже заказанного.
         // Минимальный осмысленный delay time = латентность движка; это #17.
-        constexpr float delayMs = 50.0f;
-        constexpr int delaySamples = 2400;
+        constexpr float delayMs = 200.0f;
+        constexpr int delaySamples = 9600;
 
         // Параметры выставляются до prepareToPlay: тогда сглаживание стартует уже
         // в нужной точке и не размазывает импульс рампой.
@@ -224,10 +315,10 @@ int main()
     {
         MidiDelayProcessor proc;
         constexpr double sr = 48000.0;
-        constexpr int blockSize = 4096;
-        constexpr int delaySamples = 2400;   // 50 мс на 48 кГц, ровно на сетке параметра
+        constexpr int blockSize = 16384;
+        constexpr int delaySamples = 7776;   // 162 мс на 48 кГц, ровно на сетке параметра
 
-        // 250 Гц выбрано не случайно: период ровно 192 сэмпла, а 2400 — это 12,5 периода.
+        // 250 Гц выбрано не случайно: период ровно 192 сэмпла, а 7776 — это 40,5 периода.
         // Значит wet приходит в противофазе к dry, и любой кроссфейд между ними —
         // настоящий переход, а не переход сигнала в самого себя. Нота — 60, то есть
         // ровно Root Key по умолчанию: ratio 1, и питчер вырождается в чистую задержку.
@@ -285,7 +376,9 @@ int main()
 
         // 1. mix = 0 — бит-в-бит. Первый блок холостой: пока сглаживание едет
         //    к своей цели, равенства нет, и это не баг.
-        setParam (proc, "delayTime", 50.0f);
+        // 162 мс — ближайшее к латентности движка время, дающее половину периода
+        // 250 Гц. Меньше нельзя: 120 мс это сама латентность, запас нужен.
+        setParam (proc, "delayTime", 162.0f);
         setParam (proc, "feedback", 0.0f);
         setParam (proc, "outputGain", 0.0f);
         setParam (proc, "mix", 0.0f);
@@ -304,8 +397,8 @@ int main()
 
         // 2. Выравнивание dry и wet: при mix = 50 % пик dry на нуле, пик wet ровно
         //    на delaySamples. Именно здесь видно, что латентность питчера спрятана
-        //    в delay time: движок задерживает на 1442 сэмпла, голос читает кольцо
-        //    на 1442 ближе, и снаружи хвост приходит ровно на 2400-м.
+        //    в delay time: движок задерживает на 5762 сэмпла, голос читает кольцо
+        //    на 5762 ближе, и снаружи хвост приходит ровно на 7776-м.
         setParam (proc, "mix", 50.0f);
         prepare();
 
@@ -336,7 +429,7 @@ int main()
         setParam (proc, "mix", 100.0f);
         setParam (proc, "outputGain", 12.0f);
 
-        // Сглаживание 50 мс — это 2400 сэмплов, около пяти блоков.
+        // Сглаживание 50 мс — это 2400 сэмплов, то есть кончается внутри первого блока.
         for (int b = 0; b < 8; ++b) { nextSine(); runBlock (proc, buffer); measureSteps(); }
 
         CHECK (allocations.load() == 0);
@@ -399,7 +492,7 @@ int main()
     // --- Sample-accurate MIDI и голоса (#12, #13) ------------------------------
     {
         constexpr double sr = 48000.0;
-        constexpr int delaySamples = 2400;   // 50 мс на 48 кГц, больше латентности питчера
+        constexpr int delaySamples = 9600;   // 200 мс на 48 кГц, больше латентности питчера
 
         // Общая настройка: слышны только голоса (mix 100 %), огибающая короткая.
         // Параметры выставляются до prepareToPlay — тогда сглаживание стоит на цели
@@ -407,7 +500,7 @@ int main()
         const auto setup = [] (MidiDelayProcessor& proc, int blockSize,
                                float attackMs = 1.0f, float releaseMs = 300.0f)
         {
-            setParam (proc, "delayTime", 50.0f);
+            setParam (proc, "delayTime", 200.0f);
             setParam (proc, "feedback", 0.0f);
             setParam (proc, "mix", 100.0f);
             setParam (proc, "outputGain", 0.0f);
@@ -425,7 +518,7 @@ int main()
         //
         //    Прогрев кольца теперь длиннее одного блока: голос читает не только на
         //    delay time назад, но и ещё на латентность движка сверх того — питчер при
-        //    старте ноты заливает своё окно историей. Итого 2400 + 1442 сэмпла.
+        //    старте ноты заливает своё окно историей. Итого 9600 + 5762 сэмпла.
         {
             MidiDelayProcessor proc;
             constexpr int blockSize = 512;
@@ -443,7 +536,7 @@ int main()
             {
                 setup (proc, blockSize);            // сброс кольца и голосов
 
-                for (int b = 0; b < 8; ++b)         // прогрев: 4096 сэмплов истории
+                for (int b = 0; b < 40; ++b)        // прогрев: 20480 сэмплов истории
                     { fillDC (buffer); runBlock (proc, buffer); }
 
                 fillDC (buffer); runBlock (proc, buffer, noteOnAt (onset));
@@ -461,13 +554,18 @@ int main()
         //    считается по сэмплам, а delay time стоит ровно на 480 — дробной позиции
         //    чтения, которая округлялась бы по-разному, здесь взяться неоткуда.
         {
-            constexpr int total = 4096;   // делится на все четыре размера блока
+            constexpr int total = 32768;   // делится на все четыре размера блока
+            // Партитура сдвинута вглубь прогона: голос читает на delay time плюс
+            // латентность движка назад, и на первых 15 тысячах сэмплов ему достался
+            // бы ноль. Сравнивать четыре тишины — не тест.
+            constexpr int scoreBase = 16384;
             juce::AudioBuffer<float> source (2, total);
 
             for (int i = 0; i < total; ++i)
             {
-                const float s = 0.4f * std::sin (juce::MathConstants<float>::twoPi * 220.0f * (float) i / (float) sr)
-                              + 0.1f * std::sin (juce::MathConstants<float>::twoPi * 3100.0f * (float) i / (float) sr);
+                // Фаза в double: 3100 * 32767 уже не помещается в мантиссу float.
+                const auto s = (float) (0.4 * std::sin (juce::MathConstants<double>::twoPi * 220.0 * i / sr)
+                                      + 0.1 * std::sin (juce::MathConstants<double>::twoPi * 3100.0 * i / sr));
                 source.setSample (0, i, s);
                 source.setSample (1, i, s * 0.5f);   // каналы разные: моно-сумма голоса тоже под проверкой
             }
@@ -475,15 +573,15 @@ int main()
             struct Event { int sample; juce::MidiMessage message; };
             const std::vector<Event> score
             {
-                { 100,  juce::MidiMessage::noteOn (1, 60, 1.0f) },
-                { 777,  juce::MidiMessage::noteOn (1, 64, 0.6f) },
-                { 1500, juce::MidiMessage::controllerEvent (1, 64, 127) },   // педаль вниз
-                { 1501, juce::MidiMessage::pitchWheel (1, 12000) },          // незнакомое — мимо
-                { 2000, juce::MidiMessage::noteOff (1, 60) },                // держится педалью
-                { 2500, juce::MidiMessage::controllerEvent (1, 64, 0) },     // педаль вверх
-                { 3000, juce::MidiMessage::noteOn (1, 67, 0.9f) },
-                { 3333, juce::MidiMessage::noteOn (1, 72, 0.0f) },           // velocity 0 = note off
-                { 3500, juce::MidiMessage::allNotesOff (1) },
+                { scoreBase + 100,  juce::MidiMessage::noteOn (1, 60, 1.0f) },
+                { scoreBase + 777,  juce::MidiMessage::noteOn (1, 64, 0.6f) },
+                { scoreBase + 1500, juce::MidiMessage::controllerEvent (1, 64, 127) },   // педаль вниз
+                { scoreBase + 1501, juce::MidiMessage::pitchWheel (1, 12000) },          // незнакомое — мимо
+                { scoreBase + 2000, juce::MidiMessage::noteOff (1, 60) },                // держится педалью
+                { scoreBase + 2500, juce::MidiMessage::controllerEvent (1, 64, 0) },     // педаль вверх
+                { scoreBase + 3000, juce::MidiMessage::noteOn (1, 67, 0.9f) },
+                { scoreBase + 3333, juce::MidiMessage::noteOn (1, 72, 0.0f) },           // velocity 0 = note off
+                { scoreBase + 3500, juce::MidiMessage::allNotesOff (1) },
             };
 
             juce::AudioBuffer<float> reference (2, total);
@@ -573,7 +671,7 @@ int main()
                 }
             };
 
-            for (int b = 0; b < 8; ++b) dcBlock();   // прогрев кольца, 4096 сэмплов
+            for (int b = 0; b < 40; ++b) dcBlock();   // прогрев кольца, 20480 сэмплов
 
             juce::MidiBuffer chord;
             for (int n = 0; n < 4; ++n)
@@ -624,7 +722,7 @@ int main()
                 runBlock (proc, buffer, midi);
             };
 
-            for (int b = 0; b < 8; ++b) dcBlock();   // прогрев кольца, 4096 сэмплов
+            for (int b = 0; b < 40; ++b) dcBlock();   // прогрев кольца, 20480 сэмплов
 
             juce::MidiBuffer pedalAndNote;
             pedalAndNote.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
@@ -671,8 +769,8 @@ int main()
     }
 
     // --- Маппинг ноты в pitch ratio (#15) --------------------------------------
-    // Пробный тон — 500 Гц. Это не произвол: в полуокне питчера (1440 сэмплов при
-    // 48 кГц и окне 60 мс) укладывается ровно 15 его периодов, и только на таких
+    // Пробный тон — 500 Гц. Это не произвол: в полуокне питчера (5760 сэмплов при
+    // 48 кГц и окне 240 мс) укладывается ровно 60 его периодов, и только на таких
     // частотах varispeed сдвигает без расстройки квантования. Разбор механизма —
     // в Source/DSP/test_pitch_shifter.cpp, раздел 4.
     {
@@ -690,7 +788,7 @@ int main()
                                         float rootKeyAfter, double expected)
         {
             MidiDelayProcessor proc;
-            setParam (proc, "delayTime", 50.0f);   // больше латентности движка (30 мс)
+            setParam (proc, "delayTime", 200.0f);   // больше латентности движка (120 мс)
             setParam (proc, "feedback", 0.0f);
             setParam (proc, "mix", 100.0f);        // на выходе только хвост, без dry
             setParam (proc, "outputGain", 0.0f);

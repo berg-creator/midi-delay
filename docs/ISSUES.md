@@ -639,13 +639,17 @@ MIDI-роутинга в FL Studio. Возможно, именно эта фич
 ---
 
 ## [38] HQ pitch engine
-**Labels:** dsp, post-mvp
-**Milestone:** Post-MVP
+**Labels:** dsp
+**Milestone:** M2 (вытащена из Post-MVP в сессии 08)
 
 ### Описание
 Второй движок за интерфейсом `PitchShifter`: phase vocoder с phase locking, либо
 Signalsmith Stretch, либо Rubber Band — по итогам лицензионной проверки из #6.
 Латентность прячется в delay time, так что можно позволить себе большое окно.
+
+**Поднята в M2 по замеру сессии 08.** Varispeed расстраивает хвост на 6–12 центов
+в среднем и до 47 в худшей точке, и внутри алгоритма это неустранимо — см.
+[ADR 0004](adr/0004-varispeed-window.md). Кандидат — Signalsmith Stretch (MIT).
 
 ### Критерии приёмки
 - [ ] Переключатель Quality: Fast / HQ работает без перезагрузки плагина
