@@ -1,10 +1,103 @@
 #include "PluginEditor.h"
 
+namespace
+{
+    /** Порядок органов в окне и он же порядок чтения слева направо. Список явный,
+        а не «все параметры подряд»: filterLo, filterHi и division заведены в APVTS,
+        но ни к чему не подключены (#22, #20), и показывать мёртвые ручки — врать.
+        Как только их подключат, они встают сюда одной строкой. */
+    const char* const layout[] {
+        "timeMode", "delayTime", "midiOffset", "feedback",
+        "mix",      "outputGain", "width",     "quality",
+        "rootKey",  "pitchRange", "voices",    "bypass",
+        "attack",   "release",
+    };
+
+    constexpr int headerHeight = 96;
+    constexpr int cellWidth = 152;
+    constexpr int cellHeight = 96;
+    constexpr int columns = 4;
+    constexpr int margin = 12;
+}
+
 MidiDelayEditor::MidiDelayEditor (MidiDelayProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
-    setSize (420, 180);
+    for (const auto* id : layout)
+        addControl (id);
+
+    const int rows = (static_cast<int> (std::size (layout)) + columns - 1) / columns;
+
+    setSize (columns * cellWidth + 2 * margin,
+             headerHeight + rows * cellHeight + margin);
+
     startTimerHz (15);
+}
+
+void MidiDelayEditor::addControl (const juce::String& parameterId)
+{
+    auto* param = proc.apvts.getParameter (parameterId);
+
+    if (param == nullptr)
+        return;   // параметр переименовали — лучше дырка в сетке, чем падение
+
+    auto* caption = captions.add (new juce::Label ({}, param->getName (24)));
+    caption->setJustificationType (juce::Justification::centred);
+    caption->setColour (juce::Label::textColourId, juce::Colours::white.withAlpha (0.75f));
+    caption->setFont (juce::FontOptions (12.0f));
+    addAndMakeVisible (caption);
+
+    if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param))
+    {
+        auto* box = new juce::ComboBox();
+        box->addItemList (choice->choices, 1);
+        controls.add (box);
+        addAndMakeVisible (box);
+        comboLinks.add (new juce::AudioProcessorValueTreeState::ComboBoxAttachment (
+            proc.apvts, parameterId, *box));
+        return;
+    }
+
+    if (dynamic_cast<juce::AudioParameterBool*> (param) != nullptr)
+    {
+        auto* toggle = new juce::ToggleButton ("on");
+        controls.add (toggle);
+        addAndMakeVisible (toggle);
+        buttonLinks.add (new juce::AudioProcessorValueTreeState::ButtonAttachment (
+            proc.apvts, parameterId, *toggle));
+        return;
+    }
+
+    // Ручка с числом под ней: величины тут читаются глазами (миллисекунды, проценты,
+    // децибелы), и без числа их не выставить, а только подвигать.
+    auto* slider = new juce::Slider (juce::Slider::RotaryHorizontalVerticalDrag,
+                                     juce::Slider::TextBoxBelow);
+    slider->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 68, 16);
+    controls.add (slider);
+    addAndMakeVisible (slider);
+    sliderLinks.add (new juce::AudioProcessorValueTreeState::SliderAttachment (
+        proc.apvts, parameterId, *slider));
+}
+
+void MidiDelayEditor::resized()
+{
+    for (int i = 0; i < controls.size(); ++i)
+    {
+        const int column = i % columns;
+        const int row = i / columns;
+
+        juce::Rectangle<int> cell (margin + column * cellWidth,
+                                   headerHeight + row * cellHeight,
+                                   cellWidth, cellHeight);
+
+        captions[i]->setBounds (cell.removeFromTop (16));
+
+        // Список и галка занимают одну строку по центру ячейки, ручка — всю ячейку.
+        if (dynamic_cast<juce::Slider*> (controls[i]) != nullptr)
+            controls[i]->setBounds (cell.reduced (6, 2));
+        else
+            controls[i]->setBounds (cell.withSizeKeepingCentre (cellWidth - 28, 24));
+    }
 }
 
 void MidiDelayEditor::timerCallback()
@@ -35,31 +128,49 @@ void MidiDelayEditor::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff1a1a1e));
 
+    auto header = getLocalBounds().removeFromTop (headerHeight).reduced (margin, 8);
+
     g.setColour (juce::Colours::white);
-    g.setFont (juce::FontOptions (22.0f));
-    g.drawText ("MIDI Delay", getLocalBounds().removeFromTop (90),
-                juce::Justification::centredBottom, false);
+    g.setFont (juce::FontOptions (20.0f));
+    g.drawText ("MIDI Delay", header.removeFromTop (26),
+                juce::Justification::centredLeft, false);
 
     // Текст интерфейса — только ASCII: juce::String трактует обычный литерал
     // как ASCII, и любая кириллица превращается в мусор. См. CLAUDE.md.
     const auto count = juce::jmax (0, lastCount);
-    auto area = getLocalBounds().withTrimmedTop (95);
 
-    // Движок питчинга и его минимальный delay time (ADR 0005). Своего переключателя
-    // тут нет — параметр крутится из панели плагина в хосте, а показ нужен затем,
-    // чтобы не гадать, какой движок звучит. Настоящий интерфейс — веха M4.
-    //
-    // Предел спрашивается у процессора, а не написан здесь числом (#17): он равен
-    // латентности движка и меняется вместе с его окном. Когда выставленное время
-    // ниже предела, строка про это и говорит — иначе хвост молча приходил бы позже
-    // заказанного, и понять причину было бы неоткуда.
+    g.setColour (count > 0 ? juce::Colours::limegreen : juce::Colours::grey);
+    g.setFont (juce::FontOptions (13.0f));
+
+    auto midiLine = header.removeFromTop (20);
+
+    if (count > 0)
+    {
+        const auto shown = juce::jmax (-1, shownNote);
+        const auto ratio = proc.lastRatio.load (std::memory_order_relaxed);
+        auto text = "MIDI OK - notes received: " + juce::String (count);
+
+        if (shown >= 0)
+            // Октава по-фловски: в FL Studio средняя до — C5, а не C3, и имя из другой
+            // конвенции сбивало бы с толку сильнее, чем помогало.
+            text += "   last " + juce::MidiMessage::getMidiNoteName (shown, true, true, 5)
+                  + "   ratio " + juce::String (ratio, 3);
+
+        g.drawText (text, midiLine, juce::Justification::centredLeft, false);
+    }
+    else
+    {
+        g.drawText ("No MIDI input - set the same port in MIDI Out and in the wrapper",
+                    midiLine, juce::Justification::centredLeft, false);
+    }
+
     // В Follow движок свой и предела на время нет: там показывается то, что важно
     // именно в этом режиме, — сколько плагин просит скомпенсировать у хоста.
     // Если хост этого не делает, хвост уедет от сухого ровно на это число.
     const auto minDelay = proc.getMinDelayMs();
     auto engineText = juce::String (shownFollow ? "Mode: Follow - tail sits on the note"
-                                    : shownQuality > 0 ? "Engine: HQ (Signalsmith)"
-                                                       : "Engine: Fast (varispeed)");
+                                    : shownQuality > 0 ? "Mode: Free - HQ (Signalsmith)"
+                                                       : "Mode: Free - Fast (varispeed)");
 
     if (shownFollow)
         engineText += " - host must compensate " + juce::String (shownAlignment) + " ms";
@@ -68,45 +179,9 @@ void MidiDelayEditor::paint (juce::Graphics& g)
                                     : " - min delay ") + juce::String (minDelay, 0) + " ms";
 
     if (! shownFollow && shownAlignment > 0)
-        engineText += " - offset " + juce::String (shownAlignment) + " ms to host";
+        engineText += " - offset costs " + juce::String (shownAlignment) + " ms to host";
 
     g.setColour (shownClamped && ! shownFollow ? juce::Colours::orange : juce::Colours::grey);
     g.setFont (juce::FontOptions (12.0f));
-    g.drawText (engineText, getLocalBounds().removeFromBottom (26),
-                juce::Justification::centredTop, false);
-
-    g.setColour (count > 0 ? juce::Colours::limegreen : juce::Colours::grey);
-    g.setFont (juce::FontOptions (15.0f));
-    g.drawText (count > 0 ? "MIDI OK - notes received: " + juce::String (count)
-                          : "No MIDI input",
-                area.removeFromTop (24), juce::Justification::centredTop, false);
-
-    if (count == 0)
-    {
-        g.setColour (juce::Colours::grey.withAlpha (0.7f));
-        g.setFont (juce::FontOptions (12.0f));
-        g.drawText ("Set the same MIDI port in MIDI Out and in the wrapper settings",
-                    area.removeFromTop (20), juce::Justification::centredTop, false);
-        return;
-    }
-
-    // Последняя нота и её ratio: видно, что транспонирование посчиталось и каким.
-    // Ratio 1.00 на ноте, равной Root Key, — это норма, а не отсутствие эффекта.
-    const auto note = juce::jmax (-1, shownNote);
-
-    if (note >= 0)
-    {
-        const auto ratio = proc.lastRatio.load (std::memory_order_relaxed);
-        const auto semitones = juce::roundToInt (12.0f * std::log2 (ratio));
-
-        g.setColour (juce::Colours::white.withAlpha (0.8f));
-        g.setFont (juce::FontOptions (12.0f));
-        g.drawText ("Last note " + juce::String (note)
-                        // Октава по-фловски: в FL Studio средняя до — C5, а не C3,
-                        // и имя из другой конвенции сбивало бы с толку сильнее, чем помогало.
-                        + " (" + juce::MidiMessage::getMidiNoteName (note, true, true, 5) + ")"
-                        + "   ratio " + juce::String (ratio, 3)
-                        + "   " + (semitones >= 0 ? "+" : "") + juce::String (semitones) + " st",
-                    area.removeFromTop (20), juce::Justification::centredTop, false);
-    }
+    g.drawText (engineText, header.removeFromTop (18), juce::Justification::centredLeft, false);
 }

@@ -1,8 +1,15 @@
 #pragma once
 #include "PluginProcessor.h"
 
-/** Временный редактор вехи M0: показывает, что плагин жив и что MIDI до него доходит.
-    Настоящий интерфейс — веха M4. */
+/** Рабочее окно: сверху диагностика (доходит ли MIDI, какой режим, что просится
+    у хоста), снизу сетка органов управления.
+
+    Это ещё не интерфейс — интерфейс это #26 и #27, веха M4: свой LookAndFeel,
+    группировка по смыслу, показ активных нот и хвостов. Здесь стоит ровно то,
+    без чего плагин нельзя покрутить, не разыскивая параметры в списке хоста.
+
+    Органы строятся по типу параметра, а не расписаны по одному: пятнадцать почти
+    одинаковых блоков по шесть строк каждый — это сто строк, которые нечего читать. */
 class MidiDelayEditor final : public juce::AudioProcessorEditor,
                               private juce::Timer
 {
@@ -10,12 +17,23 @@ public:
     explicit MidiDelayEditor (MidiDelayProcessor&);
 
     void paint (juce::Graphics&) override;
-    void resized() override {}
+    void resized() override;
 
 private:
     void timerCallback() override;
 
+    /** Заводит орган под параметр: список для выбора, галку для флага, ручку
+        для всего остального. Привязка к APVTS живёт в соответствующем массиве. */
+    void addControl (const juce::String& parameterId);
+
     MidiDelayProcessor& proc;
+
+    juce::OwnedArray<juce::Component> controls;
+    juce::OwnedArray<juce::Label> captions;
+    juce::OwnedArray<juce::AudioProcessorValueTreeState::SliderAttachment> sliderLinks;
+    juce::OwnedArray<juce::AudioProcessorValueTreeState::ComboBoxAttachment> comboLinks;
+    juce::OwnedArray<juce::AudioProcessorValueTreeState::ButtonAttachment> buttonLinks;
+
     int lastCount = -1;
     int shownNote = -2;
     int shownQuality = -1;
