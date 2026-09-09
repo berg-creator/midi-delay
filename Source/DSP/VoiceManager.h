@@ -21,6 +21,7 @@ public:
     void setDelaySamples (double delaySamples);   // латентность питчера вычитает голос
     void setEnvelope (float attackMs, float releaseMs);
     void setVoiceLimit (int numVoices);           // параметр Voices, не больше maxVoices
+    void setQuality (bool useHq);                 // параметр Quality: varispeed или Signalsmith
 
     void noteOn (int midiNote, float velocity, float ratio, float pan);
     void noteOff (int midiNote);
@@ -42,6 +43,7 @@ private:
     unsigned nextAge = 0;
     int blockSize = 0;
     int voiceLimit = maxVoices;
+    bool hq = false;
     double sampleRate = 44100.0;
     double delaySamples = 2.0;
     bool sustainDown = false;

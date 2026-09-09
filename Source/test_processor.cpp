@@ -3,6 +3,9 @@
 // пул голосов и маппинг ноты в pitch ratio. Без фреймворков.
 // Собирается и запускается так (в CI намеренно не собирается, см. CMakeLists.txt):
 //   cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Release/ProcessorTest
+// Офлайн-рендер для слуховой проверки (#19):
+//   ./build/ProcessorTest_artefacts/Release/ProcessorTest --render out-hq.wav hq
+//   ./build/ProcessorTest_artefacts/Release/ProcessorTest --render out-fast.wav fast
 
 #include "PluginProcessor.h"
 
@@ -113,9 +116,12 @@ namespace
 }
 
 /** Офлайн-рендер для проверки на слух: пила 220 Гц на вход, короткая мелодия в MIDI,
-    результат в WAV. Не тест — тесты не умеют сказать «звучит убедительно». Зародыш #19.
-    Запуск: ProcessorTest --render out.wav */
-static int renderDemo (const juce::String& path)
+    результат в WAV. Не тест — тесты не умеют сказать «звучит убедительно». Это #19.
+    Движок выбирается третьим аргументом, чтобы можно было сравнить их на одном
+    и том же материале; по умолчанию — HQ, то есть то, что услышит пользователь.
+    Рендер воспроизводим: зерно случайной фазы у HQ-движка фиксировано.
+    Запуск: ProcessorTest --render out.wav [fast|hq] */
+static int renderDemo (const juce::String& path, bool hq)
 {
     constexpr double sr = 48000.0;
     constexpr int blockSize = 512;
@@ -132,6 +138,7 @@ static int renderDemo (const juce::String& path)
     setParam (proc, "release", 300.0f);
     setParam (proc, "rootKey", 0.0f);       // C
     setParam (proc, "pitchRange", 12.0f);
+    setParam (proc, "quality", hq ? 1.0f : 0.0f);
 
     proc.setPlayConfigDetails (2, 2, sr, blockSize);
     proc.prepareToPlay (sr, blockSize);
@@ -194,7 +201,8 @@ static int renderDemo (const juce::String& path)
     writer->writeFromAudioSampleBuffer (out, 0, total);
     writer.reset();
 
-    std::printf ("rendered %s (%.1f s)\n", file.getFullPathName().toRawUTF8(), seconds);
+    std::printf ("rendered %s (%.1f s, %s)\n", file.getFullPathName().toRawUTF8(),
+                 seconds, hq ? "hq" : "fast");
     return 0;
 }
 
@@ -205,7 +213,8 @@ int main (int argc, char* argv[])
     juce::ScopedJuceInitialiser_GUI juceInit;
 
     if (argc >= 3 && juce::String (argv[1]) == "--render")
-        return renderDemo (juce::String (argv[2]));
+        return renderDemo (juce::String (argv[2]),
+                           argc < 4 || juce::String (argv[3]) != "fast");
 
     // --- Раскладки шин ---------------------------------------------------------
     {
@@ -235,10 +244,12 @@ int main (int argc, char* argv[])
         // 200 мс — ровно 9600 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
         // Некруглое время село бы между сэмплами, и импульс размазался бы интерполяцией.
         //
-        // Не 10 мс, как было до #14: латентность varispeed — полокна, 5762 сэмпла
-        // (120 мс), и она вычитается из позиции чтения. При delay time меньше неё
-        // смещение уходит в минус, упирается в кламп, и голос звучит позже заказанного.
-        // Минимальный осмысленный delay time = латентность движка; это #17.
+        // Не 10 мс, как было до #14: латентность движка вычитается из позиции чтения,
+        // и при delay time меньше неё смещение уходит в минус, упирается в кламп,
+        // а голос звучит позже заказанного. Минимальный осмысленный delay time равен
+        // латентности движка; это #17. У Fast это 5762 сэмпла (120 мс), у HQ — 8640
+        // (180 мс), и 200 мс с запасом больше обоих. Quality здесь не выставляется
+        // намеренно: тест обязан проходить на движке по умолчанию.
         constexpr float delayMs = 200.0f;
         constexpr int delaySamples = 9600;
 
@@ -378,6 +389,13 @@ int main (int argc, char* argv[])
         //    к своей цели, равенства нет, и это не баг.
         // 162 мс — ближайшее к латентности движка время, дающее половину периода
         // 250 Гц. Меньше нельзя: 120 мс это сама латентность, запас нужен.
+        //
+        // Quality = Fast явно. Этот тест про кроссфейды микса, гейна и обхода, а не
+        // про питчинг, и держится он на противофазе wet к dry — то есть на конкретном
+        // времени 162 мс. У HQ латентность 180 мс, 162 в неё не влезает, и хвост поехал
+        // бы позже заказанного. Двигать время значило бы пересчитывать всю конструкцию
+        // теста ради проверки, к движку не относящейся.
+        setParam (proc, "quality", 0.0f);
         setParam (proc, "delayTime", 162.0f);
         setParam (proc, "feedback", 0.0f);
         setParam (proc, "outputGain", 0.0f);
@@ -769,10 +787,11 @@ int main (int argc, char* argv[])
     }
 
     // --- Маппинг ноты в pitch ratio (#15) --------------------------------------
-    // Пробный тон — 500 Гц. Это не произвол: в полуокне питчера (5760 сэмплов при
+    // Пробный тон — 500 Гц. Это не произвол: в полуокне varispeed (5760 сэмплов при
     // 48 кГц и окне 240 мс) укладывается ровно 60 его периодов, и только на таких
-    // частотах varispeed сдвигает без расстройки квантования. Разбор механизма —
-    // в Source/DSP/test_pitch_shifter.cpp, раздел 4.
+    // частотах он сдвигает без расстройки квантования. Разбор механизма —
+    // в Source/DSP/test_pitch_shifter.cpp, раздел 4. HQ этой хитрости не требует,
+    // но и не мешает ей: проверка идёт на движке по умолчанию.
     {
         constexpr double sr = 48000.0;
         constexpr int blockSize = 2048;
@@ -788,7 +807,7 @@ int main (int argc, char* argv[])
                                         float rootKeyAfter, double expected)
         {
             MidiDelayProcessor proc;
-            setParam (proc, "delayTime", 200.0f);   // больше латентности движка (120 мс)
+            setParam (proc, "delayTime", 200.0f);   // больше латентности обоих движков
             setParam (proc, "feedback", 0.0f);
             setParam (proc, "mix", 100.0f);        // на выходе только хвост, без dry
             setParam (proc, "outputGain", 0.0f);
@@ -893,6 +912,126 @@ int main (int argc, char* argv[])
             juce::AudioProcessor::copyXmlToBinary (*xml, futureBlock);
 
         proc.setStateInformation (futureBlock.getData(), static_cast<int> (futureBlock.getSize()));
+    }
+
+    // --- Переключатель Quality (#38) -------------------------------------------
+    // Движки различаются латентностью: Fast 5762 сэмпла, HQ 8640. Delay time 150 мс
+    // (7200 сэмплов) лежит ровно между ними — у Fast смещение чтения остаётся
+    // положительным и хвост приходит на 7200-м, у HQ упирается в кламп и хвост
+    // приходит на 8640-м, то есть позже заказанного. Значит позиция пика прямо
+    // показывает, какой движок реально отработал: это и есть проверка латча.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 16384;
+
+        const auto tailPeak = [] (float quality)
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", quality);
+            setParam (proc, "delayTime", 150.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "attack", 1.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> buffer (2, blockSize);
+            buffer.clear();
+            buffer.setSample (0, 0, 1.0f);
+            buffer.setSample (1, 0, 1.0f);
+
+            runBlock (proc, buffer, noteOnAt (0));
+            CHECK (allocations.load() == 0);
+
+            int peak = -1;
+            float peakValue = 0.0f;
+
+            for (int i = 0; i < blockSize; ++i)
+                if (std::abs (buffer.getSample (0, i)) > peakValue)
+                {
+                    peakValue = std::abs (buffer.getSample (0, i));
+                    peak = i;
+                }
+
+            CHECK (peakValue > 0.99f);
+            return peak;
+        };
+
+        CHECK (tailPeak (0.0f) == 7200);
+        CHECK (tailPeak (1.0f) == 8640);
+    }
+
+    // --- Смена Quality на лету не роняет звучащую ноту и не щёлкает (#38) -------
+    // Звучащий голос обязан доиграть на своём движке: переключение латчится только
+    // на старте ноты. Проверяется тем, что слышно, — непрерывностью сигнала.
+    {
+        MidiDelayProcessor proc;
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 4096;
+        constexpr float freq = 250.0f;
+
+        setParam (proc, "quality", 0.0f);
+        setParam (proc, "delayTime", 400.0f);
+        setParam (proc, "mix", 100.0f);
+        setParam (proc, "feedback", 0.0f);
+        setParam (proc, "outputGain", 0.0f);
+        setParam (proc, "attack", 1.0f);
+        setParam (proc, "release", 300.0f);
+
+        proc.setPlayConfigDetails (2, 2, sr, blockSize);
+        proc.prepareToPlay (sr, blockSize);
+
+        juce::AudioBuffer<float> buffer (2, blockSize);
+        int phase = 0;
+        float lastSample = 0.0f;
+        float maxStep = 0.0f;
+        double tailRms = 0.0;
+
+        for (int b = 0; b < 24; ++b)
+        {
+            for (int i = 0; i < blockSize; ++i)
+            {
+                const float s = 0.25f * std::sin (juce::MathConstants<float>::twoPi
+                                                  * freq * (float) (phase + i) / (float) sr);
+                buffer.setSample (0, i, s);
+                buffer.setSample (1, i, s);
+            }
+
+            phase += blockSize;
+
+            // Нота на первом блоке, переключение движка — на двенадцатом, посреди неё.
+            juce::MidiBuffer midi;
+            if (b == 0) midi.addEvent (juce::MidiMessage::noteOn (1, 60, 0.9f), 0);
+            if (b == 12) setParam (proc, "quality", 1.0f);
+
+            runBlock (proc, buffer, midi);
+            CHECK (allocations.load() == 0);
+
+            // Первые блоки пропускаем: там ещё разгон кольца и атака огибающей.
+            if (b >= 6)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float s = buffer.getSample (0, i);
+                    maxStep = juce::jmax (maxStep, std::abs (s - lastSample));
+                    lastSample = s;
+                }
+
+                if (b >= 13)
+                    for (int i = 0; i < blockSize; ++i)
+                        tailRms += (double) buffer.getSample (0, i) * buffer.getSample (0, i);
+            }
+        }
+
+        // Синус 250 Гц амплитуды 0,25 даёт 0,008 на сэмпл. Порог 0,05 сигнала
+        // не задевает, но щелчок от подмены движка посреди ноты поймал бы сразу.
+        CHECK (maxStep < 0.05f);
+
+        // И голос не умолк: после переключения хвост продолжает звучать.
+        tailRms = std::sqrt (tailRms / (11.0 * blockSize));
+        CHECK (tailRms > 0.1);
     }
 
     std::printf ("test_processor: OK\n");

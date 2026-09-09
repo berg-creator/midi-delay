@@ -11,11 +11,14 @@ void MidiDelayEditor::timerCallback()
 {
     const auto count = proc.midiNoteCount.load (std::memory_order_relaxed);
     const auto note  = proc.lastNote.load (std::memory_order_relaxed);
+    const auto quality = static_cast<int> (proc.apvts.getRawParameterValue ("quality")
+                                               ->load (std::memory_order_relaxed));
 
-    if (count != lastCount || note != shownNote)
+    if (count != lastCount || note != shownNote || quality != shownQuality)
     {
         lastCount = count;
         shownNote = note;
+        shownQuality = quality;
         repaint();
     }
 }
@@ -33,6 +36,16 @@ void MidiDelayEditor::paint (juce::Graphics& g)
     // как ASCII, и любая кириллица превращается в мусор. См. CLAUDE.md.
     const auto count = juce::jmax (0, lastCount);
     auto area = getLocalBounds().withTrimmedTop (95);
+
+    // Движок питчинга и его минимальный delay time (ADR 0005). Своего переключателя
+    // тут нет — параметр крутится из панели плагина в хосте, а показ нужен затем,
+    // чтобы не гадать, какой движок звучит. Настоящий интерфейс — веха M4.
+    g.setColour (juce::Colours::grey);
+    g.setFont (juce::FontOptions (12.0f));
+    g.drawText (shownQuality > 0 ? "Engine: HQ (Signalsmith) - min delay 180 ms"
+                                 : "Engine: Fast (varispeed) - min delay 120 ms",
+                getLocalBounds().removeFromBottom (26),
+                juce::Justification::centredTop, false);
 
     g.setColour (count > 0 ? juce::Colours::limegreen : juce::Colours::grey);
     g.setFont (juce::FontOptions (15.0f));

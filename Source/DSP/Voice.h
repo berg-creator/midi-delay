@@ -26,6 +26,11 @@ public:
     /** Возраст присваивает менеджер: счётчик один на весь пул, голосу его не вывести. */
     void setAge (unsigned newAge);
 
+    /** Параметр Quality: false — varispeed, true — Signalsmith (#38). Латчится
+        в момент старта ноты, звучащие голоса переключение не трогает — почему
+        именно так, написано в Voice.cpp у самого латча. */
+    void setQuality (bool useHq);
+
     void noteOn (int midiNote, float velocity, float ratio, double delaySamples, float pan);
     void noteOff();
 
@@ -60,7 +65,12 @@ private:
     float nextEnvelope();
     void start (int midiNote, float velocity, float ratio, float pan);
 
-    std::unique_ptr<PitchShifter> shifter;
+    // Оба движка живут всё время работы плагина и оба готовы: создать нужный
+    // в момент переключения нельзя, это аллокация из аудиопотока. Цена — память
+    // неиспользуемого движка, около 250 КБ на голос.
+    std::unique_ptr<PitchShifter> fastShifter, hqShifter;
+    PitchShifter* shifter = nullptr;   // активный; чей именно, решает старт ноты
+    bool wantHq = false;               // то, что просит параметр прямо сейчас
 
     Stage stage = Stage::idle;
     float level = 0.0f;        // текущий уровень огибающей

@@ -37,8 +37,15 @@ void Voice::prepare (double sampleRate, int maxBlockSamples)
 
     // Обвязка голоса от движка не зависит: UnityShifter остаётся эталоном в тестах,
     // на нём голос обязан быть бит-в-бит равен обычному дилею.
-    shifter = std::make_unique<VarispeedShifter> (pitchWindowMs);
-    shifter->prepare (sr, std::max (1, maxBlockSamples));
+    const int block = std::max (1, maxBlockSamples);
+
+    fastShifter = std::make_unique<VarispeedShifter> (pitchWindowMs);
+    fastShifter->prepare (sr, block);
+
+    hqShifter = std::make_unique<SignalsmithShifter>();
+    hqShifter->prepare (sr, block);
+
+    shifter = wantHq ? hqShifter.get() : fastShifter.get();
 
     stealSamples = std::max (1.0, sr * stealFadeMs * 0.001);
     setEnvelope (sr * 0.01, sr * 0.3);
@@ -56,8 +63,22 @@ void Voice::reset()
     sustained = false;
     needsPrime = false;
 
-    if (shifter != nullptr)
-        shifter->reset();
+    // Оба: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
+    // выдать чужой хвост при следующем переключении Quality.
+    if (fastShifter != nullptr) fastShifter->reset();
+    if (hqShifter   != nullptr) hqShifter->reset();
+}
+
+void Voice::setQuality (bool useHq)
+{
+    wantHq = useHq;
+
+    // Молчащий голос переключается сразу, звучащий — доигрывает на своём движке.
+    // Иначе пришлось бы посреди ноты залить окно нового движка, а латентность у них
+    // разная, и позиция чтения уехала бы на живом звуке. Голоса освобождаются на
+    // каждом release, так что на слух переключение доезжает за одну ноту.
+    if (stage == Stage::idle)
+        shifter = useHq ? hqShifter.get() : fastShifter.get();
 }
 
 void Voice::setEnvelope (double attack, double release)
@@ -100,6 +121,10 @@ void Voice::start (int midiNote, float velocity, float ratio, float pan)
 
 void Voice::noteOn (int midiNote, float velocity, float ratio, double newDelaySamples, float pan)
 {
+    // Латч движка: только здесь, до расчёта позиции чтения — она считается
+    // от латентности активного движка, а у движков она разная.
+    shifter = wantHq ? hqShifter.get() : fastShifter.get();
+
     setDelaySamples (newDelaySamples);
     level = 0.0f;
 
@@ -166,7 +191,9 @@ float Voice::nextEnvelope()
                     // сбрасывается, и с varispeed это уже не удобство, а необходимость:
                     // его окно хранит валидную историю по тому же readOffset, а сброс
                     // открыл бы 30 мс тишины, залить которые отсюда нечем — источника
-                    // здесь нет. Огибающая тут ровно ноль, ratio доедет к сегменту.
+                    // здесь нет. По той же причине здесь не меняется и движок: смена
+                    // Quality доедет до этого голоса со следующей ноты с чистого листа.
+                    // Огибающая тут ровно ноль, ratio доедет к сегменту.
                     setDelaySamples (delaySamples);
                     start (pendingNote, pendingVelocity, pendingRatio, pendingPan);
                 }

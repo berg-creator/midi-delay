@@ -123,6 +123,7 @@ private:
     std::atomic<float>* pVoices     = nullptr;
     std::atomic<float>* pRootKey    = nullptr;
     std::atomic<float>* pPitchRange = nullptr;
+    std::atomic<float>* pQuality    = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 

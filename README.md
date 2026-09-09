@@ -32,7 +32,12 @@ cmake --build build
 Плагины копируются в `~/Library/Audio/Plug-Ins/` автоматически.
 Валидация AU: `auval -v aumf Mdly Mkev`.
 
-**JUCE 9.0.2**, зафиксирован на теге в `libs/JUCE`.
+**JUCE 9.0.2**, зафиксирован на теге в `libs/JUCE` (submodule).
+
+**Signalsmith Stretch** — HQ-движок питчинга, MIT, вендорен копией заголовков
+в `libs/signalsmith-stretch` вместе со своей зависимостью `signalsmith-linear`.
+Почему копия, а не submodule, и как обновлять —
+[libs/signalsmith-stretch/README.md](libs/signalsmith-stretch/README.md).
 
 ### Офлайн-тесты DSP
 
@@ -41,7 +46,14 @@ cmake --build build
 
 ```bash
 c++ -std=c++20 -O2 Source/DSP/DelayBuffer.cpp Source/DSP/test_delay_buffer.cpp -o /tmp/tdb && /tmp/tdb
+
+c++ -std=c++20 -O2 -Ilibs/signalsmith-stretch Source/DSP/DelayBuffer.cpp \
+    Source/DSP/PitchShifter.cpp Source/DSP/test_pitch_shifter.cpp -o /tmp/tps && /tmp/tps
 ```
+
+Тест питчера заодно печатает таблицу расстройки обоих движков в центах — это тот
+замер, из которого выросли [ADR 0004](docs/adr/0004-varispeed-window.md)
+и [ADR 0005](docs/adr/0005-hq-pitch-engine.md).
 
 ### Про Xcode
 
@@ -56,7 +68,7 @@ c++ -std=c++20 -O2 Source/DSP/DelayBuffer.cpp Source/DSP/test_delay_buffer.cpp -
 |---|---|
 | [docs/ANALYSIS.md](docs/ANALYSIS.md) | Технический разбор: архитектура, узкие места, стек |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Шесть вех от прототипа до MVP |
-| [docs/ISSUES.md](docs/ISSUES.md) | 41 задача с метками и критериями приёмки |
+| [docs/ISSUES.md](docs/ISSUES.md) | 42 задачи с метками и критериями приёмки |
 | [docs/adr/](docs/adr/) | Архитектурные решения: ядро на голосах, движок питчинга |
 | [prompts/README.md](prompts/README.md) | Как вести работу короткими сессиями |
 | [CLAUDE.md](CLAUDE.md) | Правила работы и технические инварианты |

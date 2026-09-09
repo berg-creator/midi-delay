@@ -16,6 +16,19 @@ option(MIDIDELAY_COPY_PLUGIN "Копировать собранный плаги
 
 add_subdirectory(libs/JUCE)
 
+# HQ-движок питчинга (#38). Только заголовки, вендорены копией — почему копия, а не
+# submodule, написано в libs/signalsmith-stretch/README.md. Своего CMakeLists у копии
+# нет намеренно: одна INTERFACE-цель короче, чем два чужих файла с FetchContent.
+add_library(signalsmith-stretch INTERFACE)
+target_include_directories(signalsmith-stretch INTERFACE libs/signalsmith-stretch)
+
+# Единственное, что взято из выброшенного CMakeLists библиотеки: без /bigobj MSVC
+# не переваривает столько шаблонов и падает на «too many sections». На Windows это
+# проверяется только в CI, поэтому флаг стоит здесь, а не выясняется красной сборкой.
+if(MSVC)
+    target_compile_options(signalsmith-stretch INTERFACE /bigobj)
+endif()
+
 juce_add_plugin(MidiDelay
     COMPANY_NAME            "mke"
     PLUGIN_MANUFACTURER_CODE Mkev
@@ -51,6 +64,7 @@ target_compile_definitions(MidiDelay PUBLIC
 
 target_link_libraries(MidiDelay PRIVATE
     juce::juce_audio_utils
+    signalsmith-stretch
     PUBLIC
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
@@ -79,4 +93,5 @@ target_compile_definitions(ProcessorTest PRIVATE
 
 target_link_libraries(ProcessorTest PRIVATE
     juce::juce_audio_utils
+    signalsmith-stretch
     juce::juce_recommended_config_flags)

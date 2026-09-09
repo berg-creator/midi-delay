@@ -1,4 +1,6 @@
 #pragma once
+#include <memory>
+
 #include "DelayBuffer.h"
 
 /** Транспонирование одного моно-голоса. Потоковый: сколько сэмплов подали, столько
@@ -46,6 +48,34 @@ private:
     double sweep = 1.0;      // задержка первого ридера внутри окна, [0, window)
     double step = 0.0;       // 1 - ratio: на столько едет sweep за сэмпл
     int latency = 1;         // minDelay + window/2, константа между вызовами prepare
+};
+
+/** HQ-движок (#38): Signalsmith Stretch, фазовый вокодер с phase locking.
+    MIT, вендорен копией в libs/signalsmith-stretch. Varispeed расстраивает хвост
+    неустранимо (ADR 0004), этот — нет: спектр переносится по частоте, а не читается
+    с переменной скоростью, и сетки f0 + k/T у него не возникает.
+
+    Библиотека — шаблон на 35 КБ заголовка, поэтому она спрятана в pimpl: тянуть её
+    в каждую единицу трансляции ради одного класса дорого по времени сборки, а больше
+    её никто не видит. См. ADR 0005. */
+class SignalsmithShifter final : public PitchShifter
+{
+public:
+    SignalsmithShifter();
+    ~SignalsmithShifter() override;
+
+    void prepare (double sampleRate, int maxBlockSamples) override;
+    void reset() override;
+    void setRatio (float ratio) override;
+    void process (const float* in, float* out, int numSamples) override;
+    int getLatencySamples() const override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl;
+
+    int latency = 0;       // inputLatency + outputLatency, константа между вызовами prepare
+    float ratio = 1.0f;    // последнее заданное значение: движок дёргаем только на смене
 };
 
 /** Эталон: вход копируется в выход, ratio игнорируется, латентность ноль. Была

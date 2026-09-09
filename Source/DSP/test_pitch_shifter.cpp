@@ -1,14 +1,17 @@
-// Офлайн-тест VarispeedShifter (#14): высота сдвига, equal-power кроссфейд,
-// постоянство латентности, ноль аллокаций. Без фреймворков и без JUCE.
-// Собирается и запускается одной командой:
-//   c++ -std=c++20 -O2 Source/DSP/DelayBuffer.cpp Source/DSP/PitchShifter.cpp \
-//       Source/DSP/test_pitch_shifter.cpp -o /tmp/tps && /tmp/tps
+// Офлайн-тест обоих движков питчинга (#14, #38): высота сдвига, потоковость,
+// постоянство латентности, ноль аллокаций, equal-power кроссфейд у varispeed.
+// Заодно меряет расстройку хвоста в центах и печатает её таблицей — это тот замер,
+// ради которого HQ-движок и появился (ADR 0004, ADR 0005).
+// Без фреймворков и без JUCE. Собирается и запускается одной командой:
+//   c++ -std=c++20 -O2 -Ilibs/signalsmith-stretch Source/DSP/DelayBuffer.cpp \
+//       Source/DSP/PitchShifter.cpp Source/DSP/test_pitch_shifter.cpp -o /tmp/tps && /tmp/tps
 
 #include "PitchShifter.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
 #include <new>
 #include <vector>
 
@@ -77,6 +80,46 @@ namespace
         return best;
     }
 
+    /** Частота пика с точностью много лучше герца: грубый проход сеткой в 1 Гц,
+        потом уточнение шагом 0,005 Гц. Тупой перебор, зато без окон и без БПФ —
+        а на 110 Гц один герц это 157 центов, то есть грубой сетки тут не хватает. */
+    double refinedFrequency (const std::vector<float>& x, size_t from, size_t count,
+                             double centre, double span)
+    {
+        const double coarse = dominantFrequency (x, from, count, centre - span, centre + span);
+
+        double best = coarse, bestAmp = -1.0;
+
+        for (double f = coarse - 1.0; f <= coarse + 1.0; f += 0.005)
+        {
+            const double a = amplitudeAt (x, from, count, f);
+
+            if (a > bestAmp) { bestAmp = a; best = f; }
+        }
+
+        return best;
+    }
+
+    double centsBetween (double measured, double expected)
+    {
+        return 1200.0 * std::log2 (measured / expected);
+    }
+
+    enum class Engine { varispeed, signalsmith };
+
+    const char* engineName (Engine e)
+    {
+        return e == Engine::signalsmith ? "signalsmith" : "varispeed ";
+    }
+
+    std::unique_ptr<PitchShifter> makeShifter (Engine e)
+    {
+        if (e == Engine::signalsmith)
+            return std::make_unique<SignalsmithShifter>();
+
+        return std::make_unique<VarispeedShifter> (windowMs);
+    }
+
     std::vector<float> sine (int n, double freq, double amp = 0.5)
     {
         std::vector<float> x (static_cast<size_t> (n));
@@ -85,6 +128,29 @@ namespace
             x[static_cast<size_t> (i)] = static_cast<float> (amp * std::sin (2.0 * pi * freq * i / sr));
 
         return x;
+    }
+
+    /** Расстройка хвоста в центах: подаём чистый тон f0, просим сдвиг на semitones,
+        меряем, куда движок его на самом деле поставил. Ровно та величина, из-за которой
+        varispeed уступил место Signalsmith — см. ADR 0004 и ADR 0005. */
+    double measureDetune (Engine engine, double f0, int semitones)
+    {
+        constexpr int n = 65536;
+        const double ratio = std::pow (2.0, semitones / 12.0);
+        const double expected = f0 * ratio;
+
+        auto shifter = makeShifter (engine);
+        shifter->prepare (sr, 2048);
+        shifter->setRatio (static_cast<float> (ratio));
+
+        const auto out = run (*shifter, sine (n, f0), 2048);
+
+        // Полсекунды на прогрев: там ещё тишина и первый проезд окна у varispeed.
+        // Окно замера 32768 сэмплов — разрешение ДПФ 1,5 Гц, уточнение доводит до сотых.
+        const double measured = refinedFrequency (out, 24000, 32768, expected,
+                                                  std::max (20.0, 0.05 * expected));
+
+        return centsBetween (measured, expected);
     }
 
     /** Шум, ограниченный сверху однополюсным фильтром. Именно ограниченный: широкий
@@ -123,29 +189,36 @@ namespace
 int main()
 {
     // --- 1. Латентность: константа, не зависит от ratio -------------------------
+    // Инвариант ADR 0002 и для обоих движков одинаково обязателен: латентность
+    // вычитается из позиции чтения один раз, вне аудиопотока.
+    for (const auto engine : { Engine::varispeed, Engine::signalsmith })
     {
-        VarispeedShifter shifter (windowMs);
-        shifter.prepare (sr, 512);
+        auto shifter = makeShifter (engine);
+        shifter->prepare (sr, 512);
 
-        const int latency = shifter.getLatencySamples();
+        const int latency = shifter->getLatencySamples();
 
-        // 240 мс на 48 кГц — окно 11520 сэмплов, половина 5760, плюс минимум DelayBuffer.
-        CHECK (latency == 5762);
+        // Varispeed: окно 240 мс — 11520 сэмплов, половина 5760, плюс минимум DelayBuffer.
+        // Signalsmith: окно 0,18 с, анализ и синтез забирают по половине — ровно 8640,
+        // то есть 180 мс. Почему именно 0,18 — таблица замеров в PitchShifter.cpp.
+        CHECK (latency == (engine == Engine::signalsmith ? 8640 : 5762));
 
         for (const float ratio : { 0.25f, 0.5f, 0.99f, 1.0f, 1.5f, 2.0f, 4.0f, 100.0f, -3.0f })
         {
-            shifter.setRatio (ratio);
+            shifter->setRatio (ratio);
 
             std::vector<float> out (256, 0.0f);
             const auto in = sine (256, 440.0);
-            shifter.process (in.data(), out.data(), 256);
+            shifter->process (in.data(), out.data(), 256);
 
-            CHECK (shifter.getLatencySamples() == latency);
+            CHECK (shifter->getLatencySamples() == latency);
         }
     }
 
-    // --- 2. Ratio = 1 — ровно целочисленная задержка, бит-в-бит -----------------
+    // --- 2. Varispeed, ratio = 1 — ровно целочисленная задержка, бит-в-бит ------
     // Это же и эталон для #19: на unity голос обязан звучать как обычный дилей.
+    // Только varispeed: у Signalsmith при ratio = 1 сигнал всё равно проходит через
+    // анализ и синтез STFT, и бит-в-бит равенство входу от него требовать нечестно.
     {
         VarispeedShifter shifter (windowMs);
         shifter.prepare (sr, 512);
@@ -166,17 +239,18 @@ int main()
     // --- 3. Потоковость: размер блока на выход не влияет ------------------------
     // Питчер обязан быть бит-в-бит одинаков при любой нарезке, иначе покраснеет
     // тест размеров блока в test_processor.cpp — и это будет баг здесь, а не там.
+    for (const auto engine : { Engine::varispeed, Engine::signalsmith })
     {
         const auto in = sine (32768, 330.0);
         std::vector<float> reference;
 
         for (const int block : { 1, 7, 64, 512, 4096 })
         {
-            VarispeedShifter shifter (windowMs);
-            shifter.prepare (sr, 4096);
-            shifter.setRatio (1.25f);
+            auto shifter = makeShifter (engine);
+            shifter->prepare (sr, 4096);
+            shifter->setRatio (1.25f);
 
-            const auto out = run (shifter, in, block);
+            const auto out = run (*shifter, in, block);
 
             if (reference.empty()) reference = out;
             else                   for (size_t i = 0; i < out.size(); ++i) CHECK (out[i] == reference[i]);
@@ -192,6 +266,7 @@ int main()
     // 500 Гц это ровно 60 периодов. Тогда оба ридера синфазны, кроссфейд не крутит фазу,
     // и сдвиг получается точным для любого ratio. Проверка ниже документирует, что
     // бывает с частотой не с сетки — это потолок движка, а не порог теста.
+    for (const auto engine : { Engine::varispeed, Engine::signalsmith })
     {
         constexpr double f0 = 500.0;
         constexpr int n = 65536;
@@ -202,7 +277,8 @@ int main()
             const double ratio = std::pow (2.0, semitones / 12.0);
             const double expected = f0 * ratio;
 
-            VarispeedShifter shifter (windowMs);
+            auto shifterOwner = makeShifter (engine);
+            auto& shifter = *shifterOwner;
             shifter.prepare (sr, 2048);
             shifter.setRatio (static_cast<float> (ratio));
 
@@ -237,7 +313,7 @@ int main()
         }
     }
 
-    // --- 4b. Потолок движка: расстройка на частоте не с сетки --------------------
+    // --- 4b. Потолок varispeed: расстройка на частоте не с сетки -----------------
     // 440 Гц — это 52,8 периода в полуокне, то есть мимо сетки. Сдвиг квантуется
     // шагом 1/T = |1 - ratio| / окно; на октаву вверх это 4,2 Гц, и промах доходит
     // до целого шага. Проверка держит именно эту границу: она пройдёт и на движке,
@@ -266,7 +342,7 @@ int main()
         }
     }
 
-    // --- 5. Кроссфейд equal-power: провала RMS в центре перехода нет -------------
+    // --- 5. Varispeed, кроссфейд equal-power: провала RMS в центре перехода нет --
     // Два ридера разнесены на пол-окна, то есть на 30 мс: полосный шум за это время
     // раскоррелирован полностью, и складываются они по мощности. Equal-power держит
     // gA^2 + gB^2 = 1, значит RMS постоянен. Линейный кроссфейд дал бы в центре
@@ -306,25 +382,85 @@ int main()
     }
 
     // --- 6. Ноль аллокаций вне prepare -----------------------------------------
+    for (const auto engine : { Engine::varispeed, Engine::signalsmith })
     {
-        VarispeedShifter shifter (windowMs);
-        shifter.prepare (sr, 512);
+        auto shifter = makeShifter (engine);
+        shifter->prepare (sr, 512);
 
         const auto in = sine (4096, 440.0);
         std::vector<float> out (in.size(), 0.0f);
+
+        // Первый блок вне счётчика: у Signalsmith внутренний временный буфер дорастает
+        // до своей ёмкости на первом же вызове, дальше resize её не трогает.
+        shifter->setRatio (1.5f);
+        shifter->process (in.data(), out.data(), 512);
 
         const long before = allocations;
 
         for (size_t i = 0; i < in.size(); i += 512)
         {
-            shifter.setRatio (1.5f);
-            shifter.process (in.data() + i, out.data() + i, 512);
+            shifter->setRatio (1.5f);
+            shifter->process (in.data() + i, out.data() + i, 512);
         }
 
-        shifter.reset();
-        shifter.setRatio (0.5f);
+        shifter->reset();
+        shifter->setRatio (0.5f);
 
         CHECK (allocations == before);
+    }
+
+    // --- 7. Расстройка хвоста: замер обоих движков одним и тем же ---------------
+    // Тот самый замер, ради которого поднята #38. Частоты выбраны не по вкусу:
+    // 110-140 Гц — область мужского вокала, и именно там varispeed промахивался хуже
+    // всего (ADR 0004). 500 Гц оставлено как контроль: оно лежит ровно на сетке
+    // varispeed (60 периодов в полуокне), и там он обязан быть точен.
+    {
+        constexpr double freqs[] { 110.0, 130.0, 220.0, 440.0, 500.0 };
+        constexpr int shifts[] { -12, -7, -3, 3, 7, 12 };
+
+        std::printf ("\nРасстройка хвоста, центы (полутонов: ");
+
+        for (const int st : shifts) std::printf ("%+4d", st);
+        std::printf (")\n");
+
+        double worst[2] { 0.0, 0.0 };
+        double sum[2] { 0.0, 0.0 };
+        int count = 0;
+
+        for (const double f0 : freqs)
+        {
+            for (const auto engine : { Engine::varispeed, Engine::signalsmith })
+            {
+                const int e = engine == Engine::signalsmith ? 1 : 0;
+                std::printf ("  %6.0f Гц  %s ", f0, engineName (engine));
+
+                for (const int st : shifts)
+                {
+                    const double cents = measureDetune (engine, f0, st);
+
+                    std::printf ("%+7.1f", cents);
+
+                    worst[e] = std::max (worst[e], std::abs (cents));
+                    sum[e] += std::abs (cents);
+
+                    if (e == 1) ++count;
+                }
+
+                std::printf ("\n");
+            }
+        }
+
+        std::printf ("  varispeed:   среднее %.1f, худшее %.1f центов\n", sum[0] / count, worst[0]);
+        std::printf ("  signalsmith: среднее %.1f, худшее %.1f центов\n\n", sum[1] / count, worst[1]);
+
+        // Пороги поставлены по замеру с запасом примерно вдвое. Они ловят не «стало
+        // чуть хуже», а «движок сломался» или «кто-то уменьшил окно STFT».
+        CHECK (worst[1] < 25.0);
+        CHECK (sum[1] / count < 8.0);
+
+        // И главное — ради чего менялся движок: HQ обязан быть точнее Fast.
+        CHECK (worst[1] < worst[0]);
+        CHECK (sum[1] < sum[0]);
     }
 
     std::printf ("test_pitch_shifter: OK\n");

@@ -16,6 +16,10 @@ void VoiceManager::prepare (double newSampleRate, int maxBlockSamples)
     scratch.assign (static_cast<size_t> (blockSize) * 2u, 0.0f);
     nextAge = 0;
     sustainDown = false;
+
+    // prepare пересоздал движки, а значит сбросил и латч: вернуть выбор параметра.
+    for (auto& v : voices)
+        v.setQuality (hq);
 }
 
 void VoiceManager::reset()
@@ -84,6 +88,17 @@ Voice& VoiceManager::findVoiceFor (int)
     }
 
     return voices[oldestReleasing >= 0 ? oldestReleasing : quietest];
+}
+
+void VoiceManager::setQuality (bool useHq)
+{
+    if (useHq == hq)
+        return;
+
+    hq = useHq;
+
+    for (auto& v : voices)
+        v.setQuality (useHq);
 }
 
 void VoiceManager::noteOn (int midiNote, float velocity, float ratio, float pan)

@@ -17,6 +17,7 @@ MidiDelayProcessor::MidiDelayProcessor()
     pVoices     = apvts.getRawParameterValue ("voices");
     pRootKey    = apvts.getRawParameterValue ("rootKey");
     pPitchRange = apvts.getRawParameterValue ("pitchRange");
+    pQuality    = apvts.getRawParameterValue ("quality");
     bypassParam = apvts.getParameter ("bypass");
 }
 
@@ -101,6 +102,13 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
 
     params.push_back (std::make_unique<AudioParameterInt> (
         ParameterID { "voices", 1 }, "Voices", 1, 8, 8));
+
+    // Движок питчинга (#38). HQ по умолчанию: varispeed расстраивает хвост неустранимо
+    // (ADR 0004), и держать расстроенный звук значением по умолчанию незачем. Fast
+    // остаётся для слабых машин и для того, кому нужен именно ленточный характер.
+    params.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "quality", 1 }, "Quality",
+        StringArray { "Fast", "HQ" }, 1));
 
     // Ручной калибровочный винт под MIDI-роутинг FL Studio: см. ANALYSIS §6.2.
     params.push_back (std::make_unique<AudioParameterFloat> (
@@ -205,6 +213,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     voiceManager.setEnvelope (pAttack->load (std::memory_order_relaxed),
                               pRelease->load (std::memory_order_relaxed));
     voiceManager.setVoiceLimit (static_cast<int> (pVoices->load (std::memory_order_relaxed)));
+    voiceManager.setQuality (pQuality->load (std::memory_order_relaxed) > 0.5f);
 
     wetBuffer.clear (0, numSamples);
 

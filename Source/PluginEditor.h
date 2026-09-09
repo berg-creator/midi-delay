@@ -18,6 +18,7 @@ private:
     MidiDelayProcessor& proc;
     int lastCount = -1;
     int shownNote = -2;
+    int shownQuality = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayEditor)
 };

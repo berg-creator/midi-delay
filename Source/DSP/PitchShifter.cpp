@@ -94,3 +94,85 @@ int VarispeedShifter::getLatencySamples() const
     // а этого требует ADR 0002 — вычитается она один раз, вне аудиопотока.
     return latency;
 }
+
+//==============================================================================
+// SignalsmithShifter (#38). Вся библиотека видна только отсюда.
+
+#include "signalsmith-stretch.h"
+
+struct SignalsmithShifter::Impl
+{
+    /** Фиксированное зерно, а не std::random_device: движок подмешивает случайную фазу
+        на транзиентах и в тишине, и на разных зёрнах офлайн-рендер выходил бы каждый раз
+        другим. Критерий приёмки #19 требует воспроизводимого рендера, значит зерно
+        обязано быть константой. Голоса при этом не коррелируют — у них разный вход. */
+    signalsmith::stretch::SignalsmithStretch<float> stretch { 0x5713C4 };
+};
+
+SignalsmithShifter::SignalsmithShifter() : impl (std::make_unique<Impl>()) {}
+SignalsmithShifter::~SignalsmithShifter() = default;
+
+void SignalsmithShifter::prepare (double sampleRate, int)
+{
+    const auto sr = static_cast<float> (sampleRate > 0.0 ? sampleRate : 44100.0);
+
+    // Окно 0,18 с при четырёхкратном перекрытии, а не presetDefault (0,12 / 0,03).
+    // Это измеренная величина, а не вкус. Точность высоты у этого движка упирается
+    // в энергетический центроид полосы анализа: ошибка центроида — доли бина, то есть
+    // почти постоянная величина в герцах, и в центах она бьёт тем сильнее, чем ниже
+    // нота. Замер на 110-440 Гц и ±12 полутонах (test_pitch_shifter, проверка 7):
+    //   окно 0,12 с — латентность 120 мс, средняя расстройка 7,0 цента, худшая 28,3
+    //   окно 0,18 с — латентность 180 мс, средняя 3,7, худшая 11,1
+    //   окно 0,24 с — латентность 240 мс, средняя 3,8, худшая 16,2
+    //   окно 0,36 с — латентность 360 мс, средняя 1,9, худшая  5,2
+    // 0,18 — колено: вдвое точнее presetDefault за 60 мс, дальше та же цена покупает
+    // вдвое меньше. Латентность здесь платится минимальным delay time, а не задержкой
+    // хоста (ANALYSIS §5), поэтому такое окно вообще можно себе позволить. См. ADR 0005.
+    impl->stretch.configure (1, static_cast<int> (sr * 0.18f), static_cast<int> (sr * 0.045f));
+    impl->stretch.setTransposeFactor (1.0f);
+    ratio = 1.0f;
+
+    // Обе половины: анализ смотрит назад на полокна, синтез копит выход ещё на полокна.
+    // Сумма — та самая константа, которую прячет в delay time голос (ADR 0002).
+    latency = impl->stretch.inputLatency() + impl->stretch.outputLatency();
+
+    reset();
+}
+
+void SignalsmithShifter::reset()
+{
+    impl->stretch.reset();
+}
+
+void SignalsmithShifter::setRatio (float newRatio)
+{
+    // Тот же кламп, что у varispeed: 24 полутона в обе стороны. Ноль и минус движок
+    // отобразил бы в отрицательные частоты, а это NaN в спектре, а не низкий звук.
+    const auto clamped = static_cast<float> (std::clamp (static_cast<double> (newRatio), minRatio, maxRatio));
+
+    // Сравнение с прошлым значением — не микрооптимизация: setTransposeFactor трогает
+    // std::function частотной карты, и звать его на каждый сегмент незачем.
+    if (clamped == ratio)
+        return;
+
+    ratio = clamped;
+    impl->stretch.setTransposeFactor (clamped);
+}
+
+void SignalsmithShifter::process (const float* in, float* out, int numSamples)
+{
+    if (numSamples <= 0)
+        return;
+
+    // Библиотека индексирует как buffer[channel][sample]; канал у нас один.
+    // Аллокаций здесь нет: внутренний временный буфер выделен в configure под
+    // блок + шаг, а process только урезает его размер, не увеличивая ёмкость.
+    const float* input = in;
+    float* output = out;
+    impl->stretch.process (&input, numSamples, &output, numSamples);
+}
+
+int SignalsmithShifter::getLatencySamples() const
+{
+    return latency;
+}
