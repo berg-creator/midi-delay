@@ -19,9 +19,9 @@ public:
     void setEnvelope (double attackSamples, double releaseSamples);
 
     /** Латентность движка в сэмплах, ноль до prepare. Нужна процессору, чтобы
-        ограничить delay time снизу (#17): зашивать её числом нельзя, у движков
-        она разная и меняется вместе с окном. Спрашивается именно у движка. */
-    int getLatencySamples (bool useHq) const;
+        ограничить delay time снизу (#17) и чтобы посчитать выравнивание в режиме
+        Follow (ADR 0006): зашивать её числом нельзя, у движков она разная. */
+    int getLatencySamples (PitchEngine engine) const;
 
     /** Позиция чтения из кольца. Латентность питчера вычитает сам голос: только он
         знает свой движок, процессору её взять неоткуда (#17). Отсюда же расхождение
@@ -31,10 +31,11 @@ public:
     /** Возраст присваивает менеджер: счётчик один на весь пул, голосу его не вывести. */
     void setAge (unsigned newAge);
 
-    /** Параметр Quality: false — varispeed, true — Signalsmith (#38). Латчится
+    /** Какой движок должен звучать со следующей ноты: Quality выбирает между
+        fast и hq (#38), режим Follow навязывает свой короткий (ADR 0006). Латчится
         в момент старта ноты, звучащие голоса переключение не трогает — почему
         именно так, написано в Voice.cpp у самого латча. */
-    void setQuality (bool useHq);
+    void setEngine (PitchEngine engine);
 
     void noteOn (int midiNote, float velocity, float ratio, double delaySamples, float pan);
     void noteOff();
@@ -70,12 +71,14 @@ private:
     float nextEnvelope();
     void start (int midiNote, float velocity, float ratio, float pan);
 
-    // Оба движка живут всё время работы плагина и оба готовы: создать нужный
+    // Все три движка живут всё время работы плагина и все готовы: создать нужный
     // в момент переключения нельзя, это аллокация из аудиопотока. Цена — память
-    // неиспользуемого движка, около 250 КБ на голос.
-    std::unique_ptr<PitchShifter> fastShifter, hqShifter;
+    // неиспользуемых движков, около 250 КБ на голос каждый.
+    std::unique_ptr<PitchShifter> fastShifter, hqShifter, followShifter;
+    PitchShifter* engineFor (PitchEngine engine) const;
+
     PitchShifter* shifter = nullptr;   // активный; чей именно, решает старт ноты
-    bool wantHq = false;               // то, что просит параметр прямо сейчас
+    PitchEngine wantEngine = PitchEngine::hq;   // то, что просят параметры прямо сейчас
 
     Stage stage = Stage::idle;
     float level = 0.0f;        // текущий уровень огибающей, он же выходной гейн

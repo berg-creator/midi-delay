@@ -15,13 +15,18 @@ void MidiDelayEditor::timerCallback()
                                                ->load (std::memory_order_relaxed));
     const auto clamped = proc.apvts.getRawParameterValue ("delayTime")
                              ->load (std::memory_order_relaxed) < proc.getMinDelayMs();
+    const auto follow = proc.isFollowMode();
+    const auto alignment = juce::roundToInt (proc.getAlignmentMs());
 
-    if (count != lastCount || note != shownNote || quality != shownQuality || clamped != shownClamped)
+    if (count != lastCount || note != shownNote || quality != shownQuality
+        || clamped != shownClamped || follow != shownFollow || alignment != shownAlignment)
     {
         lastCount = count;
         shownNote = note;
         shownQuality = quality;
         shownClamped = clamped;
+        shownFollow = follow;
+        shownAlignment = alignment;
         repaint();
     }
 }
@@ -48,15 +53,24 @@ void MidiDelayEditor::paint (juce::Graphics& g)
     // латентности движка и меняется вместе с его окном. Когда выставленное время
     // ниже предела, строка про это и говорит — иначе хвост молча приходил бы позже
     // заказанного, и понять причину было бы неоткуда.
+    // В Follow движок свой и предела на время нет: там показывается то, что важно
+    // именно в этом режиме, — сколько плагин просит скомпенсировать у хоста.
+    // Если хост этого не делает, хвост уедет от сухого ровно на это число.
     const auto minDelay = proc.getMinDelayMs();
-    auto engineText = juce::String (shownQuality > 0 ? "Engine: HQ (Signalsmith)"
-                                                     : "Engine: Fast (varispeed)");
+    auto engineText = juce::String (shownFollow ? "Mode: Follow - tail sits on the note"
+                                    : shownQuality > 0 ? "Engine: HQ (Signalsmith)"
+                                                       : "Engine: Fast (varispeed)");
 
-    if (minDelay > 0.0)
+    if (shownFollow)
+        engineText += " - host must compensate " + juce::String (shownAlignment) + " ms";
+    else if (minDelay > 0.0)
         engineText += (shownClamped ? " - delay time raised to min "
                                     : " - min delay ") + juce::String (minDelay, 0) + " ms";
 
-    g.setColour (shownClamped ? juce::Colours::orange : juce::Colours::grey);
+    if (! shownFollow && shownAlignment > 0)
+        engineText += " - offset " + juce::String (shownAlignment) + " ms to host";
+
+    g.setColour (shownClamped && ! shownFollow ? juce::Colours::orange : juce::Colours::grey);
     g.setFont (juce::FontOptions (12.0f));
     g.drawText (engineText, getLocalBounds().removeFromBottom (26),
                 juce::Justification::centredTop, false);

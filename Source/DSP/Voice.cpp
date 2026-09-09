@@ -23,6 +23,15 @@ namespace
         в prompts/PROGRESS.md, находки сессии 08. */
     constexpr double pitchWindowMs = 240.0;
 
+    /** Окно движка режима Follow. Там дилея нет, прятать латентность некуда, и она
+        репортится хосту — значит должна быть маленькой (ADR 0006). Секунды, потому
+        что окно у Signalsmith и есть вся его латентность.
+
+        0,09, а не меньше: на 0,06 худшая расстройка доходит до 58 центов, а в Follow
+        хвост звучит одновременно с сухим сигналом и обязан стоять с ним в унисон.
+        Замер и пороги — test_pitch_shifter, проверка 7. */
+    constexpr float followWindowSeconds = 0.09f;
+
     /** Заливка окна питчера идёт порциями через стек: одна виртуальная process()
         на сэмпл обошлась бы в полторы тысячи вызовов на каждую ноту. */
     constexpr int primeChunk = 64;
@@ -45,7 +54,10 @@ void Voice::prepare (double sampleRate, int maxBlockSamples)
     hqShifter = std::make_unique<SignalsmithShifter>();
     hqShifter->prepare (sr, block);
 
-    shifter = wantHq ? hqShifter.get() : fastShifter.get();
+    followShifter = std::make_unique<SignalsmithShifter> (followWindowSeconds);
+    followShifter->prepare (sr, block);
+
+    shifter = engineFor (wantEngine);
 
     stealSamples = std::max (1.0, sr * stealFadeMs * 0.001);
     setEnvelope (sr * 0.01, sr * 0.3);
@@ -65,28 +77,40 @@ void Voice::reset()
     sustained = false;
     needsPrime = false;
 
-    // Оба: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
-    // выдать чужой хвост при следующем переключении Quality.
-    if (fastShifter != nullptr) fastShifter->reset();
-    if (hqShifter   != nullptr) hqShifter->reset();
+    // Все: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
+    // выдать чужой хвост при следующем переключении Quality или режима.
+    if (fastShifter   != nullptr) fastShifter->reset();
+    if (hqShifter     != nullptr) hqShifter->reset();
+    if (followShifter != nullptr) followShifter->reset();
 }
 
-void Voice::setQuality (bool useHq)
+PitchShifter* Voice::engineFor (PitchEngine engine) const
 {
-    wantHq = useHq;
+    switch (engine)
+    {
+        case PitchEngine::fast:   return fastShifter.get();
+        case PitchEngine::follow: return followShifter.get();
+        case PitchEngine::hq:
+        default:                  return hqShifter.get();
+    }
+}
+
+void Voice::setEngine (PitchEngine engine)
+{
+    wantEngine = engine;
 
     // Молчащий голос переключается сразу, звучащий — доигрывает на своём движке.
     // Иначе пришлось бы посреди ноты залить окно нового движка, а латентность у них
     // разная, и позиция чтения уехала бы на живом звуке. Голоса освобождаются на
     // каждом release, так что на слух переключение доезжает за одну ноту.
     if (stage == Stage::idle)
-        shifter = useHq ? hqShifter.get() : fastShifter.get();
+        shifter = engineFor (engine);
 }
 
-int Voice::getLatencySamples (bool useHq) const
+int Voice::getLatencySamples (PitchEngine engine) const
 {
-    const PitchShifter* engine = useHq ? hqShifter.get() : fastShifter.get();
-    return engine != nullptr ? engine->getLatencySamples() : 0;
+    const PitchShifter* e = engineFor (engine);
+    return e != nullptr ? e->getLatencySamples() : 0;
 }
 
 void Voice::setEnvelope (double attack, double release)
@@ -144,7 +168,7 @@ void Voice::noteOn (int midiNote, float velocity, float ratio, double newDelaySa
 {
     // Латч движка: только здесь, до расчёта позиции чтения — она считается
     // от латентности активного движка, а у движков она разная.
-    shifter = wantHq ? hqShifter.get() : fastShifter.get();
+    shifter = engineFor (wantEngine);
 
     setDelaySamples (newDelaySamples);
 

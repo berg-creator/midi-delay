@@ -8,7 +8,8 @@
     собирается из голосов, а не из постоянного отвода. Каждый голос транспонирует
     свой хвост под нажатую ноту (#14, #15): ratio считается от Root Key в момент
     note on и живёт в голосе до конца ноты. */
-class MidiDelayProcessor final : public juce::AudioProcessor
+class MidiDelayProcessor final : public juce::AudioProcessor,
+                                 private juce::AsyncUpdater
 {
 public:
     MidiDelayProcessor();
@@ -63,6 +64,16 @@ public:
         оно разное и меняется вместе с окном. Ноль до первого prepareToPlay. */
     double getMinDelayMs() const;
 
+    /** Режим Time Mode. Free — дилей: хвост стартует на ноте, а поёт то, что было
+        delay time назад. Follow — хвост поёт то, что звучит прямо сейчас, то есть
+        мелодия повторяется нота в ноту (ADR 0006). */
+    bool isFollowMode() const;
+
+    /** Сколько плагин просит у хоста скомпенсировать, в миллисекундах. В Free
+        с неотрицательным офсетом это ноль — инвариант ANALYSIS §5 цел. Отлично
+        от нуля только в Follow и при отрицательном MIDI Offset. */
+    double getAlignmentMs() const;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -74,6 +85,16 @@ private:
 
     /** Ноты, педаль и all-notes-off. Всё незнакомое молча мимо. */
     void handleMidiMessage (const juce::MidiMessage& message);
+
+    /** Пересчитать выравнивание и сказать его хосту. Только из потока сообщений:
+        setLatencySamples дёргает хост, и звать его из processBlock нельзя. */
+    void updateLatency();
+    void handleAsyncUpdate() override;
+
+    /** Насколько весь плагин отстаёт от своего входа, в сэмплах. Одно число на оба
+        механизма: латентность питчера в Follow и отрицательный MIDI Offset (ADR 0006).
+        Целое, потому что уходит наружу репортом и внутрь сдвигом MIDI-событий. */
+    int alignmentSamples() const;
 
     /** Транспонирование хвоста для ноты (#15): 2^((note - root) / 12) с клампом
         по Pitch Range. Считается один раз в момент note on и живёт в голосе до
@@ -87,6 +108,10 @@ private:
     /** Запас кольца: максимальный delay time MVP (2 с) плюс место под латентность
         питчера и под длину хвоста. 4 с при 96 кГц — ~4 МБ на два канала. */
     static constexpr double maxDelaySeconds = 4.0;
+
+    /** Запас линии сухого сигнала: максимум выравнивания это окно Follow плюс
+        максимальный отрицательный MIDI Offset, то есть заведомо меньше 0,5 с. */
+    static constexpr double maxAlignSeconds = 0.5;
 
     /** Версия формата состояния. Меняется, когда старый проект надо мигрировать,
         а не когда просто добавился параметр: незнакомые поля APVTS игнорирует сам. */
@@ -104,6 +129,17 @@ private:
 
     DelayBuffer delayBuffer;
     VoiceManager voiceManager;
+
+    /** Линия сухого сигнала: держит его ровно столько же, сколько опаздывает
+        обработанный. Без неё в Follow сухой шёл бы впереди хвоста на всю латентность
+        питчера. Отдельное кольцо, потому что основное несёт dry + feedback. */
+    DelayBuffer dryDelay;
+
+    /** Очередь MIDI-событий, сдвинутых в будущее: положительный MIDI Offset и вся
+        компенсация Follow работают именно сдвигом события, а не позиции чтения —
+        слышно то, когда хвост начался, а не то, какой кусок кольца он поёт.
+        Обе ёмкости резервируются в prepare, в processBlock аллокаций нет. */
+    juce::MidiBuffer midiQueue, midiCarry;
 
     /** То, что уходит в кольцо: dry + feedback. Отдельный буфер нужен потому, что
         DelayBuffer::write принимает планарные указатели, а не отдельный сэмпл. */
@@ -130,13 +166,25 @@ private:
     std::atomic<float>* pRootKey    = nullptr;
     std::atomic<float>* pPitchRange = nullptr;
     std::atomic<float>* pQuality    = nullptr;
+    std::atomic<float>* pTimeMode   = nullptr;
+    std::atomic<float>* pMidiOffset = nullptr;
+    std::atomic<float>* pWidth      = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 
     // Предел из getMinDelayMs, посчитанный в prepareToPlay. Пишется в подготовке,
     // читается редактором — отсюда atomic. Два числа, потому что переключение
     // Quality обязано менять показ мгновенно, а не ждать следующего prepare.
-    std::atomic<double> minDelayFastMs { 0.0 }, minDelayHqMs { 0.0 };
+    std::atomic<double> minDelayFastMs { 0.0 }, minDelayHqMs { 0.0 }, followLatencyMs { 0.0 };
+
+    /** Выравнивание, о котором хост уже знает. Пишется и читается аудиопотоком;
+        расхождение с посчитанным — единственный повод разбудить поток сообщений. */
+    int requestedAlignment = 0;
+
+    // Снимаются в начале блока и читаются renderSegment: аудиопоток один,
+    // атомарность тут не нужна, а таскать их пятью аргументами — шум.
+    int blockAlignment = 0;
+    bool blockFollow = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayProcessor)
 };

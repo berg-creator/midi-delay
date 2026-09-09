@@ -19,7 +19,7 @@ void VoiceManager::prepare (double newSampleRate, int maxBlockSamples)
 
     // prepare пересоздал движки, а значит сбросил и латч: вернуть выбор параметра.
     for (auto& v : voices)
-        v.setQuality (hq);
+        v.setEngine (engine);
 }
 
 void VoiceManager::reset()
@@ -53,11 +53,27 @@ void VoiceManager::setVoiceLimit (int numVoices)
     voiceLimit = std::clamp (numVoices, 1, maxVoices);
 }
 
-Voice& VoiceManager::findVoiceFor (int)
+void VoiceManager::setWidth (float widthPercent)
+{
+    // 0..200 % на 0..1: на 100 % крайние голоса стоят в половине панорамы, на 200 %
+    // упираются в борта. Ширина больше 200 % смысла не имеет — дальше бортов некуда.
+    spread = std::clamp (widthPercent, 0.0f, 200.0f) * 0.005f;
+}
+
+float VoiceManager::panForSlot (int slot) const
+{
+    const int half = std::max (1, voiceLimit / 2);
+    const int step = (slot + 1) / 2;
+    const float sign = (slot % 2) == 1 ? 1.0f : -1.0f;
+
+    return spread * sign * static_cast<float> (step) / static_cast<float> (half);
+}
+
+int VoiceManager::findVoiceFor (int)
 {
     for (int i = 0; i < voiceLimit; ++i)
         if (! voices[i].isActive())
-            return voices[i];
+            return i;
 
     // Свободных нет. Сначала самый старый голос в release, иначе самый тихий,
     // при равном уровне — снова самый старый (ADR 0001, стратегия кражи).
@@ -87,30 +103,35 @@ Voice& VoiceManager::findVoiceFor (int)
         }
     }
 
-    return voices[oldestReleasing >= 0 ? oldestReleasing : quietest];
+    return oldestReleasing >= 0 ? oldestReleasing : quietest;
 }
 
-void VoiceManager::setQuality (bool useHq)
+void VoiceManager::setEngine (PitchEngine newEngine)
 {
-    if (useHq == hq)
+    if (newEngine == engine)
         return;
 
-    hq = useHq;
+    engine = newEngine;
 
     for (auto& v : voices)
-        v.setQuality (useHq);
+        v.setEngine (newEngine);
 }
 
-int VoiceManager::getLatencySamples (bool useHq) const
+int VoiceManager::getLatencySamples (PitchEngine which) const
 {
     // Голоса одинаковые и подготовлены одним prepare — спрашивать можно любой.
-    return voices[0].getLatencySamples (useHq);
+    return voices[0].getLatencySamples (which);
 }
 
-void VoiceManager::noteOn (int midiNote, float velocity, float ratio, float pan)
+void VoiceManager::noteOn (int midiNote, float velocity, float ratio)
 {
-    auto& v = findVoiceFor (midiNote);
+    const int slot = findVoiceFor (midiNote);
+    auto& v = voices[slot];
     v.setAge (nextAge++);
+
+    // Пан приходит не снаружи, а от номера слота (#23): кто именно из голосов
+    // возьмёт ноту, знает только пул, и снаружи это число взять неоткуда.
+    const float pan = panForSlot (slot);
 
     if (v.isActive())
         v.steal (midiNote, velocity, ratio, delaySamples, pan);

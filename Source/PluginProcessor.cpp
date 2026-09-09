@@ -18,6 +18,9 @@ MidiDelayProcessor::MidiDelayProcessor()
     pRootKey    = apvts.getRawParameterValue ("rootKey");
     pPitchRange = apvts.getRawParameterValue ("pitchRange");
     pQuality    = apvts.getRawParameterValue ("quality");
+    pTimeMode   = apvts.getRawParameterValue ("timeMode");
+    pMidiOffset = apvts.getRawParameterValue ("midiOffset");
+    pWidth      = apvts.getRawParameterValue ("width");
     bypassParam = apvts.getParameter ("bypass");
 }
 
@@ -43,8 +46,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         Range { 1.0f, 2000.0f, 0.01f, 0.35f }, 400.0f,
         AudioParameterFloatAttributes().withLabel ("ms")));
 
-    params.push_back (std::make_unique<AudioParameterBool> (
-        ParameterID { "sync", 1 }, "Tempo Sync", false));
+    // Режим времени. Free — обычный дилей. Follow — хвост поёт то, что звучит прямо
+    // сейчас: мелодия повторяется нота в ноту, латентность питчера уходит в репорт
+    // хосту (ADR 0006). Tempo Sync встанет сюда третьим пунктом задачей #20.
+    params.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "timeMode", 1 }, "Time Mode",
+        StringArray { "Free", "Follow" }, 0));
 
     params.push_back (std::make_unique<AudioParameterChoice> (
         ParameterID { "division", 1 }, "Note Division",
@@ -111,9 +118,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         StringArray { "Fast", "HQ" }, 1));
 
     // Ручной калибровочный винт под MIDI-роутинг FL Studio: см. ANALYSIS §6.2.
+    // Диапазон ±100 как в #18. Плюс — событие держится в очереди и стоит только её;
+    // минус — сухой сигнал придерживается на столько же, и это уходит в репорт
+    // латентности хосту. То есть отрицательная половина не бесплатна (ADR 0006).
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "midiOffset", 1 }, "MIDI Offset",
-        Range { -50.0f, 50.0f, 0.1f }, 0.0f,
+        Range { -100.0f, 100.0f, 0.1f }, 0.0f,
         AudioParameterFloatAttributes().withLabel ("ms")));
 
     return { params.begin(), params.end() };
@@ -129,20 +139,36 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     // Единственное место аллокации. После prepare кольцо нулевое — смена sample rate
     // на лету обрывает хвост тишиной, а не мусором, и потому не щёлкает.
     delayBuffer.prepare (currentSampleRate, numChannels, maxDelaySeconds);
+
+    // Линии сухого сигнала нужен ещё и запас в один блок хоста: читается она
+    // от головы записи, а голова к моменту чтения уже прошла весь блок.
+    dryDelay.prepare (currentSampleRate, numChannels,
+                      maxAlignSeconds + juce::jmax (1, maximumExpectedSamplesPerBlock) / currentSampleRate);
+
     lineInput.setSize (numChannels, juce::jmax (1, maximumExpectedSamplesPerBlock),
                        false, true, false);
     wetBuffer.setSize (numChannels, juce::jmax (1, maximumExpectedSamplesPerBlock),
                        false, true, false);
 
+    // Единственное место, где очередь MIDI выделяет память. Событие в MidiBuffer
+    // это девять байт; килобайта хватает на сотню событий в блоке с запасом.
+    midiQueue.clear();
+    midiCarry.clear();
+    midiQueue.ensureSize (1024);
+    midiCarry.ensureSize (1024);
+
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
-    voiceManager.setQuality (pQuality->load() > 0.5f);
+    voiceManager.setEngine (pTimeMode->load() > 0.5f ? PitchEngine::follow
+                                                     : (pQuality->load() > 0.5f ? PitchEngine::hq
+                                                                                : PitchEngine::fast));
 
     // Нижний предел delay time — латентность движка (#17). Спрашивается у движка сразу
     // после его подготовки: зашитое число разъехалось бы с окном при первой же правке.
     const double msPerSample = 1000.0 / currentSampleRate;
-    minDelayFastMs = voiceManager.getLatencySamples (false) * msPerSample;
-    minDelayHqMs   = voiceManager.getLatencySamples (true)  * msPerSample;
+    minDelayFastMs  = voiceManager.getLatencySamples (PitchEngine::fast)   * msPerSample;
+    minDelayHqMs    = voiceManager.getLatencySamples (PitchEngine::hq)     * msPerSample;
+    followLatencyMs = voiceManager.getLatencySamples (PitchEngine::follow) * msPerSample;
 
     delaySamplesSmoothed.reset (currentSampleRate, smoothingSeconds);
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
@@ -152,15 +178,17 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     // Первый блок после prepare не должен въезжать в значения рампой.
     delaySamplesSmoothed.setCurrentAndTargetValue (
         static_cast<float> (juce::jmax (pDelayTime->load() * 0.001 * currentSampleRate,
-                                        (double) voiceManager.getLatencySamples (pQuality->load() > 0.5f))));
+                                        getMinDelayMs() * 0.001 * currentSampleRate)));
     mixSmoothed.setCurrentAndTargetValue (pMix->load() * 0.01f);
     gainSmoothed.setCurrentAndTargetValue (
         juce::Decibels::decibelsToGain (pOutputGain->load()));
     bypassSmoothed.setCurrentAndTargetValue (pBypass->load() < 0.5f ? 1.0f : 0.0f);
 
-    // Латентность не репортим намеренно: латентность питчера будет вычтена
-    // из позиции чтения, а не выставлена хосту. ANALYSIS §5.
-    setLatencySamples (0);
+    // В Free с неотрицательным офсетом здесь ноль, и инвариант ANALYSIS §5 цел:
+    // латентность питчера вычитается из позиции чтения, а не выставляется хосту.
+    // Отлично от нуля это число только там, где прятать латентность физически
+    // некуда, — в Follow и при отрицательном MIDI Offset (ADR 0006).
+    updateLatency();
 
     midiNoteCount = 0;
 }
@@ -168,7 +196,44 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
 void MidiDelayProcessor::releaseResources()
 {
     delayBuffer.clear();
+    dryDelay.clear();
+    midiQueue.clear();
+    midiCarry.clear();
     voiceManager.reset();
+}
+
+//==============================================================================
+int MidiDelayProcessor::alignmentSamples() const
+{
+    // Follow: питчеру негде спрятать своё окно, дилея под ним нет. Отрицательный
+    // офсет: событие раньше сухого сигнала сделать нельзя, можно только придержать
+    // сухой. Оба слагаемых складываются, и сумма уходит хосту (ADR 0006).
+    const double followLatency = isFollowMode()
+        ? followLatencyMs.load (std::memory_order_relaxed) * 0.001 * currentSampleRate : 0.0;
+
+    const double offset = pMidiOffset->load (std::memory_order_relaxed) * 0.001 * currentSampleRate;
+
+    return static_cast<int> (std::lround (followLatency + std::max (0.0, -offset)));
+}
+
+void MidiDelayProcessor::updateLatency()
+{
+    setLatencySamples (alignmentSamples());
+}
+
+void MidiDelayProcessor::handleAsyncUpdate()
+{
+    updateLatency();
+}
+
+bool MidiDelayProcessor::isFollowMode() const
+{
+    return pTimeMode->load (std::memory_order_relaxed) > 0.5f;
+}
+
+double MidiDelayProcessor::getAlignmentMs() const
+{
+    return alignmentSamples() * 1000.0 / currentSampleRate;
 }
 
 bool MidiDelayProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -211,18 +276,50 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     const float feedback = pFeedback->load (std::memory_order_relaxed) * 0.01f;
 
-    // Quality снимается до delay time: предел на время — функция активного движка (#17).
+    // Режим и Quality снимаются до delay time: предел на время — функция движка (#17),
+    // а движок в Follow навязан режимом, а не параметром качества.
+    const bool follow = isFollowMode();
     const bool wantHq = pQuality->load (std::memory_order_relaxed) > 0.5f;
-    voiceManager.setQuality (wantHq);
+
+    voiceManager.setEngine (follow ? PitchEngine::follow
+                                   : (wantHq ? PitchEngine::hq : PitchEngine::fast));
+    voiceManager.setWidth (pWidth->load (std::memory_order_relaxed));
+
+    // Выравнивание: на сколько сэмплов весь плагин отстаёт от собственного входа.
+    // Сухой сигнал придерживается ровно на столько же, и это же число просится
+    // у хоста. Считается по параметрам, а не накапливается, — одна формула на все
+    // случаи (ADR 0006). Целое: им двигаются MIDI-события и репорт латентности.
+    blockAlignment = alignmentSamples();
+    blockFollow = follow;
+
+    const double offsetSamples = pMidiOffset->load (std::memory_order_relaxed)
+                               * 0.001 * currentSampleRate;
+
+    // Сдвиг события в будущее. Компенсация Follow и положительный офсет — это
+    // именно задержка события, а не смещение позиции чтения: на слух слышно то,
+    // когда хвост начался, а сдвиг чтения этого как раз не трогает (ADR 0006).
+    const int midiShift = static_cast<int> (std::lround (
+        (follow ? followLatencyMs.load (std::memory_order_relaxed) * 0.001 * currentSampleRate : 0.0)
+        + std::max (0.0, offsetSamples)));
+
+    // Хост узнаёт о смене выравнивания из потока сообщений: setLatencySamples дёргает
+    // обёртку и хост, и звать его отсюда нельзя.
+    if (blockAlignment != requestedAlignment)
+    {
+        requestedAlignment = blockAlignment;
+        triggerAsyncUpdate();
+    }
 
     // Кламп снизу на латентность движка. Без него при коротком времени смещение чтения
     // упиралось бы в кламп внутри голоса, и хвост приходил бы позже заказанного молча —
     // ровно то, что запрещает ANALYSIS §5. Подтягивается эффективное время, а не значение
     // параметра: писать в параметр из плагина значило бы драться с автоматизацией хоста
     // и терять выставленные 120 мс при возврате на Fast. Пользователю предел виден в окне.
+    // В Follow предела нет: голос читает кольцо по выравниванию, а delay time там задаёт
+    // только интервал повторов обратной связи.
     delaySamplesSmoothed.setTargetValue (static_cast<float> (juce::jmax (
         pDelayTime->load (std::memory_order_relaxed) * 0.001 * currentSampleRate,
-        (double) voiceManager.getLatencySamples (wantHq))));
+        getMinDelayMs() * 0.001 * currentSampleRate)));
 
     mixSmoothed.setTargetValue (pMix->load (std::memory_order_relaxed) * 0.01f);
     gainSmoothed.setTargetValue (juce::Decibels::decibelsToGain (
@@ -235,13 +332,25 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     wetBuffer.clear (0, numSamples);
 
+    // Сухой путь в свою линию — до того, как микс перепишет buffer. Читается он
+    // назад на blockAlignment, и при нуле выравнивания линия просто не опрашивается:
+    // сухой остаётся бит-в-бит собой, и обход по ADR 0003 не трогается.
+    dryDelay.write (buffer.getArrayOfReadPointers(), numChannels, 0, numSamples);
+
+    // Входящие события уезжают в очередь со сдвигом; играются те, что попали в этот
+    // блок, остальные ждут следующего. При нулевом сдвиге это ровно исходный буфер.
+    midiQueue.addEvents (midi, 0, numSamples, midiShift);
+
     // Блок режется на сегменты по sample offset каждого события: иначе нота дрожала бы
     // на размер буфера (ANALYSIS §6.1). MidiBuffer отдаёт события уже по возрастанию.
     int segmentStart = 0;
 
-    for (const auto meta : midi)
+    for (const auto meta : midiQueue)
     {
-        const int position = juce::jlimit (0, numSamples, meta.samplePosition);
+        if (meta.samplePosition >= numSamples)
+            break;   // события будущих блоков; очередь упорядочена, дальше только они
+
+        const int position = juce::jmax (0, meta.samplePosition);
 
         if (position > segmentStart)
         {
@@ -255,6 +364,12 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     if (segmentStart < numSamples)
         renderSegment (buffer, segmentStart, numSamples - segmentStart, numChannels, feedback);
 
+    // Хвост очереди переезжает к началу следующего блока. swapWith, а не присваивание:
+    // оба буфера сохраняют выделенную в prepare ёмкость, и аллокаций тут нет.
+    midiCarry.clear();
+    midiCarry.addEvents (midiQueue, numSamples, -1, -numSamples);
+    midiQueue.swapWith (midiCarry);
+
     // Микс, гейн и обход — одним проходом по всему блоку. Сегментация на них не влияет:
     // сглаживание едет по сэмплам, и результат не зависит от того, где прошли границы.
     for (int i = 0; i < numSamples; ++i)
@@ -265,7 +380,12 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
-            const float dry = buffer.getSample (ch, i);
+            // Голова записи линии стоит за концом блока, поэтому сэмплу i
+            // соответствует смещение (numSamples - i) плюс само выравнивание.
+            const float dry = blockAlignment > 0
+                ? dryDelay.read (ch, static_cast<double> (numSamples - i + blockAlignment))
+                : buffer.getSample (ch, i);
+
             const float wet = wetBuffer.getSample (ch, i);
 
             const float processed = (dry * (1.0f - mix) + wet * mix) * gain;
@@ -286,7 +406,11 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
     // Значение снимается на границе сегмента, а не по сэмплу: голос читает кольцо
     // блоком, одним смещением на весь сегмент. При статичном delay time это то же
     // самое число, и результат не зависит от размера блока.
-    voiceManager.setDelaySamples (delaySamplesSmoothed.getCurrentValue());
+    // Позиция чтения голоса = выравнивание + время дилея; латентность питчера
+    // вычтет сам голос. В Follow времени нет: голос читает ровно то, что звучит
+    // сейчас, и весь его отступ — это выравнивание (ADR 0006).
+    voiceManager.setDelaySamples (blockAlignment
+                                  + (blockFollow ? 0.0 : delaySamplesSmoothed.getCurrentValue()));
 
     const float* const* linePointers = lineInput.getArrayOfReadPointers();
     const int end = startSample + numSamples;
@@ -348,8 +472,8 @@ void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
         lastNote.store (note, std::memory_order_relaxed);
         lastRatio.store (ratio, std::memory_order_relaxed);
 
-        // Пан по голосам — #23, поэтому все в центре.
-        voiceManager.noteOn (note, message.getFloatVelocity(), ratio, 0.0f);
+        // Пан выбирает пул по номеру слота (#23): снаружи этот номер неизвестен.
+        voiceManager.noteOn (note, message.getFloatVelocity(), ratio);
     }
     else if (message.isNoteOff())
     {
@@ -373,8 +497,20 @@ void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
 
 double MidiDelayProcessor::getMinDelayMs() const
 {
-    return (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs : minDelayFastMs)
+    // В Follow предела нет: голос читает по выравниванию, а delay time там задаёт
+    // только интервал повторов обратной связи, и коротким ему быть можно.
+    if (isFollowMode())
+        return 0.0;
+
+    const double latency = (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs
+                                                                              : minDelayFastMs)
         .load (std::memory_order_relaxed);
+
+    // Отрицательный офсет придерживает сухой сигнал, а значит освобождает ровно
+    // столько же в бюджете позиции чтения — предел едет вниз вместе с ним.
+    const double offsetMs = pMidiOffset->load (std::memory_order_relaxed);
+
+    return std::max (0.0, latency - std::max (0.0, -offsetMs));
 }
 
 double MidiDelayProcessor::getTailLengthSeconds() const

@@ -21,14 +21,20 @@ public:
     void setDelaySamples (double delaySamples);   // латентность питчера вычитает голос
     void setEnvelope (float attackMs, float releaseMs);
     void setVoiceLimit (int numVoices);           // параметр Voices, не больше maxVoices
-    void setQuality (bool useHq);                 // параметр Quality: varispeed или Signalsmith
+    void setEngine (PitchEngine engine);          // Quality и режим Follow вместе
 
-    /** Латентность движка в сэмплах, она же нижний предел delay time (#17). Флаг
-        передаётся явно, а не берётся из своего: процессору нужен предел того движка,
-        который выбран параметром прямо сейчас, а не того, на котором доигрывают голоса. */
-    int getLatencySamples (bool useHq) const;
+    /** Раскидка голосов по стерео (#23): 0 — все в центре, 100 % — умеренно,
+        200 % — крайние голоса в упор влево и вправо. Параметр Width. */
+    void setWidth (float widthPercent);
 
-    void noteOn (int midiNote, float velocity, float ratio, float pan);
+    /** Латентность движка в сэмплах, она же нижний предел delay time (#17) и
+        выравнивание режима Follow (ADR 0006). Движок передаётся явно, а не берётся
+        свой: процессору нужен предел того движка, который выбран параметрами прямо
+        сейчас, а не того, на котором доигрывают голоса. */
+    int getLatencySamples (PitchEngine engine) const;
+
+    /** Пан не передаётся: его определяет номер слота, а слот выбирает пул (#23). */
+    void noteOn (int midiNote, float velocity, float ratio);
     void noteOff (int midiNote);
     void allNotesOff();
 
@@ -40,15 +46,22 @@ public:
                   const DelayBuffer& source);
 
 private:
-    /** Свободный голос, иначе кража: самый старый в release, иначе самый тихий. */
-    Voice& findVoiceFor (int midiNote);
+    /** Индекс свободного голоса, иначе кража: самый старый в release, иначе самый
+        тихий. Индекс, а не ссылка: от номера слота считается пан (#23). */
+    int findVoiceFor (int midiNote);
+
+    /** Пан голоса по номеру слота: нулевой в центре, дальше через одного вправо
+        и влево. Порядок именно такой, потому что одиночная нота почти всегда
+        попадает в нулевой слот — и обязана остаться по центру. */
+    float panForSlot (int slot) const;
 
     std::array<Voice, maxVoices> voices;
     std::vector<float> scratch;   // два моно-буфера подряд, общие на все голоса
     unsigned nextAge = 0;
     int blockSize = 0;
     int voiceLimit = maxVoices;
-    bool hq = false;
+    float spread = 0.5f;          // 0..1, из параметра Width
+    PitchEngine engine = PitchEngine::hq;
     double sampleRate = 44100.0;
     double delaySamples = 2.0;
     bool sustainDown = false;

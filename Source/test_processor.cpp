@@ -526,6 +526,11 @@ int main (int argc, char* argv[])
             setParam (proc, "attack", attackMs);
             setParam (proc, "release", releaseMs);
             setParam (proc, "voices", 8.0f);
+
+            // Ширина в ноль: эти тесты меряют огибающие и кражу, а не панораму,
+            // и разведённые по стерео голоса складывались бы в другое число.
+            // Раскидка проверяется отдельно, ниже в этом же файле.
+            setParam (proc, "width", 0.0f);
             proc.setPlayConfigDetails (2, 2, sr, blockSize);
             proc.prepareToPlay (sr, blockSize);
         };
@@ -1165,6 +1170,199 @@ int main (int argc, char* argv[])
 
             CHECK (second == 2 * limit);              // интервал повтора — предел, а не 20 мс
             CHECK (std::abs (secondValue - 0.5f) < 0.01f);   // и это именно feedback 50 %
+        }
+    }
+
+    // --- Режим Follow и MIDI Offset (#18, ADR 0006) -----------------------------
+    // Три вещи, которые легко перепутать знаком и увидеть только на слух: хвост
+    // в Follow обязан стоять на том же сэмпле, что сухой; положительный офсет
+    // обязан двигать сам старт хвоста, а не кусок кольца под ним; отрицательный
+    // обязан придерживать сухой и честно сказать об этом хосту.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 8192;
+        constexpr int blocks = 6;                  // 49152 сэмпла
+        constexpr int total = blockSize * blocks;
+        constexpr int followLatency = 4320;        // окно 0,09 с при 48 кГц
+
+        // Прогон с импульсом в pulse и нотой в note. Возвращает весь выход.
+        const auto render = [] (std::vector<float>& out, bool follow, float delayMs,
+                                float offsetMs, float mix, int note, int pulse,
+                                int* latency = nullptr)
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "midiOffset", offsetMs);
+            setParam (proc, "mix", mix);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "release", 2000.0f);
+            setParam (proc, "width", 0.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            if (latency != nullptr)
+                *latency = proc.getLatencySamples();
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            out.assign (total, 0.0f);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                block.clear();
+
+                if (pulse >= 0 && pulse / blockSize == b)
+                    for (int ch = 0; ch < 2; ++ch)
+                        block.setSample (ch, pulse % blockSize, 1.0f);
+
+                juce::MidiBuffer midi;
+                if (note >= 0 && note / blockSize == b)
+                    midi = noteOnAt (note % blockSize);
+
+                runBlock (proc, block, midi);
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                    out[static_cast<size_t> (b) * blockSize + i] = block.getSample (0, i);
+            }
+        };
+
+        const auto peakIndex = [] (const std::vector<float>& x)
+        {
+            int at = -1;
+            float value = 0.0f;
+
+            for (size_t i = 0; i < x.size(); ++i)
+                if (std::abs (x[i]) > value) { value = std::abs (x[i]); at = static_cast<int> (i); }
+
+            return at;
+        };
+
+        std::vector<float> out;
+
+        // 1. Follow: сухой и хвост приходят на один и тот же сэмпл. Нота открывается
+        //    заранее и держится, импульс попадает на уже открытую огибающую. При
+        //    mix 50 % оба слагаемых лежат друг на друге, и всплеск ровно один.
+        {
+            int latency = 0;
+            constexpr int pulse = 20000;
+
+            render (out, true, 400.0f, 0.0f, 50.0f, 12000, pulse, &latency);
+
+            // Латентность в Follow репортится хосту — это и есть цена режима.
+            CHECK (latency == followLatency);
+
+            // Весь плагин опаздывает от своего входа ровно на неё, и сухой вместе с ним.
+            CHECK (peakIndex (out) == pulse + followLatency);
+
+            // И это именно сумма двух половин, а не один сухой: сухой при mix 50 %
+            // дал бы 0,5, а здесь к нему прибавился хвост.
+            CHECK (out[static_cast<size_t> (pulse + followLatency)] > 0.8f);
+        }
+
+        // 2. Free с тем же материалом: хвост уезжает на delay time, сухой стоит
+        //    на месте, латентность хосту нулевая. Это контроль к проверке 1 —
+        //    без него она прошла бы и на плагине, который просто всё задержал.
+        {
+            int latency = 0;
+            constexpr int pulse = 20000;
+
+            render (out, false, 400.0f, 0.0f, 0.0f, 12000, pulse, &latency);
+
+            CHECK (latency == 0);
+            CHECK (peakIndex (out) == pulse);          // mix 0: виден только сухой
+        }
+
+        // 3. Положительный MIDI Offset двигает старт хвоста, и ровно на себя. Вход
+        //    постоянный, mix 100 %: на выходе видна одна огибающая, и её начало
+        //    читается прямо. Нота стоит после прогрева кольца — раньше голосу
+        //    нечего читать, и старт нашёлся бы не там, где событие.
+        {
+            const auto onset = [&] (float offsetMs)
+            {
+                MidiDelayProcessor proc;
+                setParam (proc, "timeMode", 0.0f);
+                setParam (proc, "delayTime", 200.0f);
+                setParam (proc, "midiOffset", offsetMs);
+                setParam (proc, "mix", 100.0f);
+                setParam (proc, "feedback", 0.0f);
+                setParam (proc, "outputGain", 0.0f);
+                setParam (proc, "bypass", 0.0f);
+                setParam (proc, "attack", 1.0f);
+                setParam (proc, "release", 2000.0f);
+                setParam (proc, "width", 0.0f);
+
+                proc.setPlayConfigDetails (2, 2, sr, blockSize);
+                proc.prepareToPlay (sr, blockSize);
+
+                juce::AudioBuffer<float> block (2, blockSize);
+                constexpr int notePos = 3 * blockSize + 1000;
+                int first = -1;
+
+                for (int b = 0; b < blocks; ++b)
+                {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < blockSize; ++i)
+                            block.setSample (ch, i, 1.0f);
+
+                    juce::MidiBuffer midi;
+                    if (notePos / blockSize == b)
+                        midi = noteOnAt (notePos % blockSize);
+
+                    runBlock (proc, block, midi);
+                    CHECK (allocations.load() == 0);
+
+                    if (first < 0)
+                        for (int i = 0; i < blockSize; ++i)
+                            if (std::abs (block.getSample (0, i)) > 1.0e-4f)
+                                { first = b * blockSize + i; break; }
+                }
+
+                CHECK (first >= 0);
+                return first - notePos;
+            };
+
+            CHECK (onset (0.0f) == 0);                  // без офсета — ровно на событии
+            CHECK (onset (20.0f) == 960);               // +20 мс это 960 сэмплов
+            CHECK (onset (100.0f) == 4800);             // и на краю диапазона тоже
+
+            // Отрицательный офсет событие не двигает: раньше собственного прихода
+            // ноту не сыграть. Он двигает всё остальное — это проверка 4.
+            CHECK (onset (-20.0f) == 0);
+        }
+
+        // 4. Отрицательный MIDI Offset придерживает сухой сигнал ровно на себя,
+        //    говорит это число хосту и на столько же опускает нижний предел delay
+        //    time: освободившийся бюджет позиции чтения достаётся ему (#17).
+        {
+            int latency = 0;
+
+            render (out, false, 400.0f, -20.0f, 0.0f, 12000, 20000, &latency);
+
+            CHECK (latency == 960);
+            CHECK (peakIndex (out) == 20000 + 960);
+
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", 1.0f);
+            setParam (proc, "timeMode", 0.0f);
+            setParam (proc, "midiOffset", 0.0f);
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            const double full = proc.getMinDelayMs();
+            CHECK (std::abs (full - 180.0) < 0.5);
+
+            setParam (proc, "midiOffset", -20.0f);
+            CHECK (std::abs (proc.getMinDelayMs() - (full - 20.0)) < 0.01);
+
+            // А в Follow предела нет вовсе: голос читает по выравниванию, и delay
+            // time там задаёт только интервал повторов обратной связи.
+            setParam (proc, "timeMode", 1.0f);
+            CHECK (proc.getMinDelayMs() == 0.0);
         }
     }
 

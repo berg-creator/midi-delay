@@ -105,19 +105,31 @@ namespace
         return 1200.0 * std::log2 (measured / expected);
     }
 
-    enum class Engine { varispeed, signalsmith };
+    /** Окно движка режима Follow. Дублирует константу из Voice.cpp намеренно:
+        офлайн-тест не тянет ни JUCE, ни голос, а разъехаться этим двум числам
+        не даёт проверка латентности ниже. */
+    constexpr float followWindowSeconds = 0.09f;
+
+    enum class Engine { varispeed, signalsmith, follow };
 
     const char* engineName (Engine e)
     {
-        return e == Engine::signalsmith ? "signalsmith" : "varispeed ";
+        switch (e)
+        {
+            case Engine::signalsmith: return "signalsmith";
+            case Engine::follow:      return "follow     ";
+            default:                  return "varispeed  ";
+        }
     }
 
     std::unique_ptr<PitchShifter> makeShifter (Engine e)
     {
-        if (e == Engine::signalsmith)
-            return std::make_unique<SignalsmithShifter>();
-
-        return std::make_unique<VarispeedShifter> (windowMs);
+        switch (e)
+        {
+            case Engine::signalsmith: return std::make_unique<SignalsmithShifter>();
+            case Engine::follow:      return std::make_unique<SignalsmithShifter> (followWindowSeconds);
+            default:                  return std::make_unique<VarispeedShifter> (windowMs);
+        }
     }
 
     std::vector<float> sine (int n, double freq, double amp = 0.5)
@@ -423,15 +435,15 @@ int main()
         for (const int st : shifts) std::printf ("%+4d", st);
         std::printf (")\n");
 
-        double worst[2] { 0.0, 0.0 };
-        double sum[2] { 0.0, 0.0 };
+        double worst[3] { 0.0, 0.0, 0.0 };
+        double sum[3] { 0.0, 0.0, 0.0 };
         int count = 0;
 
         for (const double f0 : freqs)
         {
-            for (const auto engine : { Engine::varispeed, Engine::signalsmith })
+            for (const auto engine : { Engine::varispeed, Engine::signalsmith, Engine::follow })
             {
-                const int e = engine == Engine::signalsmith ? 1 : 0;
+                const int e = static_cast<int> (engine);
                 std::printf ("  %6.0f Гц  %s ", f0, engineName (engine));
 
                 for (const int st : shifts)
@@ -451,7 +463,8 @@ int main()
         }
 
         std::printf ("  varispeed:   среднее %.1f, худшее %.1f центов\n", sum[0] / count, worst[0]);
-        std::printf ("  signalsmith: среднее %.1f, худшее %.1f центов\n\n", sum[1] / count, worst[1]);
+        std::printf ("  signalsmith: среднее %.1f, худшее %.1f центов\n", sum[1] / count, worst[1]);
+        std::printf ("  follow:      среднее %.1f, худшее %.1f центов\n\n", sum[2] / count, worst[2]);
 
         // Пороги поставлены по замеру с запасом примерно вдвое. Они ловят не «стало
         // чуть хуже», а «движок сломался» или «кто-то уменьшил окно STFT».
@@ -461,6 +474,26 @@ int main()
         // И главное — ради чего менялся движок: HQ обязан быть точнее Fast.
         CHECK (worst[1] < worst[0]);
         CHECK (sum[1] < sum[0]);
+
+        // Движок Follow: окно втрое короче, и точность обязана быть хуже HQ — иначе
+        // длинное окно в дилее не окупается и его надо укорачивать. Но остаться он
+        // обязан в пределах, где хвост ещё поёт в унисон с сухим, а не бьётся с ним.
+        // Замер на этом окне: среднее 5,2, худшее 16,2 цента. Порог с запасом в полтора
+        // раза — ловит поломку движка и укорачивание окна, а не дрожание в последней
+        // цифре. Окно 0,06 с давало худшие 58 центов, то есть четверть тона: для
+        // унисона с сухим сигналом это брак, и потому в Follow стоит 0,09 (ADR 0006).
+        CHECK (sum[2] > sum[1]);
+        CHECK (worst[2] < 25.0);
+
+        // Латентность движка Follow — ровно окно: это то число, которое плагин
+        // просит скомпенсировать у хоста (ADR 0006), и разъехаться ему нельзя.
+        {
+            auto shifter = makeShifter (Engine::follow);
+            shifter->prepare (sr, 2048);
+
+            CHECK (shifter->getLatencySamples()
+                   == static_cast<int> (sr * followWindowSeconds));
+        }
     }
 
     std::printf ("test_pitch_shifter: OK\n");
