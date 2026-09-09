@@ -37,6 +37,7 @@ juce_add_plugin(MidiDelay
 
 target_sources(MidiDelay PRIVATE
     Source/PluginProcessor.cpp
+    Source/DSP/DelayBuffer.cpp
     Source/PluginEditor.cpp)
 
 target_compile_definitions(MidiDelay PUBLIC
@@ -51,3 +52,25 @@ target_link_libraries(MidiDelay PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+
+# Офлайн-тест процессора: аллокации, смещение дилея, состояние. Из сборки по умолчанию
+# исключён намеренно — у консольного приложения своя копия модулей JUCE, и в CI это
+# лишние минуты ради проверки, которая и так гоняется руками перед коммитом:
+#   cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Release/ProcessorTest
+juce_add_console_app(ProcessorTest PRODUCT_NAME "ProcessorTest")
+set_target_properties(ProcessorTest PROPERTIES EXCLUDE_FROM_ALL TRUE)
+
+target_sources(ProcessorTest PRIVATE
+    Source/PluginProcessor.cpp
+    Source/PluginEditor.cpp
+    Source/DSP/DelayBuffer.cpp
+    Source/test_processor.cpp)
+
+target_compile_definitions(ProcessorTest PRIVATE
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_STANDALONE_APPLICATION=1)
+
+target_link_libraries(ProcessorTest PRIVATE
+    juce::juce_audio_utils
+    juce::juce_recommended_config_flags)
