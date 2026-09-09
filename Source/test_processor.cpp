@@ -1034,6 +1034,279 @@ int main (int argc, char* argv[])
         CHECK (tailRms > 0.1);
     }
 
+    // --- Реальная задержка хвоста и нижний предел delay time (#17) --------------
+    // Критерий #17 требует замера, а не одной точки: пик хвоста обязан стоять ровно
+    // на выставленном времени, на обоих движках и на разных временах. Ниже предела
+    // время подтягивается вверх — и хвост приходит ровно на пределе, а не позже него,
+    // как приходил до клампа. Латентность хосту не репортится нигде и никогда.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 16384;
+        constexpr int blocks = 4;   // 65536 сэмплов, хватает на секунду с лишним
+
+        // Позиция пика хвоста от начала прогона. Вход — один импульс в нулевом сэмпле,
+        // mix 100 %, feedback 0: во всём выходе ровно один всплеск, и это хвост.
+        // Нота 60 — Root Key по умолчанию, ratio 1, питчер время не двигает.
+        const auto tailPeak = [] (bool hq, float delayMs, double* minDelayMs = nullptr)
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", hq ? 1.0f : 0.0f);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            CHECK (proc.getLatencySamples() == 0);   // ANALYSIS §5: хосту — ноль
+
+            if (minDelayMs != nullptr)
+                *minDelayMs = proc.getMinDelayMs();
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            int peak = -1;
+            float peakValue = 0.0f;
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                block.clear();
+
+                if (b == 0)
+                {
+                    block.setSample (0, 0, 1.0f);
+                    block.setSample (1, 0, 1.0f);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                    if (std::abs (block.getSample (0, i)) > peakValue)
+                    {
+                        peakValue = std::abs (block.getSample (0, i));
+                        peak = b * blockSize + i;
+                    }
+            }
+
+            CHECK (peakValue > 0.99f);
+            return peak;
+        };
+
+        for (const bool hq : { false, true })
+        {
+            double minDelayMs = 0.0;
+            const int belowLimit = tailPeak (hq, 20.0f, &minDelayMs);
+            const int latency = juce::roundToInt (minDelayMs * 0.001 * sr);
+
+            // Предел взят у движка, а не написан числом здесь. Число в тесте при этом
+            // остаётся и стережёт константу: Fast 5762 сэмпла, HQ 8640 (ADR 0005).
+            CHECK (latency == (hq ? 8640 : 5762));
+
+            // 20 мс подтянуты ровно до предела, а не куда-нибудь мимо.
+            CHECK (belowLimit == latency);
+
+            // Замер: четыре времени от «чуть выше предела» до секунды, допуск ±1 мс.
+            for (const float delayMs : { hq ? 190.0f : 130.0f, 250.0f, 500.0f, 1000.0f })
+                CHECK (std::abs (tailPeak (hq, delayMs)
+                                 - juce::roundToInt (delayMs * 0.001 * sr)) <= 48);
+        }
+
+        // Кламп подтянул и петлю обратной связи, а не только первый хвост. Проверка
+        // отдельная и нужная: позицию первого хвоста один только кламп внутри голоса
+        // даёт ровно ту же, и на ней разницы не видно. А вот повторы её показывают —
+        // кольцо, крутящееся на заказанных 20 мс под хвостом на 120, село бы гребёнкой.
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", 0.0f);
+            setParam (proc, "delayTime", 20.0f);     // втрое ниже предела Fast
+            setParam (proc, "feedback", 50.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            const int limit = juce::roundToInt (proc.getMinDelayMs() * 0.001 * sr);
+            std::vector<float> out (static_cast<size_t> (blockSize) * blocks, 0.0f);
+            juce::AudioBuffer<float> block (2, blockSize);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                block.clear();
+
+                if (b == 0)
+                {
+                    block.setSample (0, 0, 1.0f);
+                    block.setSample (1, 0, 1.0f);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+
+                for (int i = 0; i < blockSize; ++i)
+                    out[static_cast<size_t> (b) * blockSize + i] = block.getSample (0, i);
+            }
+
+            // Второй повтор ищется во второй трети прогона: он вдвое тише первого,
+            // и глобальный максимум его не найдёт.
+            int second = -1;
+            float secondValue = 0.0f;
+
+            for (int i = limit + limit / 2; i < 3 * limit; ++i)
+                if (std::abs (out[static_cast<size_t> (i)]) > secondValue)
+                {
+                    secondValue = std::abs (out[static_cast<size_t> (i)]);
+                    second = i;
+                }
+
+            CHECK (second == 2 * limit);              // интервал повтора — предел, а не 20 мс
+            CHECK (std::abs (secondValue - 0.5f) < 0.01f);   // и это именно feedback 50 %
+        }
+    }
+
+    // --- Огибающая: velocity, длительность ноты, короткая нота (#16) -----------
+    // Вход — постоянная единица при mix 100 %, ratio 1: на выходе видна ровно
+    // огибающая голоса, и её можно читать прямо из буфера. Движок по умолчанию.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+
+        const auto setup = [] (MidiDelayProcessor& proc, float attackMs, float releaseMs)
+        {
+            setParam (proc, "delayTime", 200.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", attackMs);
+            setParam (proc, "release", releaseMs);
+            setParam (proc, "voices", 8.0f);
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+        };
+
+        // 1. Velocity через корень: мягче линейной, но слышимо. Уровень снимается
+        //    с удержанной ноты, когда атака давно кончилась и огибающая стоит на пике.
+        {
+            const auto sustainLevel = [&setup] (int velocity)
+            {
+                MidiDelayProcessor proc;
+                setup (proc, 1.0f, 300.0f);
+
+                juce::AudioBuffer<float> buffer (2, blockSize);
+                for (int b = 0; b < 40; ++b) { fillDC (buffer); runBlock (proc, buffer); }
+
+                juce::MidiBuffer midi;
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60, (juce::uint8) velocity), 0);
+                fillDC (buffer); runBlock (proc, buffer, midi);
+                fillDC (buffer); runBlock (proc, buffer);
+
+                return buffer.getSample (0, blockSize - 1);
+            };
+
+            for (const int velocity : { 1, 32, 64, 100, 127 })
+                CHECK (std::abs (sustainLevel (velocity)
+                                 - std::sqrt (velocity / 127.0f)) < 2.0e-3f);
+
+            // Слышимость: полный размах velocity — это 21 dB, а не пара децибел.
+            CHECK (sustainLevel (127) > sustainLevel (1) * 10.0f);
+            // И мягче линейной: на velocity 64 хвост садится на 3 dB, а не на 6.
+            CHECK (sustainLevel (64) > 0.6f);
+        }
+
+        // 2. Длина хвоста следует длительности ноты: держали дольше — звучало дольше
+        //    ровно на столько же. Порог 1e-4 ловит конец спада с точностью до сэмплов.
+        {
+            const auto tailEnd = [&setup] (int holdBlocks)
+            {
+                MidiDelayProcessor proc;
+                setup (proc, 1.0f, 50.0f);   // release 50 мс = 2400 сэмплов
+
+                juce::AudioBuffer<float> buffer (2, blockSize);
+                for (int b = 0; b < 40; ++b) { fillDC (buffer); runBlock (proc, buffer); }
+
+                int last = -1;
+
+                for (int b = 0; b < holdBlocks + 20; ++b)
+                {
+                    juce::MidiBuffer midi;
+                    if (b == 0)          midi.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 0);
+                    if (b == holdBlocks) midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+
+                    fillDC (buffer);
+                    runBlock (proc, buffer, midi);
+
+                    for (int i = 0; i < blockSize; ++i)
+                        if (std::abs (buffer.getSample (0, i)) > 1.0e-4f)
+                            last = b * blockSize + i;
+                }
+
+                return last;
+            };
+
+            const int shortNote = tailEnd (4);
+            const int longNote  = tailEnd (20);
+
+            CHECK (std::abs ((longNote - shortNote) - 16 * blockSize) <= 1);
+
+            // И хвост кончается спустя release после note off, а не раньше и не позже.
+            CHECK (shortNote > 4 * blockSize);
+            CHECK (shortNote < 4 * blockSize + 2400);
+        }
+
+        // 3. Нота короче атаки: огибающая уходит в спад с недобранного уровня.
+        //    Ни щелчка, ни залипшего голоса — ровно то, чего требует #16.
+        {
+            MidiDelayProcessor proc;
+            setup (proc, 50.0f, 100.0f);   // атака 50 мс = 2400 сэмплов
+
+            juce::AudioBuffer<float> buffer (2, blockSize);
+            for (int b = 0; b < 40; ++b) { fillDC (buffer); runBlock (proc, buffer); }
+
+            float lastSample = buffer.getSample (0, blockSize - 1);
+            float maxStep = 0.0f;
+            float maxLevel = 0.0f;
+
+            for (int b = 0; b < 40; ++b)
+            {
+                juce::MidiBuffer midi;
+
+                if (b == 0)   // нота длиной 32 сэмпла, в семьдесят пять раз короче атаки
+                {
+                    midi.addEvent (juce::MidiMessage::noteOn  (1, 60, 1.0f), 0);
+                    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 32);
+                }
+
+                fillDC (buffer);
+                runBlock (proc, buffer, midi);
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float s = buffer.getSample (0, i);
+                    maxStep = juce::jmax (maxStep, std::abs (s - lastSample));
+                    maxLevel = juce::jmax (maxLevel, std::abs (s));
+                    lastSample = s;
+                }
+            }
+
+            // Самый крутой участок вогнутой атаки — её начало: 2/2400 на сэмпл.
+            // Порог 0,01 выше этого на порядок и поймал бы любой честный разрыв.
+            CHECK (maxStep < 0.01f);
+
+            // Звук был, но тихий: 32 сэмпла атаки из 2400 дают 0,026 уровня.
+            CHECK (maxLevel > 1.0e-3f);
+            CHECK (maxLevel < 0.1f);
+
+            // Голос освободился: спад доехал ровно до нуля, а не завис на остатке.
+            CHECK (buffer.getSample (0, blockSize - 1) == 0.0f);
+        }
+    }
+
     std::printf ("test_processor: OK\n");
     return 0;
 }

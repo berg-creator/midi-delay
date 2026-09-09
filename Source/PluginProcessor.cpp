@@ -136,6 +136,13 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
 
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
+    voiceManager.setQuality (pQuality->load() > 0.5f);
+
+    // Нижний предел delay time — латентность движка (#17). Спрашивается у движка сразу
+    // после его подготовки: зашитое число разъехалось бы с окном при первой же правке.
+    const double msPerSample = 1000.0 / currentSampleRate;
+    minDelayFastMs = voiceManager.getLatencySamples (false) * msPerSample;
+    minDelayHqMs   = voiceManager.getLatencySamples (true)  * msPerSample;
 
     delaySamplesSmoothed.reset (currentSampleRate, smoothingSeconds);
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
@@ -144,7 +151,8 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
 
     // Первый блок после prepare не должен въезжать в значения рампой.
     delaySamplesSmoothed.setCurrentAndTargetValue (
-        static_cast<float> (pDelayTime->load() * 0.001 * currentSampleRate));
+        static_cast<float> (juce::jmax (pDelayTime->load() * 0.001 * currentSampleRate,
+                                        (double) voiceManager.getLatencySamples (pQuality->load() > 0.5f))));
     mixSmoothed.setCurrentAndTargetValue (pMix->load() * 0.01f);
     gainSmoothed.setCurrentAndTargetValue (
         juce::Decibels::decibelsToGain (pOutputGain->load()));
@@ -203,8 +211,19 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     const float feedback = pFeedback->load (std::memory_order_relaxed) * 0.01f;
 
-    delaySamplesSmoothed.setTargetValue (static_cast<float> (
-        pDelayTime->load (std::memory_order_relaxed) * 0.001 * currentSampleRate));
+    // Quality снимается до delay time: предел на время — функция активного движка (#17).
+    const bool wantHq = pQuality->load (std::memory_order_relaxed) > 0.5f;
+    voiceManager.setQuality (wantHq);
+
+    // Кламп снизу на латентность движка. Без него при коротком времени смещение чтения
+    // упиралось бы в кламп внутри голоса, и хвост приходил бы позже заказанного молча —
+    // ровно то, что запрещает ANALYSIS §5. Подтягивается эффективное время, а не значение
+    // параметра: писать в параметр из плагина значило бы драться с автоматизацией хоста
+    // и терять выставленные 120 мс при возврате на Fast. Пользователю предел виден в окне.
+    delaySamplesSmoothed.setTargetValue (static_cast<float> (juce::jmax (
+        pDelayTime->load (std::memory_order_relaxed) * 0.001 * currentSampleRate,
+        (double) voiceManager.getLatencySamples (wantHq))));
+
     mixSmoothed.setTargetValue (pMix->load (std::memory_order_relaxed) * 0.01f);
     gainSmoothed.setTargetValue (juce::Decibels::decibelsToGain (
         pOutputGain->load (std::memory_order_relaxed)));
@@ -213,7 +232,6 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     voiceManager.setEnvelope (pAttack->load (std::memory_order_relaxed),
                               pRelease->load (std::memory_order_relaxed));
     voiceManager.setVoiceLimit (static_cast<int> (pVoices->load (std::memory_order_relaxed)));
-    voiceManager.setQuality (pQuality->load (std::memory_order_relaxed) > 0.5f);
 
     wetBuffer.clear (0, numSamples);
 
@@ -351,6 +369,12 @@ void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
     }
 
     // Pitch bend, aftertouch, program change, sysex и всё прочее — молча мимо.
+}
+
+double MidiDelayProcessor::getMinDelayMs() const
+{
+    return (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs : minDelayFastMs)
+        .load (std::memory_order_relaxed);
 }
 
 double MidiDelayProcessor::getTailLengthSeconds() const

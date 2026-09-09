@@ -19,6 +19,7 @@ private:
     int lastCount = -1;
     int shownNote = -2;
     int shownQuality = -1;
+    bool shownClamped = false;   // delay time сейчас подтянут до предела движка (#17)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayEditor)
 };

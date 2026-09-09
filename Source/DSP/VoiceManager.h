@@ -23,6 +23,11 @@ public:
     void setVoiceLimit (int numVoices);           // параметр Voices, не больше maxVoices
     void setQuality (bool useHq);                 // параметр Quality: varispeed или Signalsmith
 
+    /** Латентность движка в сэмплах, она же нижний предел delay time (#17). Флаг
+        передаётся явно, а не берётся из своего: процессору нужен предел того движка,
+        который выбран параметром прямо сейчас, а не того, на котором доигрывают голоса. */
+    int getLatencySamples (bool useHq) const;
+
     void noteOn (int midiNote, float velocity, float ratio, float pan);
     void noteOff (int midiNote);
     void allNotesOff();

@@ -101,6 +101,12 @@ void VoiceManager::setQuality (bool useHq)
         v.setQuality (useHq);
 }
 
+int VoiceManager::getLatencySamples (bool useHq) const
+{
+    // Голоса одинаковые и подготовлены одним prepare — спрашивать можно любой.
+    return voices[0].getLatencySamples (useHq);
+}
+
 void VoiceManager::noteOn (int midiNote, float velocity, float ratio, float pan)
 {
     auto& v = findVoiceFor (midiNote);

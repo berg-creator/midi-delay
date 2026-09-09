@@ -57,6 +57,12 @@ public:
     std::atomic<int> lastNote { -1 };
     std::atomic<float> lastRatio { 1.0f };
 
+    /** Нижний предел delay time для движка, выбранного параметром Quality (#17):
+        ниже него хвост физически не может прийти, и время подтягивается вверх.
+        Число берётся у движка в prepareToPlay, а не зашито здесь — у Fast и HQ
+        оно разное и меняется вместе с окном. Ноль до первого prepareToPlay. */
+    double getMinDelayMs() const;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -126,6 +132,11 @@ private:
     std::atomic<float>* pQuality    = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
+
+    // Предел из getMinDelayMs, посчитанный в prepareToPlay. Пишется в подготовке,
+    // читается редактором — отсюда atomic. Два числа, потому что переключение
+    // Quality обязано менять показ мгновенно, а не ждать следующего prepare.
+    std::atomic<double> minDelayFastMs { 0.0 }, minDelayHqMs { 0.0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayProcessor)
 };

@@ -57,6 +57,8 @@ void Voice::reset()
     stage = Stage::idle;
     level = 0.0f;
     peak = 0.0f;
+    startLevel = 0.0f;
+    phase = 0.0f;
     step = 0.0f;
     note = -1;
     pendingNote = -1;
@@ -81,6 +83,12 @@ void Voice::setQuality (bool useHq)
         shifter = useHq ? hqShifter.get() : fastShifter.get();
 }
 
+int Voice::getLatencySamples (bool useHq) const
+{
+    const PitchShifter* engine = useHq ? hqShifter.get() : fastShifter.get();
+    return engine != nullptr ? engine->getLatencySamples() : 0;
+}
+
 void Voice::setEnvelope (double attack, double release)
 {
     attackSamples  = std::max (1.0, attack);
@@ -92,8 +100,11 @@ void Voice::setDelaySamples (double newDelaySamples)
     delaySamples = newDelaySamples;
 
     // Латентность питчера прячется в delay time, а не репортится хосту (ANALYSIS §5).
-    // Кламп нулём — не защита, а граница: при delay time меньше латентности движка
-    // хвост придёт позже заказанного. Нижний предел на параметр — задача #17.
+    // Процессор держит delay time не ниже латентности выбранного движка (#17), так что
+    // в норме здесь ничего не срезается. Кламп остаётся на один случай: Quality
+    // переключили с HQ на Fast, предел упал до 120 мс, а голос доигрывает на HQ —
+    // его латентность больше нового предела. Он придёт позже заказанного, и это
+    // на одну ноту, ровно как и обещано в ADR 0005.
     const double latency = shifter != nullptr ? shifter->getLatencySamples() : 0;
     readOffset = std::max (0.0, newDelaySamples - latency);
 }
@@ -103,8 +114,18 @@ void Voice::setAge (unsigned newAge) { age = newAge; }
 void Voice::start (int midiNote, float velocity, float ratio, float pan)
 {
     note = midiNote;
-    peak = std::clamp (velocity, 0.0f, 1.0f);
-    step = static_cast<float> (peak / attackSamples);
+
+    // Кривая velocity: корень, то есть velocity управляет энергией, а не амплитудой.
+    // Мягче линейной, как и просит #16: на velocity 64 хвост садится на 3 dB, а не на 6,
+    // и тихая игра не пропадает под сухим сигналом. Полный размах громкости при этом
+    // остаётся — от 1.0 до 0.09 на velocity 1. Константа, а не параметр: настраивать
+    // тут нечего, у кривой нет свободного числа, а шестнадцатая ручка в списке стоит
+    // дороже, чем разница между sqrt и чем-нибудь ещё мягким.
+    peak = std::sqrt (std::clamp (velocity, 0.0f, 1.0f));
+
+    level = 0.0f;
+    phase = 0.0f;
+    step = static_cast<float> (1.0 / attackSamples);
     stage = Stage::attack;
     sustained = false;
     pendingNote = -1;
@@ -126,7 +147,6 @@ void Voice::noteOn (int midiNote, float velocity, float ratio, double newDelaySa
     shifter = wantHq ? hqShifter.get() : fastShifter.get();
 
     setDelaySamples (newDelaySamples);
-    level = 0.0f;
 
     if (shifter != nullptr)
         shifter->reset();
@@ -144,7 +164,12 @@ void Voice::noteOff()
 
     sustained = false;
     stage = Stage::release;
-    step = static_cast<float> (level / releaseSamples);   // спад ровно за release, с любого уровня
+
+    // Спад ровно за release с любого уровня, в том числе с недобранного очень короткой
+    // нотой: фаза едет от единицы к нулю, а форму даёт кривая в nextEnvelope.
+    startLevel = level;
+    phase = 1.0f;
+    step = static_cast<float> (1.0 / releaseSamples);
 }
 
 void Voice::steal (int midiNote, float velocity, float ratio, double newDelaySamples, float pan)
@@ -157,7 +182,9 @@ void Voice::steal (int midiNote, float velocity, float ratio, double newDelaySam
 
     sustained = false;
     stage = Stage::stealing;
-    step = static_cast<float> (std::max (level, 1.0e-6f) / stealSamples);
+    startLevel = level;
+    phase = 1.0f;
+    step = static_cast<float> (1.0 / stealSamples);
 }
 
 void Voice::setSustained (bool shouldHold) { sustained = shouldHold; }
@@ -169,20 +196,41 @@ float Voice::getEnvelopeLevel() const { return level; }
 unsigned Voice::getAge() const      { return age; }
 int Voice::getMidiNote() const      { return note; }
 
+/** Форма огибающей (#16). Машина состояний та же, что была; изменилось только то,
+    что едет по прямой — теперь это фаза фронта 0..1, а уровень получается из неё кривой.
+    Цена — один множитель на сэмпл, зато оба фронта попадают в свои концы точно:
+    атака ровно в peak, спад ровно в ноль, и голос гарантированно освобождается.
+
+    Атака вогнутая, 1-(1-p)^2: у прямой на верхушке излом, и на низах он слышен щелчком
+    при коротких атаках — как раз там, где #16 требует обратного. Спад выпуклый, p^2:
+    прямая обрывает хвост на последних миллисекундах, а квадрат уходит в ноль с нулевым
+    наклоном, то есть так, как затухает всё остальное в этом плагине. */
 float Voice::nextEnvelope()
 {
     switch (stage)
     {
         case Stage::attack:
-            level += step;
-            if (level >= peak) { level = peak; stage = Stage::sustain; }
+            phase += step;
+
+            if (phase >= 1.0f) { phase = 1.0f; level = peak; stage = Stage::sustain; }
+            else               { level = peak * (2.0f - phase) * phase; }
+
             break;
 
         case Stage::release:
         case Stage::stealing:
-            level -= step;
-            if (level <= 0.0f)
+            phase -= step;
+
+            if (phase > 0.0f)
             {
+                // Кража — линейный fade-out 5 мс: она обязана быть незаметной, а не
+                // красивой, и на такой длине кривая только растянула бы её хвост (ADR 0001).
+                level = stage == Stage::release ? startLevel * phase * phase
+                                                : startLevel * phase;
+            }
+            else
+            {
+                phase = 0.0f;
                 level = 0.0f;
 
                 if (stage == Stage::stealing && pendingNote >= 0)

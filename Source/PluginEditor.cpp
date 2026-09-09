@@ -13,12 +13,15 @@ void MidiDelayEditor::timerCallback()
     const auto note  = proc.lastNote.load (std::memory_order_relaxed);
     const auto quality = static_cast<int> (proc.apvts.getRawParameterValue ("quality")
                                                ->load (std::memory_order_relaxed));
+    const auto clamped = proc.apvts.getRawParameterValue ("delayTime")
+                             ->load (std::memory_order_relaxed) < proc.getMinDelayMs();
 
-    if (count != lastCount || note != shownNote || quality != shownQuality)
+    if (count != lastCount || note != shownNote || quality != shownQuality || clamped != shownClamped)
     {
         lastCount = count;
         shownNote = note;
         shownQuality = quality;
+        shownClamped = clamped;
         repaint();
     }
 }
@@ -40,11 +43,22 @@ void MidiDelayEditor::paint (juce::Graphics& g)
     // Движок питчинга и его минимальный delay time (ADR 0005). Своего переключателя
     // тут нет — параметр крутится из панели плагина в хосте, а показ нужен затем,
     // чтобы не гадать, какой движок звучит. Настоящий интерфейс — веха M4.
-    g.setColour (juce::Colours::grey);
+    //
+    // Предел спрашивается у процессора, а не написан здесь числом (#17): он равен
+    // латентности движка и меняется вместе с его окном. Когда выставленное время
+    // ниже предела, строка про это и говорит — иначе хвост молча приходил бы позже
+    // заказанного, и понять причину было бы неоткуда.
+    const auto minDelay = proc.getMinDelayMs();
+    auto engineText = juce::String (shownQuality > 0 ? "Engine: HQ (Signalsmith)"
+                                                     : "Engine: Fast (varispeed)");
+
+    if (minDelay > 0.0)
+        engineText += (shownClamped ? " - delay time raised to min "
+                                    : " - min delay ") + juce::String (minDelay, 0) + " ms";
+
+    g.setColour (shownClamped ? juce::Colours::orange : juce::Colours::grey);
     g.setFont (juce::FontOptions (12.0f));
-    g.drawText (shownQuality > 0 ? "Engine: HQ (Signalsmith) - min delay 180 ms"
-                                 : "Engine: Fast (varispeed) - min delay 120 ms",
-                getLocalBounds().removeFromBottom (26),
+    g.drawText (engineText, getLocalBounds().removeFromBottom (26),
                 juce::Justification::centredTop, false);
 
     g.setColour (count > 0 ? juce::Colours::limegreen : juce::Colours::grey);
