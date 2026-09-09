@@ -9,6 +9,11 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES)
     set(CMAKE_OSX_ARCHITECTURES "arm64;x86_64" CACHE STRING "" FORCE)
 endif()
 
+# В CI копировать плагин в системные каталоги не нужно и вредно: на Windows JUCE лезет
+# в Program Files\Common Files\VST3, падает уже после успешной компиляции, и выглядит
+# это как «сборка сломалась», хотя собралось всё.
+option(MIDIDELAY_COPY_PLUGIN "Копировать собранный плагин в системные каталоги" ON)
+
 add_subdirectory(libs/JUCE)
 
 juce_add_plugin(MidiDelay
@@ -24,7 +29,7 @@ juce_add_plugin(MidiDelay
     NEEDS_MIDI_INPUT        TRUE
     NEEDS_MIDI_OUTPUT       FALSE
 
-    COPY_PLUGIN_AFTER_BUILD TRUE
+    COPY_PLUGIN_AFTER_BUILD ${MIDIDELAY_COPY_PLUGIN}
     VST3_CATEGORIES         "Fx" "Delay"
     # aumf, а не aufx: AU-эффект, принимающий MIDI. С aufx Logic не даст роутить MIDI
     # на плагин, и auval ругается. Для VST3 разницы нет, для AU — принципиально.

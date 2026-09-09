@@ -1,0 +1,88 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Один прогон на ветку: новый push отменяет предыдущий, недосчитанный.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PLUGINVAL_VERSION: v1.0.4
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # На Windows Ninja сам по себе не найдёт cl.exe, а генератор Visual Studio
+          # подтягивает тулчейн сам. AU в список форматов не добавляем: JUCE отбрасывает
+          # его на не-Apple сама, в _juce_get_platform_plugin_kinds.
+          - name: macOS
+            os: macos-latest
+            generator: Ninja
+            pluginval: pluginval.app/Contents/MacOS/pluginval
+          - name: Windows
+            os: windows-latest
+            generator: Visual Studio 17 2022
+            pluginval: ./pluginval.exe
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Настроить
+        run: >
+          cmake -B build -G "${{ matrix.generator }}"
+          -DCMAKE_BUILD_TYPE=Release
+          -DMIDIDELAY_COPY_PLUGIN=OFF
+
+      - name: Собрать
+        run: cmake --build build --config Release --parallel
+
+      - name: Скачать pluginval (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          curl -sSL -o pluginval.zip "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_macOS.zip"
+          unzip -q pluginval.zip
+          chmod +x "${{ matrix.pluginval }}"
+
+      - name: Скачать pluginval (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          curl -sSL -o pluginval.zip "https://github.com/Tracktion/pluginval/releases/download/$PLUGINVAL_VERSION/pluginval_Windows.zip"
+          7z x -y pluginval.zip > /dev/null
+
+      # Ненулевой код возврата pluginval роняет шаг, а с ним и весь прогон.
+      - name: pluginval, strictness 10
+        shell: bash
+        run: |
+          mkdir -p pluginval-log
+          "${{ matrix.pluginval }}" \
+            --strictness-level 10 \
+            --validate-in-process \
+            --output-dir pluginval-log \
+            --validate "build/MidiDelay_artefacts/Release/VST3/MIDI Delay.vst3"
+
+      - name: Лог pluginval
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pluginval-${{ matrix.name }}
+          path: pluginval-log/
+
+      - name: Артефакты плагина
+        uses: actions/upload-artifact@v4
+        with:
+          name: MIDI-Delay-${{ matrix.name }}
+          path: |
+            build/MidiDelay_artefacts/Release/VST3/
+            build/MidiDelay_artefacts/Release/AU/
