@@ -11,6 +11,8 @@ MidiDelayProcessor::MidiDelayProcessor()
     pFeedback   = apvts.getRawParameterValue ("feedback");
     pMix        = apvts.getRawParameterValue ("mix");
     pOutputGain = apvts.getRawParameterValue ("outputGain");
+    pBypass     = apvts.getRawParameterValue ("bypass");
+    bypassParam = apvts.getParameter ("bypass");
 }
 
 //==============================================================================
@@ -23,6 +25,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
     using Range = NormalisableRange<float>;
 
     std::vector<std::unique_ptr<RangedAudioParameter>> params;
+
+    // Свой параметр обхода, а не флаг хоста: FL Studio автоматизирует только то,
+    // что видит в списке параметров, а VST3-обёртка JUCE помечает этот параметр
+    // как bypass именно по возврату getBypassParameter().
+    params.push_back (std::make_unique<AudioParameterBool> (
+        ParameterID { "bypass", 1 }, "Bypass", false));
 
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "delayTime", 1 }, "Delay Time",
@@ -114,6 +122,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     delaySamplesSmoothed.reset (currentSampleRate, smoothingSeconds);
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
     gainSmoothed.reset (currentSampleRate, smoothingSeconds);
+    bypassSmoothed.reset (currentSampleRate, bypassSeconds);
 
     // Первый блок после prepare не должен въезжать в значения рампой.
     delaySamplesSmoothed.setCurrentAndTargetValue (
@@ -121,6 +130,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     mixSmoothed.setCurrentAndTargetValue (pMix->load() * 0.01f);
     gainSmoothed.setCurrentAndTargetValue (
         juce::Decibels::decibelsToGain (pOutputGain->load()));
+    bypassSmoothed.setCurrentAndTargetValue (pBypass->load() < 0.5f ? 1.0f : 0.0f);
 
     // Латентность не репортим намеренно: латентность питчера будет вычтена
     // из позиции чтения, а не выставлена хосту. ANALYSIS §5.
@@ -182,6 +192,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     mixSmoothed.setTargetValue (pMix->load (std::memory_order_relaxed) * 0.01f);
     gainSmoothed.setTargetValue (juce::Decibels::decibelsToGain (
         pOutputGain->load (std::memory_order_relaxed)));
+    bypassSmoothed.setTargetValue (pBypass->load (std::memory_order_relaxed) < 0.5f ? 1.0f : 0.0f);
 
     const float* const* linePointers = lineInput.getArrayOfReadPointers();
 
@@ -190,6 +201,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         const float delaySamples = delaySamplesSmoothed.getNextValue();
         const float mix  = mixSmoothed.getNextValue();
         const float gain = gainSmoothed.getNextValue();
+        const float wetPath = bypassSmoothed.getNextValue();
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
@@ -202,13 +214,30 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             // иначе каждый круг транспонировал бы хвост заново. Инвариант из CLAUDE.md.
             lineInput.setSample (ch, i, dry + delayed * feedback);
 
-            buffer.setSample (ch, i, (dry * (1.0f - mix) + delayed * mix) * gain);
+            const float processed = (dry * (1.0f - mix) + delayed * mix) * gain;
+
+            // Кроссфейд обхода линейный, а не equal-power: dry и processed
+            // коррелированы, и equal-power дал бы горб +3 dB в середине. ADR 0003.
+            // Форма именно такая: при wetPath = 1 остаётся ровно processed,
+            // при 0 — ровно dry, бит-в-бит.
+            buffer.setSample (ch, i, processed * wetPath + dry * (1.0f - wetPath));
         }
 
         // По сэмплу, а не блоком: при коротком delay time голова записи обгонит
         // позицию чтения внутри одного блока, и блочная запись затрёт хвост.
         delayBuffer.write (linePointers, numChannels, i, 1);
     }
+}
+
+double MidiDelayProcessor::getTailLengthSeconds() const
+{
+    const double delaySeconds = pDelayTime->load (std::memory_order_relaxed) * 0.001;
+    const double feedback     = pFeedback->load (std::memory_order_relaxed) * 0.01;
+
+    // Сколько кругов до -60 dB: feedback^n = 0.001. При нулевом feedback круг ровно один.
+    const double rounds = feedback > 0.001 ? std::log (0.001) / std::log (feedback) : 1.0;
+
+    return juce::jmin (delaySeconds * rounds, maxTailSeconds);
 }
 
 //==============================================================================

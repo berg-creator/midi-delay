@@ -22,7 +22,15 @@ public:
     bool acceptsMidi() const override { return true; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    /** Честная оценка хвоста: по этому числу хост решает, сколько досчитывать
+        после конца дорожки при офлайн-рендере. Ноль обрезал бы хвост ровно
+        на последнем сэмпле. */
+    double getTailLengthSeconds() const override;
+
+    /** Как только здесь не nullptr, обёртка перестаёт звать processBlockBypassed
+        и просто выставляет параметр — значит вся логика обхода живёт
+        внутри processBlock. */
+    juce::AudioProcessorParameter* getBypassParameter() const override { return bypassParam; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -54,13 +62,22 @@ private:
 
     static constexpr double smoothingSeconds = 0.05;
 
+    /** Обход отдельно и быстрее: 50 мс на кнопке «мимо» ощущаются вязкими,
+        а мгновенный переход — это щелчок. */
+    static constexpr double bypassSeconds = 0.02;
+
+    /** Потолок оценки хвоста. При feedback 95 % и delay 2 с честные 135 кругов
+        дали бы четыре с половиной минуты досчёта после каждой дорожки. */
+    static constexpr double maxTailSeconds = 20.0;
+
     DelayBuffer delayBuffer;
 
     /** То, что уходит в кольцо: dry + feedback. Отдельный буфер нужен потому, что
         DelayBuffer::write принимает планарные указатели, а не отдельный сэмпл. */
     juce::AudioBuffer<float> lineInput;
 
-    juce::SmoothedValue<float> delaySamplesSmoothed, mixSmoothed, gainSmoothed;
+    /** bypassSmoothed — доля обработанного сигнала: 1 — плагин работает, 0 — обход. */
+    juce::SmoothedValue<float> delaySamplesSmoothed, mixSmoothed, gainSmoothed, bypassSmoothed;
     double currentSampleRate = 44100.0;
 
     // Кэш указателей на то, что реально читает processBlock. Остальные параметры
@@ -69,6 +86,9 @@ private:
     std::atomic<float>* pFeedback   = nullptr;
     std::atomic<float>* pMix        = nullptr;
     std::atomic<float>* pOutputGain = nullptr;
+    std::atomic<float>* pBypass     = nullptr;
+
+    juce::AudioProcessorParameter* bypassParam = nullptr;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayProcessor)
 };

@@ -6,6 +6,7 @@
 #include "PluginProcessor.h"
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
@@ -148,6 +149,174 @@ int main()
         runBlock (proc, monoIn);
         CHECK (allocations.load() == 0);
         CHECK (std::abs (monoIn.getSample (1, blockSize - 1) - 0.5f) < 1.0e-4f);
+    }
+
+    // --- Микс, гейн и обход без щелчков (#11) ----------------------------------
+    {
+        MidiDelayProcessor proc;
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+        constexpr int delaySamples = 480;   // 10 мс на 48 кГц, ровно на сетке параметра
+
+        // 250 Гц выбрано не случайно: период ровно 192 сэмпла, а 480 — это 2,5 периода.
+        // Значит wet приходит в противофазе к dry, и любой кроссфейд между ними —
+        // настоящий переход, а не переход сигнала в самого себя.
+        constexpr float freq = 250.0f;
+        constexpr float amp  = 0.25f;
+
+        juce::AudioBuffer<float> buffer (2, blockSize);
+        juce::AudioBuffer<float> reference (2, blockSize);
+        int phase = 0;
+
+        // Заполняет блок синусом с непрерывной фазой и двигает счётчик фазы.
+        const auto nextSine = [&buffer, &phase]
+        {
+            for (int i = 0; i < blockSize; ++i)
+            {
+                const float s = amp * std::sin (juce::MathConstants<float>::twoPi
+                                                * freq * (float) (phase + i) / (float) sr);
+                buffer.setSample (0, i, s);
+                buffer.setSample (1, i, s);
+            }
+            phase += blockSize;
+        };
+
+        const auto prepare = [&proc]
+        {
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);   // заодно чистит кольцо
+        };
+
+        // Максимальный шаг между соседними сэмплами. Сам синус даёт 0,033 на сэмпл
+        // при амплитуде 1,0, так что порог 0,1 не задевает сигнал, но ловит разрыв.
+        float lastSample = 0.0f;
+        float maxStep = 0.0f;
+        const auto measureSteps = [&buffer, &lastSample, &maxStep]
+        {
+            for (int i = 0; i < blockSize; ++i)
+            {
+                const float s = buffer.getSample (0, i);
+                maxStep = juce::jmax (maxStep, std::abs (s - lastSample));
+                lastSample = s;
+            }
+        };
+
+        const auto sameAsReference = [&buffer, &reference]
+        {
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i = 0; i < blockSize; ++i)
+                    if (buffer.getSample (ch, i) != reference.getSample (ch, i))
+                        return false;
+
+            return true;
+        };
+
+        // 1. mix = 0 — бит-в-бит. Первый блок холостой: пока сглаживание едет
+        //    к своей цели, равенства нет, и это не баг.
+        setParam (proc, "delayTime", 10.0f);
+        setParam (proc, "feedback", 0.0f);
+        setParam (proc, "outputGain", 0.0f);
+        setParam (proc, "mix", 0.0f);
+        setParam (proc, "bypass", 0.0f);
+        prepare();
+
+        nextSine();
+        runBlock (proc, buffer);
+
+        nextSine();
+        reference.makeCopyOf (buffer);
+        runBlock (proc, buffer);
+        CHECK (allocations.load() == 0);
+        CHECK (sameAsReference());
+
+        // 2. Выравнивание dry и wet: при mix = 50 % пик dry на нуле, пик wet ровно
+        //    на delaySamples. Когда появится латентность питчера, ломаться будет здесь.
+        setParam (proc, "mix", 50.0f);
+        prepare();
+
+        buffer.clear();
+        buffer.setSample (0, 0, 1.0f);
+        buffer.setSample (1, 0, 1.0f);
+        runBlock (proc, buffer);
+
+        CHECK (std::abs (buffer.getSample (0, 0) - 0.5f) < 1.0e-4f);
+        CHECK (std::abs (buffer.getSample (0, delaySamples) - 0.5f) < 1.0e-4f);
+
+        for (int i = 1; i < blockSize; ++i)
+            if (i != delaySamples)
+                CHECK (std::abs (buffer.getSample (0, i)) < 1.0e-4f);
+
+        // 3. Щелчки: mix 0 -> 100 % и output gain -24 -> +12 dB посреди сигнала.
+        //    Без сглаживания выход прыгнул бы с 0,016 до 1,0 за один сэмпл.
+        setParam (proc, "mix", 0.0f);
+        setParam (proc, "outputGain", -24.0f);
+        prepare();
+
+        phase = 0;
+        for (int b = 0; b < 4; ++b) { nextSine(); runBlock (proc, buffer); }   // прогрев кольца
+
+        lastSample = buffer.getSample (0, blockSize - 1);
+        maxStep = 0.0f;
+        setParam (proc, "mix", 100.0f);
+        setParam (proc, "outputGain", 12.0f);
+
+        // Сглаживание 50 мс — это 2400 сэмплов, около пяти блоков.
+        for (int b = 0; b < 8; ++b) { nextSine(); runBlock (proc, buffer); measureSteps(); }
+
+        CHECK (allocations.load() == 0);
+        CHECK (maxStep < 0.1f);
+
+        // 4. Обход и возврат. Гейн уже +12 dB — вернём в ноль, иначе сам обход
+        //    даст честный скачок громкости, а проверяем мы не его.
+        setParam (proc, "outputGain", 0.0f);
+        prepare();
+
+        phase = 0;
+        for (int b = 0; b < 4; ++b) { nextSine(); runBlock (proc, buffer); }
+
+        lastSample = buffer.getSample (0, blockSize - 1);
+        maxStep = 0.0f;
+        setParam (proc, "bypass", 1.0f);
+
+        for (int b = 0; b < 4; ++b)
+        {
+            nextSine();
+            reference.makeCopyOf (buffer);
+            runBlock (proc, buffer);
+            measureSteps();
+        }
+
+        CHECK (maxStep < 0.1f);
+        CHECK (sameAsReference());   // обход доехал: выход бит-в-бит равен входу
+
+        maxStep = 0.0f;
+        setParam (proc, "bypass", 0.0f);
+
+        for (int b = 0; b < 4; ++b) { nextSine(); runBlock (proc, buffer); measureSteps(); }
+
+        CHECK (allocations.load() == 0);
+        CHECK (maxStep < 0.1f);
+
+        // Кольцо во время обхода продолжали писать, значит хвост вернулся без дыры:
+        // wet в противофазе к dry, при mix = 100 % это ровно -amp * sin.
+        for (int i = 0; i < blockSize; ++i)
+        {
+            const float expected = -amp * std::sin (juce::MathConstants<float>::twoPi
+                                                    * freq * (float) (phase - blockSize + i) / (float) sr);
+            CHECK (std::abs (buffer.getSample (0, i) - expected) < 1.0e-3f);
+        }
+
+        // 5. Длина хвоста: круг умножить на число кругов до -60 dB, с потолком.
+        setParam (proc, "delayTime", 400.0f);
+        setParam (proc, "feedback", 0.0f);
+        CHECK (std::abs (proc.getTailLengthSeconds() - 0.4) < 1.0e-6);
+
+        setParam (proc, "feedback", 50.0f);   // 0,5^n = 0,001 -> n = 9,97
+        CHECK (std::abs (proc.getTailLengthSeconds() - 0.4 * 9.9658) < 0.01);
+
+        setParam (proc, "delayTime", 2000.0f);
+        setParam (proc, "feedback", 95.0f);   // 269 с честных -> потолок
+        CHECK (proc.getTailLengthSeconds() == 20.0);
     }
 
     // --- Состояние -------------------------------------------------------------

@@ -39,7 +39,8 @@
 - Feedback берётся **до** питч-стадии — иначе высота хвостов кумулятивно уползает.
 - Латентность питчера прячется в delay time, плагин репортит **нулевую** задержку.
   Подробности: [docs/ANALYSIS.md](docs/ANALYSIS.md) §5.
-- Кроссфейды — **equal-power**, не линейные.
+- Кроссфейды — **equal-power**, не линейные. Единственное исключение — обход плагина:
+  dry и wet там коррелированы, и equal-power дал бы горб +3 dB. См. [ADR 0003](docs/adr/0003-bypass-crossfade.md).
 - `NEEDS_MIDI_INPUT TRUE` в CMake — без него FL Studio не покажет MIDI-вход.
 - `AU_MAIN_TYPE kAudioUnitType_MusicEffect` — AU-эффект с MIDI-входом это `aumf`, не `aufx`.
 - Каждая нетривиальная DSP-единица оставляет один запускаемый офлайн-тест. Без фреймворков.
