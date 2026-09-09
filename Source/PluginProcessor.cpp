@@ -12,6 +12,9 @@ MidiDelayProcessor::MidiDelayProcessor()
     pMix        = apvts.getRawParameterValue ("mix");
     pOutputGain = apvts.getRawParameterValue ("outputGain");
     pBypass     = apvts.getRawParameterValue ("bypass");
+    pAttack     = apvts.getRawParameterValue ("attack");
+    pRelease    = apvts.getRawParameterValue ("release");
+    pVoices     = apvts.getRawParameterValue ("voices");
     bypassParam = apvts.getParameter ("bypass");
 }
 
@@ -118,6 +121,11 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     delayBuffer.prepare (currentSampleRate, numChannels, maxDelaySeconds);
     lineInput.setSize (numChannels, juce::jmax (1, maximumExpectedSamplesPerBlock),
                        false, true, false);
+    wetBuffer.setSize (numChannels, juce::jmax (1, maximumExpectedSamplesPerBlock),
+                       false, true, false);
+
+    voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
+    voiceManager.reset();
 
     delaySamplesSmoothed.reset (currentSampleRate, smoothingSeconds);
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
@@ -142,6 +150,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
 void MidiDelayProcessor::releaseResources()
 {
     delayBuffer.clear();
+    voiceManager.reset();
 }
 
 bool MidiDelayProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -174,13 +183,10 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         for (int ch = numInputs; ch < buffer.getNumChannels(); ++ch)
             buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
 
-    for (const auto meta : midi)
-        if (meta.getMessage().isNoteOn())
-            midiNoteCount.fetch_add (1, std::memory_order_relaxed);
-
     const int numChannels = juce::jmin (buffer.getNumChannels(),
                                         delayBuffer.getNumChannels(),
-                                        lineInput.getNumChannels());
+                                        lineInput.getNumChannels(),
+                                        wetBuffer.getNumChannels());
 
     if (numChannels <= 0 || numSamples > lineInput.getNumSamples())
         return;   // Блок больше обещанного в prepare — писать некуда, лучше пропустить.
@@ -194,14 +200,71 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         pOutputGain->load (std::memory_order_relaxed)));
     bypassSmoothed.setTargetValue (pBypass->load (std::memory_order_relaxed) < 0.5f ? 1.0f : 0.0f);
 
-    const float* const* linePointers = lineInput.getArrayOfReadPointers();
+    voiceManager.setEnvelope (pAttack->load (std::memory_order_relaxed),
+                              pRelease->load (std::memory_order_relaxed));
+    voiceManager.setVoiceLimit (static_cast<int> (pVoices->load (std::memory_order_relaxed)));
 
+    wetBuffer.clear (0, numSamples);
+
+    // Блок режется на сегменты по sample offset каждого события: иначе нота дрожала бы
+    // на размер буфера (ANALYSIS §6.1). MidiBuffer отдаёт события уже по возрастанию.
+    int segmentStart = 0;
+
+    for (const auto meta : midi)
+    {
+        const int position = juce::jlimit (0, numSamples, meta.samplePosition);
+
+        if (position > segmentStart)
+        {
+            renderSegment (buffer, segmentStart, position - segmentStart, numChannels, feedback);
+            segmentStart = position;
+        }
+
+        handleMidiMessage (meta.getMessage());
+    }
+
+    if (segmentStart < numSamples)
+        renderSegment (buffer, segmentStart, numSamples - segmentStart, numChannels, feedback);
+
+    // Микс, гейн и обход — одним проходом по всему блоку. Сегментация на них не влияет:
+    // сглаживание едет по сэмплам, и результат не зависит от того, где прошли границы.
     for (int i = 0; i < numSamples; ++i)
     {
-        const float delaySamples = delaySamplesSmoothed.getNextValue();
         const float mix  = mixSmoothed.getNextValue();
         const float gain = gainSmoothed.getNextValue();
         const float wetPath = bypassSmoothed.getNextValue();
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
+            const float dry = buffer.getSample (ch, i);
+            const float wet = wetBuffer.getSample (ch, i);
+
+            const float processed = (dry * (1.0f - mix) + wet * mix) * gain;
+
+            // Кроссфейд обхода линейный, а не equal-power: dry и processed
+            // коррелированы, и equal-power дал бы горб +3 dB в середине. ADR 0003.
+            // Форма именно такая: при wetPath = 1 остаётся ровно processed,
+            // при 0 — ровно dry, бит-в-бит.
+            buffer.setSample (ch, i, processed * wetPath + dry * (1.0f - wetPath));
+        }
+    }
+}
+
+void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
+                                        int startSample, int numSamples,
+                                        int numChannels, float feedback)
+{
+    // Значение снимается на границе сегмента, а не по сэмплу: голос читает кольцо
+    // блоком, одним смещением на весь сегмент. При статичном delay time это то же
+    // самое число, и результат не зависит от размера блока.
+    voiceManager.setDelaySamples (delaySamplesSmoothed.getCurrentValue());
+
+    const float* const* linePointers = lineInput.getArrayOfReadPointers();
+    const int end = startSample + numSamples;
+
+    for (int i = startSample; i < end; ++i)
+    {
+        const float delaySamples = delaySamplesSmoothed.getNextValue();
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
@@ -210,23 +273,51 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             // ещё указывает на слот сэмпла i, и read(d) отдаёт ровно x[i - d].
             const float delayed = delayBuffer.read (ch, delaySamples);
 
-            // Feedback снимается ДО питч-стадии (её пока нет, но точка отбора уже здесь):
-            // иначе каждый круг транспонировал бы хвост заново. Инвариант из CLAUDE.md.
+            // Feedback снимается ДО питч-стадии: голоса читают уже записанное кольцо,
+            // и транспонирование в петлю не попадает. Инвариант из CLAUDE.md.
             lineInput.setSample (ch, i, dry + delayed * feedback);
-
-            const float processed = (dry * (1.0f - mix) + delayed * mix) * gain;
-
-            // Кроссфейд обхода линейный, а не equal-power: dry и processed
-            // коррелированы, и equal-power дал бы горб +3 dB в середине. ADR 0003.
-            // Форма именно такая: при wetPath = 1 остаётся ровно processed,
-            // при 0 — ровно dry, бит-в-бит.
-            buffer.setSample (ch, i, processed * wetPath + dry * (1.0f - wetPath));
         }
 
         // По сэмплу, а не блоком: при коротком delay time голова записи обгонит
         // позицию чтения внутри одного блока, и блочная запись затрёт хвост.
         delayBuffer.write (linePointers, numChannels, i, 1);
     }
+
+    // Кольцо записано на весь сегмент — голоса отсчитывают смещение от его конца.
+    voiceManager.process (wetBuffer.getArrayOfWritePointers(), numChannels,
+                          startSample, numSamples, delayBuffer);
+}
+
+void MidiDelayProcessor::handleMidiMessage (const juce::MidiMessage& message)
+{
+    // isNoteOn() по умолчанию не считает нотой velocity 0, а isNoteOff() — считает.
+    // Отдельная ветка под этот случай не нужна: JUCE уже развела его правильно.
+    if (message.isNoteOn())
+    {
+        midiNoteCount.fetch_add (1, std::memory_order_relaxed);
+
+        // #15: ratio считается из ноты и root key. Пока хвост звучит в исходной высоте.
+        // Пан по голосам — #23, поэтому все в центре.
+        voiceManager.noteOn (message.getNoteNumber(), message.getFloatVelocity(), 1.0f, 0.0f);
+    }
+    else if (message.isNoteOff())
+    {
+        voiceManager.noteOff (message.getNoteNumber());
+    }
+    else if (message.isAllNotesOff() || message.isAllSoundOff())
+    {
+        voiceManager.allNotesOff();
+    }
+    else if (message.isSustainPedalOn())
+    {
+        voiceManager.setSustain (true);
+    }
+    else if (message.isSustainPedalOff())
+    {
+        voiceManager.setSustain (false);
+    }
+
+    // Pitch bend, aftertouch, program change, sysex и всё прочее — молча мимо.
 }
 
 double MidiDelayProcessor::getTailLengthSeconds() const

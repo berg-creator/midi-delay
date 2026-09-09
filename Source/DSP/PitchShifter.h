@@ -35,3 +35,20 @@ public:
     void process (const float* in, float* out, int numSamples) override;
     int getLatencySamples() const override;
 };
+
+/** Заглушка на время M2: вход копируется в выход, ratio игнорируется, латентность ноль.
+    Нужна не «для будущего», а чтобы голоса, огибающие и кража собирались и проверялись
+    до появления настоящего движка. Голос на ней звучит как обычный дилей.
+    Задача #14 меняет одну строку в Voice::prepare. */
+class UnityShifter final : public PitchShifter
+{
+public:
+    void prepare (double, int) override {}
+    void reset() override {}
+    void setRatio (float) override {}
+    void process (const float* in, float* out, int numSamples) override
+    {
+        for (int i = 0; i < numSamples; ++i) out[i] = in[i];
+    }
+    int getLatencySamples() const override { return 0; }
+};

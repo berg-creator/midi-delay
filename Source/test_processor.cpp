@@ -1,5 +1,6 @@
-// Офлайн-тест процессора (#9, #10): ноль аллокаций в аудиопотоке, точность смещения
-// дилея, смена sample rate, раскладки шин и живучесть состояния. Без фреймворков.
+// Офлайн-тест процессора (#9-#13): ноль аллокаций в аудиопотоке, точность смещения
+// дилея, смена sample rate, раскладки шин, живучесть состояния, sample-accurate MIDI
+// и пул голосов. Без фреймворков.
 // Собирается и запускается так (в CI намеренно не собирается, см. CMakeLists.txt):
 //   cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Release/ProcessorTest
 
@@ -10,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <vector>
 
 // Не assert: сборка Release определяет NDEBUG, и assert превратился бы в пустоту —
 // тест «проходил» бы, ничего не проверяя. Проверка обязана быть безусловной.
@@ -42,14 +44,30 @@ namespace
         CHECK (std::abs (proc.apvts.getRawParameterValue (id)->load() - value) < 0.01f);
     }
 
-    /** Прогоняет блок с включённым счётчиком аллокаций. */
-    void runBlock (MidiDelayProcessor& proc, juce::AudioBuffer<float>& buffer)
+    /** Прогоняет блок с включённым счётчиком аллокаций. Копия MidiBuffer делается
+        до включения счётчика: считаем только то, что делает сам processBlock. */
+    void runBlock (MidiDelayProcessor& proc, juce::AudioBuffer<float>& buffer,
+                   const juce::MidiBuffer& midiIn = {})
     {
-        juce::MidiBuffer midi;
+        juce::MidiBuffer midi (midiIn);
 
         counting = true;
         proc.processBlock (buffer, midi);
         counting = false;
+    }
+
+    juce::MidiBuffer noteOnAt (int samplePosition, int note = 60, float velocity = 1.0f)
+    {
+        juce::MidiBuffer midi;
+        midi.addEvent (juce::MidiMessage::noteOn (1, note, velocity), samplePosition);
+        return midi;
+    }
+
+    void fillDC (juce::AudioBuffer<float>& buffer, float value = 1.0f)
+    {
+        for (int ch = 0; ch < buffer.getNumChannels(); ++ch)
+            for (int i = 0; i < buffer.getNumSamples(); ++i)
+                buffer.setSample (ch, i, value);
     }
 }
 
@@ -93,6 +111,9 @@ int main()
         setParam (proc, "mix", 100.0f);
         setParam (proc, "feedback", 0.0f);
         setParam (proc, "outputGain", 0.0f);
+        // Атака 1 мс — 48 сэмплов: к 480-му огибающая давно единица, и импульс
+        // приходит неискажённым. Wet теперь собирается из голосов, без ноты его нет.
+        setParam (proc, "attack", 1.0f);
 
         proc.setPlayConfigDetails (2, 2, sr, blockSize);
         proc.prepareToPlay (sr, blockSize);
@@ -102,7 +123,7 @@ int main()
         buffer.setSample (0, 0, 1.0f);
         buffer.setSample (1, 0, 1.0f);
 
-        runBlock (proc, buffer);
+        runBlock (proc, buffer, noteOnAt (0));
         CHECK (allocations.load() == 0);
 
         // read() вызывается до записи текущего сэмпла, поэтому смещение ровно delaySamples,
@@ -134,9 +155,11 @@ int main()
             CHECK (small.getSample (0, i) == 0.0f);
 
         // Моно→стерео: правый канал приходит с мусором, dry обязан в нём появиться.
+        // mix выставляется ДО prepareToPlay: иначе сглаживание поедет с прошлого
+        // значения, и dry на выходе будет неполным весь первый блок.
+        setParam (proc, "mix", 0.0f);
         proc.setPlayConfigDetails (1, 2, sr, blockSize);
         proc.prepareToPlay (sr, blockSize);
-        setParam (proc, "mix", 0.0f);
 
         juce::AudioBuffer<float> monoIn (2, blockSize);
         monoIn.clear();
@@ -181,10 +204,12 @@ int main()
             phase += blockSize;
         };
 
+        // prepareToPlay чистит и кольцо, и голоса, поэтому ноту надо давать заново
+        // после каждого prepare: без живого голоса wet теперь ноль по определению.
         const auto prepare = [&proc]
         {
             proc.setPlayConfigDetails (2, 2, sr, blockSize);
-            proc.prepareToPlay (sr, blockSize);   // заодно чистит кольцо
+            proc.prepareToPlay (sr, blockSize);
         };
 
         // Максимальный шаг между соседними сэмплами. Сам синус даёт 0,033 на сэмпл
@@ -218,10 +243,11 @@ int main()
         setParam (proc, "outputGain", 0.0f);
         setParam (proc, "mix", 0.0f);
         setParam (proc, "bypass", 0.0f);
+        setParam (proc, "attack", 1.0f);
         prepare();
 
         nextSine();
-        runBlock (proc, buffer);
+        runBlock (proc, buffer, noteOnAt (0));
 
         nextSine();
         reference.makeCopyOf (buffer);
@@ -237,7 +263,7 @@ int main()
         buffer.clear();
         buffer.setSample (0, 0, 1.0f);
         buffer.setSample (1, 0, 1.0f);
-        runBlock (proc, buffer);
+        runBlock (proc, buffer, noteOnAt (0));
 
         CHECK (std::abs (buffer.getSample (0, 0) - 0.5f) < 1.0e-4f);
         CHECK (std::abs (buffer.getSample (0, delaySamples) - 0.5f) < 1.0e-4f);
@@ -253,7 +279,8 @@ int main()
         prepare();
 
         phase = 0;
-        for (int b = 0; b < 4; ++b) { nextSine(); runBlock (proc, buffer); }   // прогрев кольца
+        for (int b = 0; b < 4; ++b)                                    // прогрев кольца
+            { nextSine(); runBlock (proc, buffer, b == 0 ? noteOnAt (0) : juce::MidiBuffer {}); }
 
         lastSample = buffer.getSample (0, blockSize - 1);
         maxStep = 0.0f;
@@ -272,7 +299,8 @@ int main()
         prepare();
 
         phase = 0;
-        for (int b = 0; b < 4; ++b) { nextSine(); runBlock (proc, buffer); }
+        for (int b = 0; b < 4; ++b)
+            { nextSine(); runBlock (proc, buffer, b == 0 ? noteOnAt (0) : juce::MidiBuffer {}); }
 
         lastSample = buffer.getSample (0, blockSize - 1);
         maxStep = 0.0f;
@@ -317,6 +345,264 @@ int main()
         setParam (proc, "delayTime", 2000.0f);
         setParam (proc, "feedback", 95.0f);   // 269 с честных -> потолок
         CHECK (proc.getTailLengthSeconds() == 20.0);
+    }
+
+    // --- Sample-accurate MIDI и голоса (#12, #13) ------------------------------
+    {
+        constexpr double sr = 48000.0;
+        constexpr int delaySamples = 480;   // 10 мс на 48 кГц, ровно на сетке параметра
+
+        // Общая настройка: слышны только голоса (mix 100 %), огибающая короткая.
+        // Параметры выставляются до prepareToPlay — тогда сглаживание стоит на цели
+        // с первого сэмпла и не мешает сравнивать блоки разного размера.
+        const auto setup = [] (MidiDelayProcessor& proc, int blockSize,
+                               float attackMs = 1.0f, float releaseMs = 300.0f)
+        {
+            setParam (proc, "delayTime", 10.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", attackMs);
+            setParam (proc, "release", releaseMs);
+            setParam (proc, "voices", 8.0f);
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+        };
+
+        // 1. Голос стартует ровно на сэмпле события. Вход — постоянная единица, поэтому
+        //    на выходе видно ровно огибающую: до события она обязана быть нулём, а на
+        //    самом событии — уже нет. Точность проверки — один сэмпл.
+        {
+            MidiDelayProcessor proc;
+            constexpr int blockSize = 512;
+            juce::AudioBuffer<float> buffer (2, blockSize);
+
+            setup (proc, blockSize);
+            fillDC (buffer);
+            runBlock (proc, buffer);
+
+            // Без нот хвоста нет вообще: wet теперь это сумма голосов, а не отвод кольца.
+            for (int i = 0; i < blockSize; ++i)
+                CHECK (buffer.getSample (0, i) == 0.0f);
+
+            for (const int onset : { 100, 300 })
+            {
+                setup (proc, blockSize);            // сброс кольца и голосов
+                fillDC (buffer); runBlock (proc, buffer);                    // прогрев кольца
+                fillDC (buffer); runBlock (proc, buffer, noteOnAt (onset));
+
+                for (int i = 0; i < onset; ++i)
+                    CHECK (buffer.getSample (0, i) == 0.0f);
+
+                CHECK (buffer.getSample (0, onset) > 0.0f);
+            }
+        }
+
+        // 2. Главный тест сессии: одна и та же партитура, нарезанная блоками 64, 128,
+        //    512 и 2048, обязана дать бит-в-бит один и тот же выход. Сравнение точное,
+        //    а не с порогом: всё, что едет во времени (сглаживание, огибающие, кольцо),
+        //    считается по сэмплам, а delay time стоит ровно на 480 — дробной позиции
+        //    чтения, которая округлялась бы по-разному, здесь взяться неоткуда.
+        {
+            constexpr int total = 4096;   // делится на все четыре размера блока
+            juce::AudioBuffer<float> source (2, total);
+
+            for (int i = 0; i < total; ++i)
+            {
+                const float s = 0.4f * std::sin (juce::MathConstants<float>::twoPi * 220.0f * (float) i / (float) sr)
+                              + 0.1f * std::sin (juce::MathConstants<float>::twoPi * 3100.0f * (float) i / (float) sr);
+                source.setSample (0, i, s);
+                source.setSample (1, i, s * 0.5f);   // каналы разные: моно-сумма голоса тоже под проверкой
+            }
+
+            struct Event { int sample; juce::MidiMessage message; };
+            const std::vector<Event> score
+            {
+                { 100,  juce::MidiMessage::noteOn (1, 60, 1.0f) },
+                { 777,  juce::MidiMessage::noteOn (1, 64, 0.6f) },
+                { 1500, juce::MidiMessage::controllerEvent (1, 64, 127) },   // педаль вниз
+                { 1501, juce::MidiMessage::pitchWheel (1, 12000) },          // незнакомое — мимо
+                { 2000, juce::MidiMessage::noteOff (1, 60) },                // держится педалью
+                { 2500, juce::MidiMessage::controllerEvent (1, 64, 0) },     // педаль вверх
+                { 3000, juce::MidiMessage::noteOn (1, 67, 0.9f) },
+                { 3333, juce::MidiMessage::noteOn (1, 72, 0.0f) },           // velocity 0 = note off
+                { 3500, juce::MidiMessage::allNotesOff (1) },
+            };
+
+            juce::AudioBuffer<float> reference (2, total);
+
+            for (const int blockSize : { 64, 128, 512, 2048 })
+            {
+                MidiDelayProcessor proc;
+                setup (proc, blockSize);
+
+                // mix и gain выставляются после prepareToPlay и едут к цели первые
+                // 50 мс прогона: под сравнение попадает и сглаживание, а не только
+                // статика. Сломать их сегментацией нельзя по построению — они считаются
+                // одним проходом на весь блок, вне сегментов; проверено регрессом.
+                setParam (proc, "mix", 80.0f);
+                setParam (proc, "outputGain", 6.0f);
+
+                juce::AudioBuffer<float> out (2, total);
+                juce::AudioBuffer<float> block (2, blockSize);
+
+                for (int start = 0; start < total; start += blockSize)
+                {
+                    for (int ch = 0; ch < 2; ++ch)
+                        block.copyFrom (ch, 0, source, ch, start, blockSize);
+
+                    juce::MidiBuffer midi;
+                    for (const auto& e : score)
+                        if (e.sample >= start && e.sample < start + blockSize)
+                            midi.addEvent (e.message, e.sample - start);
+
+                    runBlock (proc, block, midi);
+
+                    for (int ch = 0; ch < 2; ++ch)
+                        out.copyFrom (ch, start, block, ch, 0, blockSize);
+                }
+
+                if (blockSize == 64)
+                {
+                    reference.makeCopyOf (out);
+
+                    // Партитура обязана быть слышна, иначе сравнивались бы четыре тишины.
+                    CHECK (reference.getMagnitude (0, total) > 0.1f);
+                }
+                else
+                {
+                    for (int ch = 0; ch < 2; ++ch)
+                        for (int i = 0; i < total; ++i)
+                            CHECK (out.getSample (ch, i) == reference.getSample (ch, i));
+                }
+            }
+
+            CHECK (allocations.load() == 0);
+        }
+
+        // 3. Аккорд, кража и all-notes-off. Вход — постоянная единица, поэтому каждый
+        //    живой голос добавляет к выходу ровно свою огибающую, и число голосов
+        //    читается прямо с выхода. Атака 10 мс, чтобы шаг одновременных атак
+        //    оставался мелким и порог на щелчки мерил кражу, а не игру аккордом.
+        {
+            MidiDelayProcessor proc;
+            constexpr int blockSize = 512;
+            setup (proc, blockSize, 10.0f, 300.0f);
+
+            juce::AudioBuffer<float> buffer (2, blockSize);
+            float lastSample = 0.0f;
+            float maxStep = 0.0f;
+
+            const auto dcBlock = [&] (const juce::MidiBuffer& midi = {}, bool measure = false)
+            {
+                fillDC (buffer);
+                runBlock (proc, buffer, midi);
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float value = buffer.getSample (0, i);
+                    if (measure)
+                        maxStep = juce::jmax (maxStep, std::abs (value - lastSample));
+                    lastSample = value;
+                }
+            };
+
+            dcBlock();   // прогрев кольца
+
+            juce::MidiBuffer chord;
+            for (int n = 0; n < 4; ++n)
+                chord.addEvent (juce::MidiMessage::noteOn (1, 60 + n * 4, 1.0f), n * 10);
+
+            dcBlock (chord);
+            dcBlock();
+            CHECK (std::abs (buffer.getSample (0, blockSize - 1) - 4.0f) < 1.0e-3f);
+
+            // Ещё пять нот: девятая обязана украсть голос, а не упасть и не потеряться.
+            juce::MidiBuffer more;
+            for (int n = 0; n < 5; ++n)
+                more.addEvent (juce::MidiMessage::noteOn (1, 40 + n, 1.0f), n * 10);
+
+            maxStep = 0.0f;
+            dcBlock (more, true);
+            dcBlock ({}, true);
+
+            // Пул полон: восемь голосов, ни больше (девятая нота села в чужой), ни меньше.
+            CHECK (std::abs (buffer.getSample (0, blockSize - 1) - 8.0f) < 1.0e-3f);
+            // 5 одновременных атак по 10 мс дают 0,010 на сэмпл, fade-out кражи 5 мс —
+            // ещё 0,004. Порог 0,05 оставляет запас втрое и ловит любой честный разрыв.
+            CHECK (maxStep < 0.05f);
+
+            // All-notes-off гасит через release, а не щелчком.
+            juce::MidiBuffer panic;
+            panic.addEvent (juce::MidiMessage::allNotesOff (1), 0);
+
+            maxStep = 0.0f;
+            dcBlock (panic, true);
+            for (int b = 0; b < 30; ++b) dcBlock ({}, true);   // release 300 мс = 14400 сэмплов
+
+            CHECK (maxStep < 0.05f);
+            CHECK (buffer.getSample (0, blockSize - 1) == 0.0f);   // хвост доехал ровно до нуля
+            CHECK (allocations.load() == 0);
+        }
+
+        // 4. Педаль сустейна: note off при нажатой педали ничего не гасит, гасит подъём.
+        {
+            MidiDelayProcessor proc;
+            constexpr int blockSize = 512;
+            setup (proc, blockSize, 1.0f, 5.0f);   // release 5 мс — укладывается в один блок
+
+            juce::AudioBuffer<float> buffer (2, blockSize);
+            const auto dcBlock = [&] (const juce::MidiBuffer& midi = {})
+            {
+                fillDC (buffer);
+                runBlock (proc, buffer, midi);
+            };
+
+            dcBlock();
+
+            juce::MidiBuffer pedalAndNote;
+            pedalAndNote.addEvent (juce::MidiMessage::controllerEvent (1, 64, 127), 0);
+            pedalAndNote.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), 10);
+            dcBlock (pedalAndNote);
+
+            juce::MidiBuffer release;
+            release.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            dcBlock (release);
+            CHECK (std::abs (buffer.getSample (0, blockSize - 1) - 1.0f) < 1.0e-3f);
+
+            juce::MidiBuffer pedalUp;
+            pedalUp.addEvent (juce::MidiMessage::controllerEvent (1, 64, 0), 0);
+            dcBlock (pedalUp);
+            CHECK (buffer.getSample (0, blockSize - 1) == 0.0f);
+        }
+
+        // 5. Незнакомые сообщения не роняют плагин и не будят голоса.
+        {
+            MidiDelayProcessor proc;
+            constexpr int blockSize = 512;
+            setup (proc, blockSize);
+
+            juce::AudioBuffer<float> buffer (2, blockSize);
+            juce::MidiBuffer junk;
+            junk.addEvent (juce::MidiMessage::pitchWheel (1, 0), 0);
+            junk.addEvent (juce::MidiMessage::channelPressureChange (1, 90), 5);
+            junk.addEvent (juce::MidiMessage::aftertouchChange (1, 60, 40), 7);
+            junk.addEvent (juce::MidiMessage::programChange (1, 12), 9);
+            junk.addEvent (juce::MidiMessage::controllerEvent (1, 74, 55), 11);
+            junk.addEvent (juce::MidiMessage::midiStart(), 13);
+            const juce::uint8 sysexData[] = { 0x11, 0x22, 0x33 };
+            junk.addEvent (juce::MidiMessage::createSysExMessage (sysexData, 3), 300);
+            // Событие за пределами блока: хост так делать не должен, но кламп это ловит.
+            junk.addEvent (juce::MidiMessage::noteOn (1, 60, 1.0f), blockSize + 100);
+
+            fillDC (buffer);
+            runBlock (proc, buffer, junk);
+            CHECK (allocations.load() == 0);
+
+            for (int i = 0; i < blockSize; ++i)
+                CHECK (std::isfinite (buffer.getSample (0, i)));
+        }
     }
 
     // --- Состояние -------------------------------------------------------------

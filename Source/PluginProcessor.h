@@ -2,9 +2,11 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "DSP/DelayBuffer.h"
+#include "DSP/VoiceManager.h"
 
-/** MIDI-Driven Pitch Delay. На вехе M1 это ещё обычный однотапный дилей:
-    хвост повторяет вход без транспонирования. Питч и голоса — M2. */
+/** MIDI-Driven Pitch Delay. Хвост существует только пока звучит MIDI-нота: wet
+    собирается из голосов, а не из постоянного отвода. На вехе M2 голоса сидят
+    на заглушке UnityShifter и звучат в исходной высоте — транспонирование это #14/#15. */
 class MidiDelayProcessor final : public juce::AudioProcessor
 {
 public:
@@ -52,6 +54,15 @@ public:
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
+    /** Кусок блока между двумя MIDI-событиями: dry в кольцо, feedback, потом голоса.
+        Голоса рендерятся после записи кольца — иначе им нечего было бы читать
+        на коротких delay time. */
+    void renderSegment (const juce::AudioBuffer<float>& buffer, int startSample, int numSamples,
+                        int numChannels, float feedback);
+
+    /** Ноты, педаль и all-notes-off. Всё незнакомое молча мимо. */
+    void handleMidiMessage (const juce::MidiMessage& message);
+
     /** Запас кольца: максимальный delay time MVP (2 с) плюс место под латентность
         питчера и под длину хвоста. 4 с при 96 кГц — ~4 МБ на два канала. */
     static constexpr double maxDelaySeconds = 4.0;
@@ -71,10 +82,15 @@ private:
     static constexpr double maxTailSeconds = 20.0;
 
     DelayBuffer delayBuffer;
+    VoiceManager voiceManager;
 
     /** То, что уходит в кольцо: dry + feedback. Отдельный буфер нужен потому, что
         DelayBuffer::write принимает планарные указатели, а не отдельный сэмпл. */
     juce::AudioBuffer<float> lineInput;
+
+    /** Сумма голосов за блок. Отдельный буфер нужен потому, что микс, гейн и обход
+        считаются по сэмплу и по всему блоку сразу, а голоса приходят сегментами. */
+    juce::AudioBuffer<float> wetBuffer;
 
     /** bypassSmoothed — доля обработанного сигнала: 1 — плагин работает, 0 — обход. */
     juce::SmoothedValue<float> delaySamplesSmoothed, mixSmoothed, gainSmoothed, bypassSmoothed;
@@ -87,6 +103,9 @@ private:
     std::atomic<float>* pMix        = nullptr;
     std::atomic<float>* pOutputGain = nullptr;
     std::atomic<float>* pBypass     = nullptr;
+    std::atomic<float>* pAttack     = nullptr;
+    std::atomic<float>* pRelease    = nullptr;
+    std::atomic<float>* pVoices     = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 
