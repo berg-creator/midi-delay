@@ -2,6 +2,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include "DSP/DelayBuffer.h"
+#include "DSP/Diffuser.h"
 #include "DSP/VoiceManager.h"
 
 /** MIDI-Driven Pitch Delay. Хвост существует только пока звучит MIDI-нота: wet
@@ -129,12 +130,32 @@ private:
         а мгновенный переход — это щелчок. */
     static constexpr double bypassSeconds = 0.02;
 
+    /** Потолок коэффициента алл-пассов. Выше 0,7 звено начинает звенеть металлом,
+        а не размывать. Ручка Diffusion едет от нуля до этого числа. */
+    static constexpr float diffusionMaxGain = 0.7f;
+
+    /** Крутизна ввода диффузора в петлю. Цепочка крутится всегда — так она остаётся
+        прогретой и включение не даёт щелчка, — а подмешивается вот этим множителем:
+        на нуле ручки в петле ровно недиффузированный сигнал, бит-в-бит. Выход на
+        полную к 25 % ручки: в промежутке две ветви петли имеют разную длину,
+        и держать эту зону широкой значило бы держать гребёнку. */
+    static constexpr float diffusionBlendSlope = 4.0f;
+
+    /** Края диапазонов фильтров петли — положение «выключено». Однополюсник,
+        поставленный на 20 кГц, всё ещё срезает импульс почти на децибел, поэтому
+        на краю фильтр обходится целиком, а не ставится «почти прозрачным». */
+    static constexpr float filterLoOff = 20.0f;
+    static constexpr float filterHiOff = 20000.0f;
+
     /** Потолок оценки хвоста. При feedback 95 % и delay 2 с честные 135 кругов
         дали бы четыре с половиной минуты досчёта после каждой дорожки. */
     static constexpr double maxTailSeconds = 20.0;
 
     DelayBuffer delayBuffer;
     VoiceManager voiceManager;
+
+    /** Диффузия хвоста (#45): алл-пассы на возврате обратной связи. */
+    Diffuser diffuser;
 
     /** Линия сухого сигнала: держит его ровно столько же, сколько опаздывает
         обработанный. Без неё в Follow сухой шёл бы впереди хвоста на всю латентность
@@ -157,6 +178,16 @@ private:
 
     /** bypassSmoothed — доля обработанного сигнала: 1 — плагин работает, 0 — обход. */
     juce::SmoothedValue<float> delaySamplesSmoothed, mixSmoothed, gainSmoothed, bypassSmoothed;
+
+    /** Диффузия и коэффициенты фильтров петли. Коэффициент сглаживается сам, а не
+        пересчитывается по сэмплу: exp() на каждый сэмпл — это дорого, а зиппер
+        при крутке среза слышен одинаково что от частоты, что от коэффициента. */
+    juce::SmoothedValue<float> diffusionSmoothed, loCoeffSmoothed, hiCoeffSmoothed;
+
+    /** Состояния однополюсников петли, по одному на канал (#22). Шины не бывают
+        шире стерео — см. isBusesLayoutSupported. */
+    float loState[2] {}, hiState[2] {};
+
     double currentSampleRate = 44100.0;
 
     // Кэш указателей на то, что реально читает processBlock. Остальные параметры
@@ -175,6 +206,9 @@ private:
     std::atomic<float>* pTimeMode   = nullptr;
     std::atomic<float>* pMidiOffset = nullptr;
     std::atomic<float>* pWidth      = nullptr;
+    std::atomic<float>* pDiffusion  = nullptr;
+    std::atomic<float>* pFilterLo   = nullptr;
+    std::atomic<float>* pFilterHi   = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 
@@ -196,6 +230,10 @@ private:
     // атомарность тут не нужна, а таскать их пятью аргументами — шум.
     int blockAlignment = 0;
     bool blockFollow = false;
+    bool blockUseLo = false, blockUseHi = false;
+
+    /** Коэффициент однополюсника по частоте среза: a = 1 - exp(-2*pi*f/fs). */
+    float onePoleCoeff (float frequencyHz) const;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayProcessor)
 };

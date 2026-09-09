@@ -21,6 +21,9 @@ MidiDelayProcessor::MidiDelayProcessor()
     pTimeMode   = apvts.getRawParameterValue ("timeMode");
     pMidiOffset = apvts.getRawParameterValue ("midiOffset");
     pWidth      = apvts.getRawParameterValue ("width");
+    pDiffusion  = apvts.getRawParameterValue ("diffusion");
+    pFilterLo   = apvts.getRawParameterValue ("filterLo");
+    pFilterHi   = apvts.getRawParameterValue ("filterHi");
     bypassParam = apvts.getParameter ("bypass");
 }
 
@@ -72,6 +75,14 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         ParameterID { "outputGain", 1 }, "Output Gain",
         Range { -24.0f, 12.0f, 0.1f }, 0.0f,
         AudioParameterFloatAttributes().withLabel ("dB")));
+
+    // Плотность диффузии хвоста (#45): 0 — цепочка алл-пассов обойдена целиком
+    // и выход бит-в-бит совпадает с простым дилеем, дальше растёт коэффициент g.
+    // Потолок 0,7 — выше алл-пасс Шрёдера начинает звенеть металлом.
+    params.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "diffusion", 1 }, "Diffusion",
+        Range { 0.0f, 100.0f, 0.1f }, 35.0f,
+        AudioParameterFloatAttributes().withLabel ("%")));
 
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "filterLo", 1 }, "Low Cut",
@@ -157,6 +168,12 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     midiQueue.ensureSize (1024);
     midiCarry.ensureSize (1024);
 
+    // Диффузор и фильтры петли (#45, #22). После prepare оба нулевые: смена sample rate
+    // на лету обрывает хвост тишиной, а не мусором, как и само кольцо.
+    diffuser.prepare (currentSampleRate, numChannels);
+    diffuser.clear();
+    loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
+
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
     voiceManager.setEngine (pQuality->load() > 0.5f ? PitchEngine::hq : PitchEngine::fast);
@@ -171,6 +188,9 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     mixSmoothed.reset (currentSampleRate, smoothingSeconds);
     gainSmoothed.reset (currentSampleRate, smoothingSeconds);
     bypassSmoothed.reset (currentSampleRate, bypassSeconds);
+    diffusionSmoothed.reset (currentSampleRate, smoothingSeconds);
+    loCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
+    hiCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
 
     // Первый блок после prepare не должен въезжать в значения рампой.
     delaySamplesSmoothed.setCurrentAndTargetValue (
@@ -180,6 +200,9 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     gainSmoothed.setCurrentAndTargetValue (
         juce::Decibels::decibelsToGain (pOutputGain->load()));
     bypassSmoothed.setCurrentAndTargetValue (pBypass->load() < 0.5f ? 1.0f : 0.0f);
+    diffusionSmoothed.setCurrentAndTargetValue (pDiffusion->load() * 0.01f);
+    loCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterLo->load()));
+    hiCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterHi->load()));
 
     // В Free с неотрицательным офсетом здесь ноль, и инвариант ANALYSIS §5 цел:
     // латентность питчера вычитается из позиции чтения, а не выставляется хосту.
@@ -194,12 +217,24 @@ void MidiDelayProcessor::releaseResources()
 {
     delayBuffer.clear();
     dryDelay.clear();
+    diffuser.clear();
+    loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
     midiQueue.clear();
     midiCarry.clear();
     voiceManager.reset();
 }
 
 //==============================================================================
+float MidiDelayProcessor::onePoleCoeff (float frequencyHz) const
+{
+    // a = 1 - exp(-2*pi*f/fs). Кламп сверху нужен на низких sample rate: срез,
+    // заехавший за Найквиста, дал бы a > 1 и раскачку однополюсника.
+    const auto a = 1.0 - std::exp (-juce::MathConstants<double>::twoPi
+                                   * juce::jmax (0.0f, frequencyHz) / currentSampleRate);
+
+    return static_cast<float> (juce::jlimit (0.0, 1.0, a));
+}
+
 double MidiDelayProcessor::engineLatencyMs() const
 {
     return (pQuality->load (std::memory_order_relaxed) > 0.5f ? minDelayHqMs : minDelayFastMs)
@@ -274,10 +309,13 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         for (int ch = numInputs; ch < buffer.getNumChannels(); ++ch)
             buffer.copyFrom (ch, 0, buffer, 0, 0, numSamples);
 
-    const int numChannels = juce::jmin (buffer.getNumChannels(),
+    // Двойка тут не косметика: состояния фильтров петли — массивы на два канала,
+    // и шире стерео раскладка не бывает (isBusesLayoutSupported). Кламп стоит на
+    // границе доверия к хосту, а не в горячем цикле.
+    const int numChannels = juce::jmin (2, buffer.getNumChannels(),
                                         delayBuffer.getNumChannels(),
-                                        lineInput.getNumChannels(),
-                                        wetBuffer.getNumChannels());
+                                        juce::jmin (lineInput.getNumChannels(),
+                                                    wetBuffer.getNumChannels()));
 
     if (numChannels <= 0 || numSamples > lineInput.getNumSamples())
         return;   // Блок больше обещанного в prepare — писать некуда, лучше пропустить.
@@ -332,6 +370,18 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     gainSmoothed.setTargetValue (juce::Decibels::decibelsToGain (
         pOutputGain->load (std::memory_order_relaxed)));
     bypassSmoothed.setTargetValue (pBypass->load (std::memory_order_relaxed) < 0.5f ? 1.0f : 0.0f);
+
+    // Окраска петли (#45, #22). Фильтры на краях диапазона обходятся целиком:
+    // «выключено» обязано значить выключено, а не «однополюсник на 20 кГц».
+    const float loHz = pFilterLo->load (std::memory_order_relaxed);
+    const float hiHz = pFilterHi->load (std::memory_order_relaxed);
+
+    blockUseLo = loHz > filterLoOff;
+    blockUseHi = hiHz < filterHiOff;
+
+    diffusionSmoothed.setTargetValue (pDiffusion->load (std::memory_order_relaxed) * 0.01f);
+    loCoeffSmoothed.setTargetValue (onePoleCoeff (loHz));
+    hiCoeffSmoothed.setTargetValue (onePoleCoeff (hiHz));
 
     voiceManager.setEnvelope (pAttack->load (std::memory_order_relaxed),
                               pRelease->load (std::memory_order_relaxed));
@@ -426,6 +476,17 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
     {
         const float delaySamples = delaySamplesSmoothed.getNextValue();
 
+        // Диффузия (#45). Цепочка алл-пассов крутится всегда, даже на нуле ручки:
+        // так она остаётся прогретой, и ввод её в петлю не даёт ни щелчка, ни всплеска
+        // застоявшегося звука. Подмешивается она множителем blend, и на нуле ручки
+        // в петлю уходит ровно недиффузированный сигнал — бит-в-бит.
+        const float amount = diffusionSmoothed.getNextValue();
+        const float diffusionGain = amount * diffusionMaxGain;
+        const float blend = juce::jmin (1.0f, amount * diffusionBlendSlope);
+
+        const float loCoeff = loCoeffSmoothed.getNextValue();
+        const float hiCoeff = hiCoeffSmoothed.getNextValue();
+
         for (int ch = 0; ch < numChannels; ++ch)
         {
             const float dry = buffer.getSample (ch, i);
@@ -433,9 +494,40 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             // ещё указывает на слот сэмпла i, и read(d) отдаёт ровно x[i - d].
             const float delayed = delayBuffer.read (ch, delaySamples);
 
+            // Вторая точка чтения — та же петля, укороченная на длину цепочки:
+            // алл-пасс при любом g несёт свои M сэмплов задержки, и без этого вычета
+            // интервал повторов уехал бы примерно на 60 мс. Кламп снизу упирается
+            // в предел DelayBuffer и работает только там, где петля короче цепочки, —
+            // то есть в Follow на совсем малом времени. ponytail: там интервал повторов
+            // упирается в длину цепочки; отдельные длины под короткую петлю — если
+            // такой режим кому-то понадобится.
+            const float shifted = delayBuffer.read (ch, juce::jmax (2.0f,
+                delaySamples - static_cast<float> (diffuser.getDelaySamples (ch))));
+
+            const float diffused = diffuser.process (ch, shifted, diffusionGain);
+
             // Feedback снимается ДО питч-стадии: голоса читают уже записанное кольцо,
             // и транспонирование в петлю не попадает. Инвариант из CLAUDE.md.
-            lineInput.setSample (ch, i, dry + delayed * feedback);
+            float lineIn = dry + (delayed + blend * (diffused - delayed)) * feedback;
+
+            // Фильтры стоят на входе кольца, а не на выходе wet (#22). На выходе это
+            // был бы просто эквалайзер; здесь первый хвост окрашен один раз, второй
+            // два, и хвост темнеет с каждым кругом — то, ради чего фильтры в дилее
+            // и нужны. Однополюсные и без резонанса: резонансный биквад в петле
+            // при feedback 95 % — классический способ получить свист.
+            if (blockUseHi)
+            {
+                hiState[ch] += hiCoeff * (lineIn - hiState[ch]);
+                lineIn = hiState[ch];
+            }
+
+            if (blockUseLo)
+            {
+                loState[ch] += loCoeff * (lineIn - loState[ch]);
+                lineIn -= loState[ch];
+            }
+
+            lineInput.setSample (ch, i, lineIn);
         }
 
         // По сэмплу, а не блоком: при коротком delay time голова записи обгонит

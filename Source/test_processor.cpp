@@ -57,6 +57,17 @@ namespace
         CHECK (std::abs (proc.apvts.getRawParameterValue (id)->load() - value) < 0.01f);
     }
 
+    /** Выключает окраску петли: фильтры на краях диапазона, диффузия в нуле. Почти
+        все замеры ниже меряют тайминг и уровни, и окраска в них только мешает; те
+        тесты, что меряют её саму, ставят значения руками. Заодно замеры перестают
+        зависеть от того, какие значения выбраны значениями по умолчанию. */
+    void plainLoop (MidiDelayProcessor& proc)
+    {
+        setParam (proc, "diffusion", 0.0f);
+        setParam (proc, "filterLo", 20.0f);
+        setParam (proc, "filterHi", 20000.0f);
+    }
+
     /** Прогоняет блок с включённым счётчиком аллокаций. Копия MidiBuffer делается
         до включения счётчика: считаем только то, что делает сам processBlock. */
     void runBlock (MidiDelayProcessor& proc, juce::AudioBuffer<float>& buffer,
@@ -115,23 +126,77 @@ namespace
     }
 }
 
-/** Офлайн-рендер для проверки на слух: пила 220 Гц на вход, короткая мелодия в MIDI,
-    результат в WAV. Не тест — тесты не умеют сказать «звучит убедительно». Это #19.
-    Движок выбирается третьим аргументом, чтобы можно было сравнить их на одном
-    и том же материале; по умолчанию — HQ, то есть то, что услышит пользователь.
+/** Офлайн-рендер для проверки на слух. Не тест — тесты не умеют сказать «звучит
+    убедительно». Это #19. Материалом может быть синтетическая пила 220 Гц (по умолчанию)
+    или WAV с диска: живой голос показывает то, о чём пила молчит, — атаку слога
+    и согласные, то есть ровно слабое место фазового вокодера.
     Рендер воспроизводим: зерно случайной фазы у HQ-движка фиксировано.
-    Запуск: ProcessorTest --render out.wav [fast|hq] */
-static int renderDemo (const juce::String& path, bool hq)
+    Mix 100 %: слушаем сам движок, а не то, как он прячется за сухим сигналом.
+    По умолчанию диффузия и фильтры петли выключены — рендер судит питчер, а не
+    обвязку. Пятый аргумент colour включает окраску петли (#45, #22) и обратную
+    связь: это A/B к тому же файлу без окраски, одной командой.
+    Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] */
+static int renderDemo (const juce::String& path, const juce::String& mode,
+                       const juce::String& inputPath, bool colour)
 {
-    constexpr double sr = 48000.0;
+    const bool hq     = mode != "fast";
+    const bool follow = mode == "follow";
+
     constexpr int blockSize = 512;
-    constexpr double seconds = 8.0;
-    const int total = static_cast<int> (sr * seconds);
+    constexpr double maxSeconds = 30.0;   // хватает на слух, а файл остаётся лёгким
+
+    // Материал. Файл читается как есть, без ресемплинга: плагин просто готовится
+    // на частоту файла. Моно раскладывается на оба канала — вход у нас обычно моно-вокал.
+    juce::AudioBuffer<float> input;
+    double sr = 48000.0;
+
+    if (inputPath.isNotEmpty())
+    {
+        juce::AudioFormatManager formats;
+        formats.registerBasicFormats();
+
+        juce::File source (inputPath);
+        std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (source));
+
+        if (reader == nullptr)
+        {
+            std::printf ("cannot read %s\n", source.getFullPathName().toRawUTF8());
+            return 1;
+        }
+
+        sr = reader->sampleRate;
+        const int frames = static_cast<int> (juce::jmin (reader->lengthInSamples,
+                                                         static_cast<juce::int64> (sr * maxSeconds)));
+        input.setSize (2, frames);
+        reader->read (&input, 0, frames, 0, true, true);
+
+        if (reader->numChannels < 2)
+            input.copyFrom (1, 0, input, 0, 0, frames);
+    }
+    else
+    {
+        // Пила 220 Гц: у неё много гармоник, и транспонирование на ней слышно сразу.
+        const int frames = static_cast<int> (sr * 8.0);
+        input.setSize (2, frames);
+        double phase = 0.0;
+
+        for (int i = 0; i < frames; ++i)
+        {
+            phase += 220.0 / sr;
+            if (phase >= 1.0) phase -= 1.0;
+
+            const auto value = static_cast<float> (0.25 * (2.0 * phase - 1.0));
+            input.setSample (0, i, value);
+            input.setSample (1, i, value);
+        }
+    }
+
+    const int total = input.getNumSamples();
 
     MidiDelayProcessor proc;
     setParam (proc, "delayTime", 400.0f);
     setParam (proc, "feedback", 0.0f);
-    setParam (proc, "mix", 60.0f);
+    setParam (proc, "mix", 100.0f);
     setParam (proc, "outputGain", 0.0f);
     setParam (proc, "bypass", 0.0f);
     setParam (proc, "attack", 10.0f);
@@ -139,43 +204,46 @@ static int renderDemo (const juce::String& path, bool hq)
     setParam (proc, "rootKey", 0.0f);       // C
     setParam (proc, "pitchRange", 12.0f);
     setParam (proc, "quality", hq ? 1.0f : 0.0f);
+    setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+    setParam (proc, "diffusion", colour ? 60.0f : 0.0f);
+    setParam (proc, "filterLo", colour ? 100.0f : 20.0f);
+    setParam (proc, "filterHi", colour ? 12000.0f : 20000.0f);
+
+    if (colour)
+        setParam (proc, "feedback", 45.0f);   // без повторов диффузию не услышать
 
     proc.setPlayConfigDetails (2, 2, sr, blockSize);
     proc.prepareToPlay (sr, blockSize);
 
-    // Пила 220 Гц: у неё много гармоник, и транспонирование на ней слышно сразу.
-    // Ноты — C5, E5, G5, C6 по номерам FL Studio, то есть MIDI 60, 64, 67, 72:
-    // унисон, большая терция, квинта, октава от Root Key.
+    // Мелодия крутится по кругу до конца материала: иначе на длинном файле хвост
+    // молчал бы там, где как раз и интересно слушать согласные. Номера — MIDI 60,
+    // 64, 67, 72, в терминах FL Studio C5, E5, G5, C6: унисон, терция, квинта, октава
+    // от Root Key. Унисон в списке не случайно — на нём слышно прозрачность движка.
     const int notes[] { 60, 64, 67, 72 };
-    const int noteLength = static_cast<int> (sr * 1.5);
+    const int noteLength = static_cast<int> (sr * 1.0);
+    const int gap = static_cast<int> (sr * 0.05);
+    const int firstNote = static_cast<int> (sr * 0.5);
 
     juce::AudioBuffer<float> out (2, total);
     juce::AudioBuffer<float> block (2, blockSize);
-    double phase = 0.0;
 
     for (int start = 0; start < total; start += blockSize)
     {
         const int n = juce::jmin (blockSize, total - start);
 
-        for (int i = 0; i < n; ++i)
-        {
-            phase += 220.0 / sr;
-            if (phase >= 1.0) phase -= 1.0;
-
-            const auto value = static_cast<float> (0.25 * (2.0 * phase - 1.0));
-            block.setSample (0, i, value);
-            block.setSample (1, i, value);
-        }
+        for (int ch = 0; ch < 2; ++ch)
+            block.copyFrom (ch, 0, input, ch, start, n);
 
         juce::MidiBuffer midi;
 
-        for (int k = 0; k < 4; ++k)
+        for (int k = 0; firstNote + k * noteLength < total; ++k)
         {
-            const int on  = static_cast<int> (sr * 0.5) + k * noteLength;
-            const int off = on + noteLength - static_cast<int> (sr * 0.1);
+            const int on  = firstNote + k * noteLength;
+            const int off = on + noteLength - gap;
+            const int note = notes[k % 4];
 
-            if (on  >= start && on  < start + n) midi.addEvent (juce::MidiMessage::noteOn  (1, notes[k], 0.9f), on  - start);
-            if (off >= start && off < start + n) midi.addEvent (juce::MidiMessage::noteOff (1, notes[k]), off - start);
+            if (on  >= start && on  < start + n) midi.addEvent (juce::MidiMessage::noteOn  (1, note, 0.9f), on  - start);
+            if (off >= start && off < start + n) midi.addEvent (juce::MidiMessage::noteOff (1, note), off - start);
         }
 
         juce::AudioBuffer<float> view (block.getArrayOfWritePointers(), 2, n);
@@ -201,8 +269,9 @@ static int renderDemo (const juce::String& path, bool hq)
     writer->writeFromAudioSampleBuffer (out, 0, total);
     writer.reset();
 
-    std::printf ("rendered %s (%.1f s, %s)\n", file.getFullPathName().toRawUTF8(),
-                 seconds, hq ? "hq" : "fast");
+    std::printf ("rendered %s (%.1f s, %s%s%s)\n", file.getFullPathName().toRawUTF8(),
+                 total / sr, hq ? "hq" : "fast", follow ? ", follow" : "",
+                 colour ? ", colour" : "");
     return 0;
 }
 
@@ -214,11 +283,14 @@ int main (int argc, char* argv[])
 
     if (argc >= 3 && juce::String (argv[1]) == "--render")
         return renderDemo (juce::String (argv[2]),
-                           argc < 4 || juce::String (argv[3]) != "fast");
+                           argc >= 4 ? juce::String (argv[3]) : juce::String ("hq"),
+                           argc >= 5 ? juce::String (argv[4]) : juce::String(),
+                           argc >= 6 && juce::String (argv[5]) == "colour");
 
     // --- Раскладки шин ---------------------------------------------------------
     {
         MidiDelayProcessor proc;
+        plainLoop (proc);
         using Set = juce::AudioChannelSet;
 
         const auto supported = [&proc] (const Set& in, const Set& out)
@@ -239,6 +311,7 @@ int main (int argc, char* argv[])
     // --- Смещение дилея и ноль аллокаций ---------------------------------------
     {
         MidiDelayProcessor proc;
+        plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 16384;
         // 200 мс — ровно 9600 сэмплов на 48 кГц и ровно на сетке параметра (шаг 0.01 мс).
@@ -325,6 +398,7 @@ int main (int argc, char* argv[])
     // --- Микс, гейн и обход без щелчков (#11) ----------------------------------
     {
         MidiDelayProcessor proc;
+        plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 16384;
         constexpr int delaySamples = 7776;   // 162 мс на 48 кГц, ровно на сетке параметра
@@ -544,6 +618,7 @@ int main (int argc, char* argv[])
         //    старте ноты заливает своё окно историей. Итого 9600 + 5762 сэмпла.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             constexpr int blockSize = 512;
             juce::AudioBuffer<float> buffer (2, blockSize);
 
@@ -612,6 +687,7 @@ int main (int argc, char* argv[])
             for (const int blockSize : { 64, 128, 512, 2048 })
             {
                 MidiDelayProcessor proc;
+                plainLoop (proc);
                 setup (proc, blockSize);
 
                 // mix и gain выставляются после prepareToPlay и едут к цели первые
@@ -673,6 +749,7 @@ int main (int argc, char* argv[])
         //    игнорирует), так что унисон здесь ничего не теряет.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize, 10.0f, 300.0f);
 
@@ -735,6 +812,7 @@ int main (int argc, char* argv[])
         // 4. Педаль сустейна: note off при нажатой педали ничего не гасит, гасит подъём.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize, 1.0f, 5.0f);   // release 5 мс — укладывается в один блок
 
@@ -766,6 +844,7 @@ int main (int argc, char* argv[])
         // 5. Незнакомые сообщения не роняют плагин и не будят голоса.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize);
 
@@ -812,6 +891,7 @@ int main (int argc, char* argv[])
                                         float rootKeyAfter, double expected)
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "delayTime", 200.0f);   // больше латентности обоих движков
             setParam (proc, "feedback", 0.0f);
             setParam (proc, "mix", 100.0f);        // на выходе только хвост, без dry
@@ -879,6 +959,7 @@ int main (int argc, char* argv[])
     // --- Состояние -------------------------------------------------------------
     {
         MidiDelayProcessor proc;
+        plainLoop (proc);
         setParam (proc, "delayTime", 250.0f);
         setParam (proc, "feedback", 40.0f);
 
@@ -932,6 +1013,7 @@ int main (int argc, char* argv[])
         const auto tailPeak = [] (float quality)
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "quality", quality);
             setParam (proc, "delayTime", 150.0f);
             setParam (proc, "mix", 100.0f);
@@ -973,6 +1055,7 @@ int main (int argc, char* argv[])
     // на старте ноты. Проверяется тем, что слышно, — непрерывностью сигнала.
     {
         MidiDelayProcessor proc;
+        plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 4096;
         constexpr float freq = 250.0f;
@@ -1055,6 +1138,7 @@ int main (int argc, char* argv[])
         const auto tailPeak = [] (bool hq, float delayMs, double* minDelayMs = nullptr)
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "quality", hq ? 1.0f : 0.0f);
             setParam (proc, "delayTime", delayMs);
             setParam (proc, "mix", 100.0f);
@@ -1125,6 +1209,7 @@ int main (int argc, char* argv[])
         // кольцо, крутящееся на заказанных 20 мс под хвостом на 120, село бы гребёнкой.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "quality", 0.0f);
             setParam (proc, "delayTime", 20.0f);     // втрое ниже предела Fast
             setParam (proc, "feedback", 50.0f);
@@ -1173,6 +1258,274 @@ int main (int argc, char* argv[])
         }
     }
 
+    // --- Диффузия и фильтры в петле (#45, #22) ---------------------------------
+    // Три вещи, которые ломаются молча. Диффузор при g = 0 не исчезает, а становится
+    // чистой задержкой на длину цепочки — и интервал повторов уезжает на 60 мс, не уронив
+    // ни одного другого теста (проверено: без вычитания длины цепочки центр тяжести
+    // второго повтора уходит на +3011 сэмплов). Фильтр, поставленный на выход, а не
+    // в петлю, звучит почти так же на одном круге и совсем не так на пятом. И оба
+    // вместе меняют усиление петли сильнее, чем каждый по отдельности.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 16384;
+        constexpr int blocks = 4;
+        constexpr float delayMs = 200.0f;   // выше предела Fast (120 мс)
+        const int delaySamples = juce::roundToInt (delayMs * 0.001 * sr);
+
+        // Импульсный отклик петли: импульс на входе, mix 100 %, нота 60 (ratio 1),
+        // нота держится весь прогон. В выходе — цепочка повторов и больше ничего.
+        const auto loopResponse = [] (float diffusion, float feedbackPercent,
+                                      float loHz, float hiHz, bool follow = false,
+                                      int* alignment = nullptr)
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", 0.0f);
+            setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "feedback", feedbackPercent);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "diffusion", diffusion);
+            setParam (proc, "filterLo", loHz);
+            setParam (proc, "filterHi", hiHz);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            if (alignment != nullptr)
+                *alignment = proc.getLatencySamples();
+
+            std::vector<float> out (static_cast<size_t> (blockSize) * blocks, 0.0f);
+            juce::AudioBuffer<float> block (2, blockSize);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                block.clear();
+
+                if (b == 0)
+                {
+                    block.setSample (0, 0, 1.0f);
+                    block.setSample (1, 0, 1.0f);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);   // диффузор и фильтры не аллоцируют
+
+                for (int i = 0; i < blockSize; ++i)
+                    out[static_cast<size_t> (b) * blockSize + i] = block.getSample (0, i);
+            }
+
+            return out;
+        };
+
+        // Центр тяжести энергии в окне. Диффузия размывает повтор, и один только пик
+        // про интервал больше ничего не говорит — а центр тяжести говорит.
+        const auto centroid = [] (const std::vector<float>& x, int from, int to)
+        {
+            double sum = 0.0, weighted = 0.0;
+
+            for (int i = juce::jmax (0, from); i < to && i < static_cast<int> (x.size()); ++i)
+            {
+                const double e = static_cast<double> (x[static_cast<size_t> (i)])
+                               * static_cast<double> (x[static_cast<size_t> (i)]);
+                sum += e;
+                weighted += e * i;
+            }
+
+            return sum > 0.0 ? weighted / sum : -1.0;
+        };
+
+        // Diffusion 0 — цепочка обойдена, и это проверяется буквально: во втором
+        // повторе ровно один ненулевой сэмпл ровно нужной величины, всё остальное
+        // окно — точные нули. Утечка диффузора на нуле ручки сюда бы и попала.
+        {
+            const auto r = loopResponse (0.0f, 50.0f, 20.0f, 20000.0f);
+
+            // Половина от импульса — это feedback 50 %. Точного 0,5f тут нет и без
+            // диффузора: столько оставляет кроссфейд голов varispeed (0,49999997).
+            CHECK (std::abs (r[static_cast<size_t> (2 * delaySamples)] - 0.5f) < 1.0e-6f);
+
+            for (int i = delaySamples + 64; i < 3 * delaySamples; ++i)
+                if (std::abs (i - 2 * delaySamples) > 2)
+                    CHECK (r[static_cast<size_t> (i)] == 0.0f);
+        }
+
+        // Интервал повторов не зависит от положения Diffusion — в обоих режимах.
+        // В Free повторы стоят на кратных delay time, в Follow — от выравнивания.
+        for (const bool follow : { false, true })
+        {
+            int alignment = 0;
+            loopResponse (0.0f, 50.0f, 20.0f, 20000.0f, follow, &alignment);
+
+            const int expected = (follow ? alignment : delaySamples) + delaySamples;
+
+            for (const float diffusion : { 0.0f, 25.0f, 60.0f, 100.0f })
+            {
+                const auto r = loopResponse (diffusion, 50.0f, 20.0f, 20000.0f, follow);
+                const double c = centroid (r, expected - delaySamples / 2,
+                                              expected + delaySamples / 2);
+
+                // Допуск 15 мс. Без вычитания длины цепочки промах был бы +63 мс.
+                CHECK (std::abs (c - expected) < 0.015 * sr);
+            }
+        }
+
+        // Фильтры именно в петле, а не на выходе. Проверяется тем, чем эти две схемы
+        // и различаются: сколько добавляет обратная связь. Синус 6 кГц, интервал
+        // повтора — целое число периодов, повторы складываются в фазе, и установившийся
+        // уровень равен A*|H| / (1 - fb*|H|). Фильтр на выходе дал бы одинаковый рост
+        // с фильтром и без него; фильтр в петле режет каждый круг заново.
+        {
+            constexpr double tone = 6000.0;   // 8 сэмплов на период, 1200 периодов в петле
+
+            const auto steadyLevel = [&] (float feedbackPercent, float hiHz)
+            {
+                MidiDelayProcessor proc;
+                setParam (proc, "quality", 0.0f);
+                setParam (proc, "delayTime", delayMs);
+                setParam (proc, "feedback", feedbackPercent);
+                setParam (proc, "mix", 100.0f);
+                setParam (proc, "outputGain", 0.0f);
+                setParam (proc, "bypass", 0.0f);
+                setParam (proc, "attack", 1.0f);
+                setParam (proc, "diffusion", 0.0f);
+                setParam (proc, "filterLo", 20.0f);
+                setParam (proc, "filterHi", hiHz);
+
+                proc.setPlayConfigDetails (2, 2, sr, blockSize);
+                proc.prepareToPlay (sr, blockSize);
+
+                juce::AudioBuffer<float> block (2, blockSize);
+
+                for (int b = 0; b < 12; ++b)   // 4 с: петля выходит на установившийся уровень
+                {
+                    for (int i = 0; i < blockSize; ++i)
+                    {
+                        const auto v = static_cast<float> (0.25 * std::sin (
+                            juce::MathConstants<double>::twoPi * tone * (b * blockSize + i) / sr));
+                        block.setSample (0, i, v);
+                        block.setSample (1, i, v);
+                    }
+
+                    runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                }
+
+                return amplitudeAt (block, blockSize / 2, blockSize / 2, tone, sr);
+            };
+
+            const double openGrowth   = steadyLevel (80.0f, 20000.0f) / steadyLevel (0.0f, 20000.0f);
+            const double filterGrowth = steadyLevel (80.0f, 2000.0f)  / steadyLevel (0.0f, 2000.0f);
+
+            CHECK (openGrowth > 4.5);      // без фильтра 1/(1-0,8) = 5
+            CHECK (filterGrowth < 2.0);    // с фильтром в петле 1/(1-0,8*0,32) = 1,35
+        }
+
+        // Значения по умолчанию (100 Гц / 12 кГц) слышно уже на первом хвосте:
+        // подклад отодвигается назад, а не ждёт третьего круга. Это критерий #22.
+        {
+            const auto firstRepeatTone = [&] (double frequency, float loHz, float hiHz)
+            {
+                MidiDelayProcessor proc;
+                setParam (proc, "quality", 0.0f);
+                setParam (proc, "delayTime", delayMs);
+                setParam (proc, "feedback", 0.0f);
+                setParam (proc, "mix", 100.0f);
+                setParam (proc, "outputGain", 0.0f);
+                setParam (proc, "bypass", 0.0f);
+                setParam (proc, "attack", 1.0f);
+                setParam (proc, "diffusion", 0.0f);
+                setParam (proc, "filterLo", loHz);
+                setParam (proc, "filterHi", hiHz);
+
+                proc.setPlayConfigDetails (2, 2, sr, blockSize);
+                proc.prepareToPlay (sr, blockSize);
+
+                juce::AudioBuffer<float> block (2, blockSize);
+
+                for (int b = 0; b < 4; ++b)
+                {
+                    for (int i = 0; i < blockSize; ++i)
+                    {
+                        const auto v = static_cast<float> (0.25 * std::sin (
+                            juce::MathConstants<double>::twoPi * frequency * (b * blockSize + i) / sr));
+                        block.setSample (0, i, v);
+                        block.setSample (1, i, v);
+                    }
+
+                    runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                }
+
+                return amplitudeAt (block, blockSize / 2, blockSize / 2, frequency, sr);
+            };
+
+            for (const double frequency : { 50.0, 16000.0 })
+            {
+                const double open = firstRepeatTone (frequency, 20.0f, 20000.0f);
+                const double shaped = firstRepeatTone (frequency, 100.0f, 12000.0f);
+
+                CHECK (shaped < open * 0.71);   // не меньше 3 dB уже на первом круге
+            }
+        }
+
+        // Диффузия и фильтры вместе при feedback 95 % не разгоняют петлю. Проверять
+        // надо именно вместе: по отдельности усиление меняется слабее.
+        {
+            MidiDelayProcessor proc;
+            setParam (proc, "quality", 0.0f);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "feedback", 95.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "diffusion", 100.0f);
+            setParam (proc, "filterLo", 100.0f);
+            setParam (proc, "filterHi", 12000.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            float peak = 0.0f, earlyTail = 0.0f, lateTail = 0.0f;
+
+            // 2 с сигнала, потом 6 с тишины. Установившийся уровень при feedback 95 %
+            // и единичном усилении петли — 0,25 / 0,05 = 5; выше него подниматься
+            // нечему, а после конца сигнала уровень обязан падать, а не расти.
+            for (int b = 0; b < 24; ++b)
+            {
+                const bool driven = b < 6;
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = driven ? static_cast<float> (0.25 * std::sin (
+                        juce::MathConstants<double>::twoPi * 1000.0 * (b * blockSize + i) / sr)) : 0.0f;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+
+                const float blockPeak = block.getMagnitude (0, 0, blockSize);
+
+                peak = juce::jmax (peak, blockPeak);
+
+                if (b == 7)  earlyTail = blockPeak;   // первый блок после конца сигнала
+                if (b == 23) lateTail = blockPeak;    // пять с половиной секунд спустя
+            }
+
+            // Потолок 5,5 — установившийся уровень при единичном усилении петли
+            // (0,25 / 0,05 = 5) с запасом. И хвост обязан падать, а не расти.
+            // Запас на затухание широкий намеренно: алл-пасс добавляет петле фазу,
+            // то есть на части частот удлиняет её круг, и хвост с диффузией живёт
+            // заметно дольше, чем даёт оценка feedback^n. Это не разгон, это
+            // и есть та «глубина», ради которой диффузия и ставится.
+            CHECK (peak < 5.5f);
+            CHECK (lateTail < earlyTail * 0.6f);
+        }
+    }
+
     // --- Режим Follow и MIDI Offset (#18, ADR 0006) -----------------------------
     // Три вещи, которые легко перепутать знаком и увидеть только на слух: хвост
     // в Follow обязан стоять на том же сэмпле, что сухой; положительный офсет
@@ -1193,6 +1546,7 @@ int main (int argc, char* argv[])
                                 int* latency = nullptr)
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
             setParam (proc, "quality", 1.0f);      // HQ: от него считается выравнивание
             setParam (proc, "delayTime", delayMs);
@@ -1288,6 +1642,7 @@ int main (int argc, char* argv[])
             const auto onset = [&] (float offsetMs)
             {
                 MidiDelayProcessor proc;
+                plainLoop (proc);
                 setParam (proc, "timeMode", 0.0f);
                 setParam (proc, "quality", 1.0f);
                 setParam (proc, "delayTime", 200.0f);
@@ -1351,6 +1706,7 @@ int main (int argc, char* argv[])
             CHECK (peakIndex (out) == 20000 + 960);
 
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setParam (proc, "quality", 1.0f);
             setParam (proc, "timeMode", 0.0f);
             setParam (proc, "midiOffset", 0.0f);
@@ -1397,6 +1753,7 @@ int main (int argc, char* argv[])
             const auto sustainLevel = [&setup] (int velocity)
             {
                 MidiDelayProcessor proc;
+                plainLoop (proc);
                 setup (proc, 1.0f, 300.0f);
 
                 juce::AudioBuffer<float> buffer (2, blockSize);
@@ -1426,6 +1783,7 @@ int main (int argc, char* argv[])
             const auto tailEnd = [&setup] (int holdBlocks)
             {
                 MidiDelayProcessor proc;
+                plainLoop (proc);
                 setup (proc, 1.0f, 50.0f);   // release 50 мс = 2400 сэмплов
 
                 juce::AudioBuffer<float> buffer (2, blockSize);
@@ -1464,6 +1822,7 @@ int main (int argc, char* argv[])
         //    Ни щелчка, ни залипшего голоса — ровно то, чего требует #16.
         {
             MidiDelayProcessor proc;
+            plainLoop (proc);
             setup (proc, 50.0f, 100.0f);   // атака 50 мс = 2400 сэмплов
 
             juce::AudioBuffer<float> buffer (2, blockSize);

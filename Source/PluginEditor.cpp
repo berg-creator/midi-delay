@@ -3,14 +3,18 @@
 namespace
 {
     /** Порядок органов в окне и он же порядок чтения слева направо. Список явный,
-        а не «все параметры подряд»: filterLo, filterHi и division заведены в APVTS,
-        но ни к чему не подключены (#22, #20), и показывать мёртвые ручки — врать.
-        Как только их подключат, они встают сюда одной строкой. */
+        а не «все параметры подряд»: division заведён в APVTS, но ни к чему не
+        подключён (#20), и показывать мёртвую ручку — врать. Как только его
+        подключат, он встанет сюда одной строкой.
+
+        Строки сгруппированы по смыслу: время, характер хвоста, выход, высота,
+        огибающая. Это ещё не интерфейс (#26, #27), но покрутить уже можно осмысленно. */
     const char* const layout[] {
-        "timeMode", "delayTime", "midiOffset", "feedback",
-        "mix",      "outputGain", "width",     "quality",
-        "rootKey",  "pitchRange", "voices",    "bypass",
-        "attack",   "release",
+        "timeMode",  "delayTime",  "midiOffset", "feedback",
+        "diffusion", "filterLo",   "filterHi",   "width",
+        "mix",       "outputGain", "quality",    "bypass",
+        "rootKey",   "pitchRange", "voices",     "attack",
+        "release",
     };
 
     constexpr int headerHeight = 114;
