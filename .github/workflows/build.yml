@@ -21,26 +21,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # На Windows Ninja сам по себе не найдёт cl.exe, а генератор Visual Studio
-          # подтягивает тулчейн сам. AU в список форматов не добавляем: JUCE отбрасывает
-          # его на не-Apple сама, в _juce_get_platform_plugin_kinds.
+          # На Windows генератор не задаём: Ninja сам не найдёт cl.exe, а называть версию
+          # Visual Studio явно нельзя — она меняется вместе с образом раннера (на «17 2022»
+          # прогон падал с «could not find any instance of Visual Studio»). Дефолтный
+          # генератор CMake находит ту студию, что реально стоит.
+          # AU в форматы добавлять не надо: JUCE отбрасывает его на не-Apple сама,
+          # в _juce_get_platform_plugin_kinds.
           - name: macOS
             os: macos-latest
-            generator: Ninja
+            cmake_args: -G Ninja
             pluginval: pluginval.app/Contents/MacOS/pluginval
           - name: Windows
             os: windows-latest
-            generator: Visual Studio 17 2022
+            cmake_args: ""
             pluginval: ./pluginval.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Настроить
         run: >
-          cmake -B build -G "${{ matrix.generator }}"
+          cmake -B build ${{ matrix.cmake_args }}
           -DCMAKE_BUILD_TYPE=Release
           -DMIDIDELAY_COPY_PLUGIN=OFF
 
@@ -74,13 +77,13 @@ jobs:
 
       - name: Лог pluginval
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pluginval-${{ matrix.name }}
           path: pluginval-log/
 
       - name: Артефакты плагина
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: MIDI-Delay-${{ matrix.name }}
           path: |
