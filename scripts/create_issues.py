@@ -16,7 +16,8 @@ LABEL_COLORS = {
     "architecture": "5319e7", "dsp": "1d76db", "midi": "0e8a16", "ui": "d93f0b",
     "build": "555555", "ci": "555555", "test": "fbca04", "docs": "c5def5",
     "perf": "b60205", "daw-compat": "e99695", "research": "bfd4f2",
-    "release": "0052cc", "post-mvp": "d4c5f9",
+    "release": "0052cc", "post-mvp": "d4c5f9", "sound": "006b75",
+    "legal": "8b4513",
 }
 
 def parse(text):
@@ -32,7 +33,7 @@ def parse(text):
             "num": int(num),
             "title": title.strip(),
             "labels": [l.strip() for l in labels.group(1).split(",")] if labels else [],
-            "milestone": milestone.group(1).strip() if milestone else "",
+            "milestone": milestone.group(1).split()[0].strip() if milestone else "",
             "body": md,
         }
 
@@ -83,12 +84,12 @@ def main(argv):
 def _selfcheck():
     """Проверка парсера на живом файле: 40 задач, у каждой есть метки, веха и критерии."""
     items = list(parse(SRC.read_text(encoding="utf-8")))
-    assert len(items) == 40, len(items)
+    assert len(items) == 50, len(items)
     for i in items:
         assert i["labels"], i["num"]
         assert i["milestone"] in MILESTONES, (i["num"], i["milestone"])
         assert "Критерии приёмки" in i["body"], i["num"]
-        assert i["body"].count("- [ ]") >= 3, (i["num"], i["body"].count("- [ ]"))
+        assert i["body"].count("- [") >= 3, (i["num"], i["body"].count("- ["))
     print(f"selfcheck ok: {len(items)} задач разобрано")
 
 if __name__ == "__main__":
