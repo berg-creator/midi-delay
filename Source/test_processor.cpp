@@ -198,12 +198,19 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         if (reader->numChannels < 2)
             raw.copyFrom (1, 0, raw, 0, 0, frames);
 
+        // Ручное начало, если названо: автопоиск ищет, где голоса больше всего, а это
+        // не то же самое, где он лучше всего записан. У живой записи начало бывает
+        // хуже середины, и слышит это только человек.
         // Откуда брать кусок. Обрезать тишину в начале мало: дикторская запись — это
         // сессия с дублями, и после первой фразы идёт пауза в семь секунд. Берётся
         // окно, в котором голос звучит дольше всего: тридцать секунд, наполовину
         // состоящие из комнаты, про согласные ничего не расскажут.
-        const int start = [&raw, frames, sr]
+        const int start = [&raw, frames, sr, &overrides]
         {
+            if (overrides.containsKey ("startS"))
+                return juce::jlimit (0, juce::jmax (0, frames - 1),
+                                     static_cast<int> (overrides["startS"].getDoubleValue() * sr));
+
             const int frame = juce::jmax (1, static_cast<int> (sr * 0.25));
             const int count = frames / frame;
             const int window = juce::jmin (count, static_cast<int> (maxSeconds / 0.25));
@@ -223,16 +230,23 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
             std::sort (sorted.begin(), sorted.end());
             const float threshold = sorted[static_cast<size_t> (count * 9 / 10)] * 0.25f;
 
-            int best = 0, bestVoiced = -1;
+            // Считается не только «сколько кадров звучат», но и насколько громко.
+            // Вырезка из старого трека — это куски разного качества и уровня, и окно,
+            // набранное тихими кадрами, формально плотное, а на слух гнилое.
+            // Вес — сумма уровней звучащих кадров: тихое окно проигрывает громкому
+            // при той же плотности, и это ровно то, что просил пользователь.
+            int best = 0;
+            double bestScore = -1.0;
 
             for (int i = 0; i + window <= count; ++i)
             {
-                int voiced = 0;
+                double score = 0.0;
 
                 for (int k = i; k < i + window; ++k)
-                    voiced += level[static_cast<size_t> (k)] > threshold ? 1 : 0;
+                    if (level[static_cast<size_t> (k)] > threshold)
+                        score += level[static_cast<size_t> (k)];
 
-                if (voiced > bestVoiced) { bestVoiced = voiced; best = i; }
+                if (score > bestScore) { bestScore = score; best = i; }
             }
 
             return best * frame;
@@ -301,8 +315,8 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     // что выключил режим без colour.
     for (const auto& id : overrides.getAllKeys())
     {
-        if (id == "noteMs")
-            continue;   // настройка рендера, а не параметр плагина
+        if (id == "noteMs" || id == "startS")
+            continue;   // настройки рендера, а не параметры плагина
 
         if (proc.apvts.getParameter (id) == nullptr)
         {
@@ -388,6 +402,12 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
             float env = 0.03f;
             lp = 0.0f;
 
+            // Ноты плака расходятся по панораме через одну, равномощно. Голос при этом
+            // остаётся моно по центру: стерео нужно фону, а не солисту.
+            const float angle = 0.25f * juce::MathConstants<float>::pi
+                              * (((k % 2) == 0 ? -0.6f : 0.6f) + 1.0f);
+            const float pan[2] { std::cos (angle) * 1.41421356f, std::sin (angle) * 1.41421356f };
+
             for (int i = 0; i < length; ++i)
             {
                 phase += frequency / sr;
@@ -397,7 +417,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
                 env *= decay;
 
                 for (int ch = 0; ch < 2; ++ch)
-                    out.addSample (ch, on + i, lp * env);
+                    out.addSample (ch, on + i, lp * env * pan[ch]);
             }
         }
 
@@ -2111,6 +2131,96 @@ int main (int argc, char* argv[])
             // откуда его берёт микс, и выравнивание Follow на приседание не влияет.
             CHECK (duckUnder / flatUnder > 0.05);
         }
+    }
+
+    // --- Ping-pong по нотам (#23) -----------------------------------------------
+    // Классический ping-pong — чередование повторов обратной связи — в этой архитектуре
+    // не слышен вовсе: наружу хвост выходит только через голоса, а голос читает
+    // моно-сумму кольца (ADR 0001) и усреднил бы чередование обратно в центр.
+    // Поэтому чередуются ноты. Проверяется буквально: две ноты подряд обязаны уйти
+    // в разные стороны, и на них же проверяется, что без ping-pong обе идут одинаково.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 8192;
+        constexpr int blocks = 8;
+
+        /** Две ноты через два блока. Возвращает баланс каналов на каждой: -1 это
+            целиком слева, +1 целиком справа. */
+        const auto balances = [&] (bool pingPong, double& first, double& second)
+        {
+            MidiDelayProcessor proc;
+            plainLoop (proc);
+            setParam (proc, "quality", 0.0f);
+            setParam (proc, "delayTime", 200.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "release", 50.0f);
+            setParam (proc, "width", 100.0f);
+            setParam (proc, "pingPong", pingPong ? 1.0f : 0.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            double energy[2][2] {};
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = static_cast<float> (0.25 * std::sin (
+                        juce::MathConstants<double>::twoPi * 500.0 * (b * blockSize + i) / sr));
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                // Нота в блоке 1, отпускается в блоке 3, вторая в блоке 4. Отпускать
+                // обязательно: без этого в блоке 4 звучат обе, их стороны складываются
+                // и баланс выходит ровно нулевым — проверка краснела бы на работающем
+                // ping-pong (проверено).
+                juce::MidiBuffer midi;
+
+                if (b == 1 || b == 4)
+                    midi = noteOnAt (0, 60);
+                else if (b == 3)
+                    midi.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+
+                runBlock (proc, block, midi);
+
+                const int note = b == 1 ? 0 : (b == 4 ? 1 : -1);
+
+                if (note >= 0)
+                    for (int ch = 0; ch < 2; ++ch)
+                        energy[note][ch] = block.getRMSLevel (ch, blockSize / 4, blockSize / 2);
+            }
+
+            const auto balance = [] (const double* e)
+            {
+                const double sum = e[0] + e[1];
+                return sum > 0.0 ? (e[1] - e[0]) / sum : 0.0;
+            };
+
+            first  = balance (energy[0]);
+            second = balance (energy[1]);
+        };
+
+        double first = 0.0, second = 0.0;
+
+        balances (true, first, second);
+        std::printf ("  ping-pong: первая нота %+.2f, вторая %+.2f (-1 слева, +1 справа)\n",
+                     first, second);
+
+        // Разные стороны и обе заметно от центра. Порог 0,2 — это примерно четверть
+        // панорамы: меньше было бы «чуть шире», а не чередованием.
+        CHECK (first < -0.2 && second > 0.2);
+
+        // Контроль: без ping-pong обе ноты идут одинаково. Без него проверка выше
+        // прошла бы и на плагине, который просто раскидывает голоса по слотам.
+        balances (false, first, second);
+        CHECK (std::abs (first - second) < 0.2);
     }
 
     // --- Режим Follow и MIDI Offset (#18, ADR 0006) -----------------------------

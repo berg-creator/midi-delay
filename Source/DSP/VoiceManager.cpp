@@ -30,6 +30,7 @@ void VoiceManager::reset()
     for (auto& v : voices)
         v.reset();
 
+    pingPongRight = false;
     nextAge = 0;
     sustainDown = false;
 }
@@ -61,6 +62,20 @@ void VoiceManager::setWidth (float widthPercent)
     // 0..200 % на 0..1: на 100 % крайние голоса стоят в половине панорамы, на 200 %
     // упираются в борта. Ширина больше 200 % смысла не имеет — дальше бортов некуда.
     spread = std::clamp (widthPercent, 0.0f, 200.0f) * 0.005f;
+}
+
+void VoiceManager::setPingPong (bool shouldPingPong)
+{
+    if (shouldPingPong == pingPong)
+        return;
+
+    pingPong = shouldPingPong;
+
+    // Сторона сбрасывается на выключении, а не на включении: тогда первая нота после
+    // включения всегда уходит влево, и эффект начинается предсказуемо, а не с той
+    // стороны, где его застало прошлое выключение.
+    if (! shouldPingPong)
+        pingPongRight = false;
 }
 
 float VoiceManager::panForSlot (int slot) const
@@ -145,7 +160,14 @@ void VoiceManager::noteOn (int midiNote, float velocity, float ratio)
 
     // Пан приходит не снаружи, а от номера слота (#23): кто именно из голосов
     // возьмёт ноту, знает только пул, и снаружи это число взять неоткуда.
-    const float pan = panForSlot (slot);
+    // В ping-pong слот ни при чём — сторона чередуется по порядку нот.
+    float pan = panForSlot (slot);
+
+    if (pingPong)
+    {
+        pan = pingPongRight ? spread : -spread;
+        pingPongRight = ! pingPongRight;
+    }
 
     if (v.isActive())
         v.steal (midiNote, velocity, ratio, delaySamples, pan);

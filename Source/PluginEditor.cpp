@@ -12,9 +12,10 @@ namespace
     const char* const layout[] {
         "timeMode",  "delayTime",  "midiOffset", "feedback",
         "diffusion", "modulation", "filterLo",   "filterHi",
-        "width",     "ducking",    "mix",        "outputGain",
-        "quality",   "formants",   "rootKey",    "pitchRange",
-        "voices",    "attack",     "release",    "bypass",
+        "width",     "pingPong",   "ducking",    "mix",
+        "outputGain","quality",    "formants",   "rootKey",
+        "pitchRange","voices",     "attack",     "release",
+        "bypass",
     };
 
     constexpr int headerHeight = 114;

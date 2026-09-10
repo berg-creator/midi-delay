@@ -250,6 +250,7 @@ private:
     std::atomic<float>* pTimeMode   = nullptr;
     std::atomic<float>* pMidiOffset = nullptr;
     std::atomic<float>* pWidth      = nullptr;
+    std::atomic<float>* pPingPong   = nullptr;
     std::atomic<float>* pDiffusion  = nullptr;
     std::atomic<float>* pModulation = nullptr;
     std::atomic<float>* pDucking    = nullptr;

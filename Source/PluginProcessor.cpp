@@ -22,6 +22,7 @@ MidiDelayProcessor::MidiDelayProcessor()
     pTimeMode   = apvts.getRawParameterValue ("timeMode");
     pMidiOffset = apvts.getRawParameterValue ("midiOffset");
     pWidth      = apvts.getRawParameterValue ("width");
+    pPingPong   = apvts.getRawParameterValue ("pingPong");
     pDiffusion  = apvts.getRawParameterValue ("diffusion");
     pModulation = apvts.getRawParameterValue ("modulation");
     pDucking    = apvts.getRawParameterValue ("ducking");
@@ -115,6 +116,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         ParameterID { "filterHi", 1 }, "High Cut",
         Range { 200.0f, 20000.0f, 1.0f, 0.35f }, 12000.0f,
         AudioParameterFloatAttributes().withLabel ("Hz")));
+
+    // Ping-pong (#23): ноты уходят попеременно влево и вправо. Размах берётся от Width,
+    // отдельной ручки у него нет — иначе в окне стояли бы две ручки ширины, и вторая
+    // объяснялась бы только тем, что первая работает в другом режиме.
+    params.push_back (std::make_unique<AudioParameterBool> (
+        ParameterID { "pingPong", 1 }, "Ping-Pong", false));
 
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "width", 1 }, "Width",
@@ -377,6 +384,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     voiceManager.setEngine (wantHq ? PitchEngine::hq : PitchEngine::fast);
     voiceManager.setWidth (pWidth->load (std::memory_order_relaxed));
+    voiceManager.setPingPong (pPingPong->load (std::memory_order_relaxed) > 0.5f);
     voiceManager.setFormantHold (pFormants->load (std::memory_order_relaxed) > 0.5f);
 
     // Выравнивание: на сколько сэмплов весь плагин отстаёт от собственного входа.
