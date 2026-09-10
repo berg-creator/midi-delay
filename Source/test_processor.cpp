@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <new>
 #include <thread>
+#include <algorithm>
 #include <vector>
 
 // Не assert: сборка Release определяет NDEBUG, и assert превратился бы в пустоту —
@@ -172,13 +173,66 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         }
 
         sr = reader->sampleRate;
+
+        // Читается весь файл, а не первые полминуты: нужный кусок в нём может быть
+        // где угодно, см. ниже. Потолок в пять минут — чтобы случайно указанный
+        // час подкаста не съел память.
         const int frames = static_cast<int> (juce::jmin (reader->lengthInSamples,
-                                                         static_cast<juce::int64> (sr * maxSeconds)));
-        input.setSize (2, frames);
-        reader->read (&input, 0, frames, 0, true, true);
+                                                         static_cast<juce::int64> (sr * 300.0)));
+        juce::AudioBuffer<float> raw (2, frames);
+        reader->read (&raw, 0, frames, 0, true, true);
 
         if (reader->numChannels < 2)
-            input.copyFrom (1, 0, input, 0, 0, frames);
+            raw.copyFrom (1, 0, raw, 0, 0, frames);
+
+        // Откуда брать кусок. Обрезать тишину в начале мало: дикторская запись — это
+        // сессия с дублями, и после первой фразы идёт пауза в семь секунд. Берётся
+        // окно, в котором голос звучит дольше всего: тридцать секунд, наполовину
+        // состоящие из комнаты, про согласные ничего не расскажут.
+        const int start = [&raw, frames, sr]
+        {
+            const int frame = juce::jmax (1, static_cast<int> (sr * 0.25));
+            const int count = frames / frame;
+            const int window = juce::jmin (count, static_cast<int> (maxSeconds / 0.25));
+
+            if (window <= 0 || count <= window)
+                return 0;
+
+            std::vector<float> level (static_cast<size_t> (count));
+
+            for (int i = 0; i < count; ++i)
+                level[static_cast<size_t> (i)] = raw.getRMSLevel (0, i * frame, frame);
+
+            // Порог — четверть от громкого уровня самой записи. Абсолютное число
+            // не годится: у одной шумовая полка -60 dB, у другой -35, и одно и то же
+            // число одну запись обрежет по живому, а в другой примет комнату за речь.
+            std::vector<float> sorted (level);
+            std::sort (sorted.begin(), sorted.end());
+            const float threshold = sorted[static_cast<size_t> (count * 9 / 10)] * 0.25f;
+
+            int best = 0, bestVoiced = -1;
+
+            for (int i = 0; i + window <= count; ++i)
+            {
+                int voiced = 0;
+
+                for (int k = i; k < i + window; ++k)
+                    voiced += level[static_cast<size_t> (k)] > threshold ? 1 : 0;
+
+                if (voiced > bestVoiced) { bestVoiced = voiced; best = i; }
+            }
+
+            return best * frame;
+        }();
+
+        const int kept = juce::jmin (frames - start, static_cast<int> (sr * maxSeconds));
+        input.setSize (2, kept);
+
+        for (int ch = 0; ch < 2; ++ch)
+            input.copyFrom (ch, 0, raw, ch, start, kept);
+
+        if (start > 0)
+            std::printf ("  кусок взят с %.1f с — там голоса больше всего\n", start / sr);
     }
     else
     {
