@@ -63,6 +63,18 @@ public:
     std::atomic<int> lastNote { -1 };
     std::atomic<float> lastRatio { 1.0f };
 
+    /** Снимок голосов для окна (#27): какая нота звучит в каждом слоте (-1 — слот
+        свободен) и на каком уровне её огибающая. Пишет аудиопоток раз в блок,
+        читает таймер редактора — отсюда atomic и только relaxed: числа независимы,
+        и рассогласование на один кадр в картинке не видно. Восемь пар вместо одной
+        структуры под локом потому, что лока в processBlock нет и не будет.
+
+        Уровень нужен не для красоты: он и есть хвост. Нота отпущена, огибающая ползёт
+        вниз, а голос всё ещё занят — без уровня «сколько голосов занято» выглядит
+        как залипание. */
+    std::atomic<int> voiceNote[VoiceManager::maxVoices];
+    std::atomic<float> voiceLevel[VoiceManager::maxVoices];
+
     /** Нижний предел delay time для движка, выбранного параметром Quality (#17):
         ниже него хвост физически не может прийти, и время подтягивается вверх.
         Число берётся у движка в prepareToPlay, а не зашито здесь — у Fast и HQ
@@ -108,6 +120,11 @@ private:
         на коротких delay time. */
     void renderSegment (const juce::AudioBuffer<float>& buffer, int startSample, int numSamples,
                         int numChannels, float feedback);
+
+    /** Переписать снимок голосов для окна (#27). Зовётся раз в блок из конца
+        processBlock и ещё из подготовки/сброса, чтобы окно не показывало ноты,
+        которых уже нет. Восемь пар relaxed-записей, аллокаций и локов нет. */
+    void publishVoiceSnapshot();
 
     /** Ноты, педаль и all-notes-off. Всё незнакомое молча мимо. */
     void handleMidiMessage (const juce::MidiMessage& message);

@@ -123,6 +123,8 @@ MidiDelayProcessor::MidiDelayProcessor()
     pFilterHi   = apvts.getRawParameterValue ("filterHi");
     bypassParam = apvts.getParameter ("bypass");
 
+    publishVoiceSnapshot();   // окно открывается на пустом пуле, а не на мусоре (#27)
+
     // Плагин открывается на Chord Pad, а не на тихом подкладе: демо «послушайте,
     // как почти ничего не изменилось» не существует (STRATEGY.md §3 и §5, #48).
     // Значения по умолчанию самих параметров при этом не тронуты — они остаются тем,
@@ -391,6 +393,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     updateLatency();
 
     midiNoteCount = 0;
+    publishVoiceSnapshot();
 }
 
 void MidiDelayProcessor::releaseResources()
@@ -403,6 +406,7 @@ void MidiDelayProcessor::releaseResources()
     midiQueue.clear();
     midiCarry.clear();
     voiceManager.reset();
+    publishVoiceSnapshot();
 }
 
 //==============================================================================
@@ -700,6 +704,18 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
             // при 0 — ровно dry, бит-в-бит.
             buffer.setSample (ch, i, processed * wetPath + dry * (1.0f - wetPath));
         }
+    }
+
+    // Снимок для окна — последним делом блока, когда голоса уже отработали (#27).
+    publishVoiceSnapshot();
+}
+
+void MidiDelayProcessor::publishVoiceSnapshot()
+{
+    for (int slot = 0; slot < VoiceManager::maxVoices; ++slot)
+    {
+        voiceNote[slot].store (voiceManager.getVoiceNote (slot), std::memory_order_relaxed);
+        voiceLevel[slot].store (voiceManager.getVoiceLevel (slot), std::memory_order_relaxed);
     }
 }
 

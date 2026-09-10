@@ -673,6 +673,72 @@ int main (int argc, char* argv[])
         return benchmark (argc >= 3 ? juce::String (argv[2]) : juce::String ("hq"),
                           argc >= 4 ? juce::String (argv[3]) : juce::String ("hold"));
 
+    // Снимок окна в PNG (#26, #27). Не украшение: интерфейс иначе правится вслепую —
+    // увидеть его можно только запустив хост, а хост в эстафету промптов не помещается.
+    // Заодно это единственная проверка, что редактор создаётся, отрисовывается
+    // и разрушается без падения, — pluginval то же самое делает дольше и молча.
+    //   ./build/ProcessorTest_artefacts/Release/ProcessorTest --shot editor.png [пресет]
+    if (argc >= 3 && juce::String (argv[1]) == "--shot")
+    {
+        MidiDelayProcessor proc;
+        proc.prepareToPlay (48000.0, 512);
+
+        if (argc >= 4)
+            proc.setCurrentProgram (juce::String (argv[3]).getIntValue());
+
+        // Аккорд без отпускания: снимок должен показывать занятые голоса, а не пустую
+        // клавиатуру. Иначе половина того, ради чего #27 делалась, на картинке не видна.
+        // Слово silent четвёртым аргументом снимает второе состояние — то, ради которого
+        // #27 и заводилась: MIDI не доехал, и это должно быть видно с первого взгляда.
+        const bool silent = argc >= 5 && juce::String (argv[4]) == "silent";
+
+        juce::AudioBuffer<float> block (2, 512);
+        fillDC (block, 0.4f);
+        juce::MidiBuffer chord;
+
+        if (! silent)
+            for (const int note : { 55, 58, 62, 65 })
+                chord.addEvent (juce::MidiMessage::noteOn (1, note, 0.9f), 0);
+
+        proc.processBlock (block, chord);
+
+        // Шестьдесят блоков, а не пара: в Follow события едут в очереди на всю
+        // латентность движка (ADR 0006), и на девяти блоках нота просто не успевала
+        // прозвучать — снимок выходил с пустой клавиатурой и надписью «нет MIDI».
+        for (int i = 0; i < 60; ++i)
+        {
+            juce::MidiBuffer none;
+            fillDC (block, 0.4f);
+            proc.processBlock (block, none);
+        }
+
+        std::unique_ptr<juce::AudioProcessorEditor> editor (proc.createEditor());
+        CHECK (editor != nullptr);
+
+        // Таймеры редактора должны успеть снять снимок голосов и разложить контекст
+        // по режимам: без этого окно нарисовалось бы с пустой клавиатурой. Очередь
+        // сообщений тут не крутится (модальные циклы в консольном приложении JUCE
+        // выключены), поэтому таймеры дёргаются напрямую — подождав, пока настанет
+        // их срок. Сто миллисекунд хватает обоим: 15 Гц у окна, 30 Гц у ленты.
+        std::this_thread::sleep_for (std::chrono::milliseconds (100));
+        juce::Timer::callPendingTimersSynchronously();
+
+        const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true);
+        const auto file = juce::File::getCurrentWorkingDirectory()
+                              .getChildFile (juce::String::fromUTF8 (argv[2]));
+        file.deleteFile();
+
+        std::unique_ptr<juce::FileOutputStream> out (file.createOutputStream());
+        CHECK (out != nullptr);
+
+        juce::PNGImageFormat png;
+        CHECK (png.writeImageToStream (image, *out));
+
+        std::printf ("wrote %s (%d x %d)\n", file.getFullPathName().toRawUTF8(),
+                     image.getWidth(), image.getHeight());
+        return 0;
+    }
+
     // --- Раскладки шин ---------------------------------------------------------
     {
         MidiDelayProcessor proc;
@@ -3873,6 +3939,111 @@ int main (int argc, char* argv[])
         // Порог тот же, что в стресс-тесте всех разрывов: там на исправном плагине
         // отношение держится около 5, и 8 оставляет запас, но ловит настоящий выброс.
         CHECK (ratio < 8.0);
+    }
+
+    // --- Снимок голосов для окна (#27) -----------------------------------------
+    // Индикатор нот — диагностический прибор, а не украшение: пользователь по нему
+    // решает «плагин не работает» или «MIDI не доехал». Значит проверяется ровно то,
+    // за что он отвечает: занятые слоты названы своими нотами, хвост виден уровнем
+    // огибающей, отпущенная нота из картинки уходит, а снимок ничего не выделяет.
+    {
+        MidiDelayProcessor proc;
+        engineDefaults (proc);
+        plainLoop (proc);
+        setParam (proc, "timeMode", 0.0f);            // Free: голос стартует сразу
+        setParam (proc, "release", 50.0f);            // короткий спад, чтобы не ждать
+        setParam (proc, "voices", 8.0f);
+
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+        proc.prepareToPlay (sr, blockSize);
+
+        juce::AudioBuffer<float> block (2, blockSize);
+
+        auto busyVoices = [&proc]
+        {
+            int busy = 0;
+
+            for (int slot = 0; slot < VoiceManager::maxVoices; ++slot)
+                if (proc.voiceNote[slot].load() >= 0)
+                    ++busy;
+
+            return busy;
+        };
+
+        auto slotOf = [&proc] (int note)
+        {
+            for (int slot = 0; slot < VoiceManager::maxVoices; ++slot)
+                if (proc.voiceNote[slot].load() == note)
+                    return slot;
+
+            return -1;
+        };
+
+        // Свежий процессор — пустой пул: окно, открытое до первой ноты, обязано
+        // показывать тишину, а не мусор из неинициализированной памяти.
+        CHECK (busyVoices() == 0);
+
+        fillDC (block, 0.5f);
+        juce::MidiBuffer chord;
+        for (const int note : { 60, 64, 67 })
+            chord.addEvent (juce::MidiMessage::noteOn (1, note, 0.9f), 0);
+
+        runBlock (proc, block, chord);
+        CHECK (allocations.load() == 0);   // снимок живёт в processBlock: аллокаций там нет
+
+        CHECK (busyVoices() == 3);
+        for (const int note : { 60, 64, 67 })
+        {
+            const int slot = slotOf (note);
+            CHECK (slot >= 0);
+            CHECK (proc.voiceLevel[slot].load() > 0.0f);
+        }
+
+        CHECK (proc.midiNoteCount.load() == 3);
+        CHECK (proc.lastNote.load() == 67);
+
+        // Хвост: нота отпущена, слот ещё занят, но уровень падает. Без уровня
+        // «три голоса заняты» после отпускания выглядело бы как залипание.
+        juce::MidiBuffer release;
+        for (const int note : { 60, 64, 67 })
+            release.addEvent (juce::MidiMessage::noteOff (1, note), 0);
+
+        const float beforeRelease = proc.voiceLevel[slotOf (60)].load();
+        runBlock (proc, block, release);
+
+        const int decaying = slotOf (60);
+        CHECK (decaying >= 0);
+        CHECK (proc.voiceLevel[decaying].load() < beforeRelease);
+
+        // Спад 50 мс: за полсекунды голоса обязаны освободиться все до одного.
+        for (int i = 0; i < 50; ++i)
+        {
+            fillDC (block, 0.5f);
+            runBlock (proc, block);
+        }
+
+        CHECK (busyVoices() == 0);
+
+        // Сброс обязан чистить картинку: иначе окно после смены sample rate
+        // показывало бы ноты, которых уже нет.
+        runBlock (proc, block, chord);
+        CHECK (busyVoices() == 3);
+        proc.releaseResources();
+        CHECK (busyVoices() == 0);
+
+        // Подписи в окне — это имена параметров, и они уходят на экран как есть.
+        // ASCII, как и имена пресетов (CLAUDE.md): кириллица в окне рассыпается.
+        for (auto* param : proc.getParameters())
+            if (auto* named = dynamic_cast<juce::AudioProcessorParameterWithID*> (param))
+            {
+                CHECK (named->getName (64).isNotEmpty());
+
+                for (auto c : named->getName (64))
+                    CHECK (c >= 32 && c < 127);
+            }
+
+        std::printf ("  #27: три ноты -> три слота, хвост гаснет, сброс чистит картинку\n");
     }
 
     std::printf ("test_processor: OK\n");

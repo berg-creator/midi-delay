@@ -56,6 +56,21 @@ public:
     /** Педаль сустейна (CC 64): отпущенные клавиши держатся до её подъёма. */
     void setSustain (bool down);
 
+    /** Снимок слота для окна (#27): какая нота в нём звучит (-1 — свободен) и на каком
+        уровне огибающей. Читает поток сообщений, пишет — никто: это просто взгляд
+        на состояние голоса, локов и копий не нужно. Публикует снимок процессор,
+        раз в блок, в атомики — здесь только чтение. */
+    int getVoiceNote (int slot) const
+    {
+        return voices[static_cast<size_t> (slot)].isActive()
+             ? voices[static_cast<size_t> (slot)].getMidiNote() : -1;
+    }
+
+    float getVoiceLevel (int slot) const
+    {
+        return voices[static_cast<size_t> (slot)].getEnvelopeLevel();
+    }
+
     /** Рендер одного сегмента между MIDI-событиями: каждый живой голос подмешивается в out. */
     void process (float* const* out, int numOutChannels, int startSample, int numSamples,
                   const DelayBuffer& source);
