@@ -146,10 +146,12 @@ namespace
     на том же файле и одной командой, ровно как colour к окраске петли. Там же можно
     выставить любой параметр по имени: feedback=75 modulation=60. Это дешевле, чем
     заводить флаг под каждую ручку, которую захочется послушать в следующий раз.
-    Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] [shift] [id=value ...] */
+    Слово pluck меняет мелодию на ритмичный паттерн восьмыми — сценарий, ради которого
+    плагин и задуман: голос идёт своим флоу, хвост повторяет ноты плака в сетке трека.
+    Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] [shift] [pluck] [id=value ...] */
 static int renderDemo (const juce::String& path, const juce::String& mode,
                        const juce::String& inputPath, bool colour, bool formantShift,
-                       const juce::StringPairArray& overrides)
+                       bool pluck, const juce::StringPairArray& overrides)
 {
     const bool hq     = mode != "fast";
     const bool follow = mode == "follow";
@@ -312,9 +314,18 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     // молчал бы там, где как раз и интересно слушать согласные. Номера — MIDI 60,
     // 64, 67, 72, в терминах FL Studio C5, E5, G5, C6: унисон, терция, квинта, октава
     // от Root Key. Унисон в списке не случайно — на нём слышно прозрачность движка.
-    const int notes[] { 60, 64, 67, 72 };
-    const int noteLength = static_cast<int> (sr * 1.0);
-    const int gap = static_cast<int> (sr * 0.05);
+    // Два разных материала, и разница между ними — это разница между «проверить движок»
+    // и «проверить идею». Обычный: четыре длинные ноты по секунде, на них слышно
+    // прозрачность и расстройку. Ритмичный (слово pluck в команде): восьмые при 120 BPM,
+    // паттерн как у синтезаторного плака — то, ради чего плагин задуман. Хвост при
+    // delay time 250 мс попадает ровно на следующую восьмую, то есть в сетку трека.
+    static constexpr int melody[] { 60, 64, 67, 72 };
+    static constexpr int pluckPattern[] { 60, 64, 67, 64, 69, 67, 64, 60 };
+
+    const int* notes = pluck ? pluckPattern : melody;
+    const int numNotes = pluck ? 8 : 4;
+    const int noteLength = static_cast<int> (sr * (pluck ? 0.25 : 1.0));
+    const int gap = static_cast<int> (sr * (pluck ? 0.03 : 0.05));
     const int firstNote = static_cast<int> (sr * 0.5);
 
     juce::AudioBuffer<float> out (2, total);
@@ -333,7 +344,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         {
             const int on  = firstNote + k * noteLength;
             const int off = on + noteLength - gap;
-            const int note = notes[k % 4];
+            const int note = notes[k % numNotes];
 
             if (on  >= start && on  < start + n) midi.addEvent (juce::MidiMessage::noteOn  (1, note, 0.9f), on  - start);
             if (off >= start && off < start + n) midi.addEvent (juce::MidiMessage::noteOff (1, note), off - start);
@@ -362,9 +373,10 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     writer->writeFromAudioSampleBuffer (out, 0, total);
     writer.reset();
 
-    std::printf ("rendered %s (%.1f s, %s%s%s, formants %s)\n", file.getFullPathName().toRawUTF8(),
+    std::printf ("rendered %s (%.1f s, %s%s%s%s, formants %s)\n", file.getFullPathName().toRawUTF8(),
                  total / sr, hq ? "hq" : "fast", follow ? ", follow" : "",
-                 colour ? ", colour" : "", formantShift ? "shift" : "hold");
+                 colour ? ", colour" : "", pluck ? ", pluck" : "",
+                 formantShift ? "shift" : "hold");
     return 0;
 }
 
@@ -448,7 +460,7 @@ int main (int argc, char* argv[])
         // Хвост команды — набор слов без порядка: colour и shift ищутся где угодно
         // после имени файла. Позиционные флаги тут кончились бы «пустой строкой,
         // чтобы добраться до шестого аргумента».
-        bool colour = false, formantShift = false;
+        bool colour = false, formantShift = false, pluck = false;
         juce::StringPairArray overrides;
 
         for (int i = 5; i < argc; ++i)
@@ -461,12 +473,13 @@ int main (int argc, char* argv[])
 
             colour       = colour       || flag == "colour";
             formantShift = formantShift || flag == "shift";
+            pluck        = pluck        || flag == "pluck";
         }
 
         return renderDemo (juce::String::fromUTF8 (argv[2]),
                            argc >= 4 ? juce::String::fromUTF8 (argv[3]) : juce::String ("hq"),
                            argc >= 5 ? juce::String::fromUTF8 (argv[4]) : juce::String(),
-                           colour, formantShift, overrides);
+                           colour, formantShift, pluck, overrides);
     }
 
     if (argc >= 2 && juce::String (argv[1]) == "--bench")
@@ -1625,6 +1638,7 @@ int main (int argc, char* argv[])
             setParam (proc, "attack", 1.0f);
             setParam (proc, "diffusion", diffusion);
             setParam (proc, "modulation", 0.0f);   // замер тайминга: дрейф позиции чтения тут мешает
+            setParam (proc, "ducking", 0.0f);      // и приседание: оно жмёт wet, а меряются уровни
             setParam (proc, "filterLo", loHz);
             setParam (proc, "filterHi", hiHz);
 
@@ -1729,6 +1743,7 @@ int main (int argc, char* argv[])
                 setParam (proc, "attack", 1.0f);
                 setParam (proc, "diffusion", 0.0f);
                 setParam (proc, "modulation", 0.0f);
+                setParam (proc, "ducking", 0.0f);
                 setParam (proc, "filterLo", 20.0f);
                 setParam (proc, "filterHi", hiHz);
 
@@ -1775,6 +1790,7 @@ int main (int argc, char* argv[])
                 setParam (proc, "attack", 1.0f);
                 setParam (proc, "diffusion", 0.0f);
                 setParam (proc, "modulation", 0.0f);
+                setParam (proc, "ducking", 0.0f);
                 setParam (proc, "filterLo", loHz);
                 setParam (proc, "filterHi", hiHz);
 
@@ -1822,6 +1838,7 @@ int main (int argc, char* argv[])
             setParam (proc, "attack", 1.0f);
             setParam (proc, "diffusion", 100.0f);
             setParam (proc, "modulation", 100.0f);
+            setParam (proc, "ducking", 0.0f);       // разгон петли меряется без приседания
             setParam (proc, "filterLo", 100.0f);
             setParam (proc, "filterHi", 12000.0f);
 
