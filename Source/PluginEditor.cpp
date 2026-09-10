@@ -28,6 +28,19 @@ namespace
 MidiDelayEditor::MidiDelayEditor (MidiDelayProcessor& p)
     : AudioProcessorEditor (&p), proc (p)
 {
+    for (int i = 0; i < proc.getNumPrograms(); ++i)
+        presetBox.addItem (proc.getProgramName (i), i + 1);
+
+    presetBox.setSelectedItemIndex (proc.getCurrentProgram(), juce::dontSendNotification);
+    presetBox.onChange = [this]
+    {
+        // Пресет ставится через штатный интерфейс программ, а не записью в APVTS:
+        // тогда хост узнаёт о смене программы и его собственное меню пресетов
+        // не расходится с этим списком.
+        proc.setCurrentProgram (presetBox.getSelectedItemIndex());
+    };
+    addAndMakeVisible (presetBox);
+
     for (const auto* id : layout)
         addControl (id);
 
@@ -86,6 +99,10 @@ void MidiDelayEditor::addControl (const juce::String& parameterId)
 
 void MidiDelayEditor::resized()
 {
+    // Список пресетов — в шапке справа, на одной строке с названием плагина:
+    // это первое, что трогают, и оно не должно теряться в сетке одинаковых ручек.
+    presetBox.setBounds (getWidth() - margin - 200, 10, 200, 24);
+
     for (int i = 0; i < controls.size(); ++i)
     {
         const int column = i % columns;
@@ -120,6 +137,13 @@ void MidiDelayEditor::timerCallback()
     const auto division = static_cast<int> (proc.apvts.getRawParameterValue ("division")
                                                 ->load (std::memory_order_relaxed));
     const auto bpm = juce::roundToInt (proc.getSyncBpm());
+
+    // Программу может сменить и хост — своим меню пресетов или автоматизацией.
+    if (const auto preset = proc.getCurrentProgram(); preset != shownPreset)
+    {
+        shownPreset = preset;
+        presetBox.setSelectedItemIndex (preset, juce::dontSendNotification);
+    }
 
     if (count != lastCount || note != shownNote || quality != shownQuality
         || clamped != shownClamped || follow != shownFollow || alignment != shownAlignment

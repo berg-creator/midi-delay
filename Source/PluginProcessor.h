@@ -37,11 +37,15 @@ public:
         внутри processBlock. */
     juce::AudioProcessorParameter* getBypassParameter() const override { return bypassParam; }
 
-    int getNumPrograms() override { return 1; }
-    int getCurrentProgram() override { return 0; }
-    void setCurrentProgram (int) override {}
-    const juce::String getProgramName (int) override { return {}; }
-    void changeProgramName (int, const juce::String&) override {}
+    /** Фабричные пресеты (#48) отданы хосту через штатный интерфейс программ,
+        а не своим списком в окне: тогда они видны в меню пресетов FL и Logic
+        и автоматизируются как программа, а окну остаётся один ComboBox.
+        Пользовательские пресеты — это #28, здесь их нет. */
+    int getNumPrograms() override;
+    int getCurrentProgram() override { return currentProgram; }
+    void setCurrentProgram (int) override;
+    const juce::String getProgramName (int) override;
+    void changeProgramName (int, const juce::String&) override {}   // фабричные не переименовываются
 
     void getStateInformation (juce::MemoryBlock&) override;
     void setStateInformation (const void*, int) override;
@@ -168,7 +172,39 @@ private:
 
     /** Версия формата состояния. Меняется, когда старый проект надо мигрировать,
         а не когда просто добавился параметр: незнакомые поля APVTS игнорирует сам. */
+    /** Мягкое ограничение отвода обратной связи (#44). Ниже колена — тождество,
+        бит-в-бит; выше — плавно упирается в потолок и никогда его не переходит.
+        Колено и потолок подобраны так, чтобы обычный хвост (уровень круга около 0,33
+        при feedback 95 %, замер #21) не задевало вовсе, а горячий материал не мог
+        накачать кольцо выше единицы. Склейка гладкая и по значению, и по наклону:
+        на колене производная ровно 1, поэтому ограничитель не даёт излома. */
+    static constexpr float loopKnee = 0.7f;
+    static constexpr float loopCeiling = 1.0f;
+
+    static float softLimit (float x) noexcept
+    {
+        const float magnitude = std::abs (x);
+
+        if (magnitude <= loopKnee)
+            return x;
+
+        const float over = (magnitude - loopKnee) / (loopCeiling - loopKnee);
+        return std::copysign (loopKnee + (loopCeiling - loopKnee) * over / (1.0f + over), x);
+    }
+
     static constexpr int stateVersion = 1;
+
+    /** Выставляет все параметры пресета. Пресет — снимок целиком, а не набор поправок:
+        всё, чего он не называет, возвращается к значению по умолчанию. Иначе Ghost Choir,
+        выбранный после Arp Echo, звучал бы не так, как Ghost Choir на свежем экземпляре,
+        и пресет перестал бы быть адресом. Bypass не трогается: обход — это состояние
+        пользователя, а не звука. */
+    void applyPreset (int index);
+
+    /** Индекс фабричного пресета. Живёт в состоянии проекта отдельным полем: сами
+        параметры и так сохраняются, но без индекса окно после загрузки показывало бы
+        чужое имя. */
+    int currentProgram = 0;
 
     static constexpr double smoothingSeconds = 0.05;
 

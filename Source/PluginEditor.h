@@ -28,12 +28,17 @@ private:
 
     MidiDelayProcessor& proc;
 
+    /** Список фабричных пресетов (#48). Отдельным полем, а не через addControl:
+        пресет — не параметр APVTS, он выставляет сразу все. */
+    juce::ComboBox presetBox;
+
     juce::OwnedArray<juce::Component> controls;
     juce::OwnedArray<juce::Label> captions;
     juce::OwnedArray<juce::AudioProcessorValueTreeState::SliderAttachment> sliderLinks;
     juce::OwnedArray<juce::AudioProcessorValueTreeState::ComboBoxAttachment> comboLinks;
     juce::OwnedArray<juce::AudioProcessorValueTreeState::ButtonAttachment> buttonLinks;
 
+    int shownPreset = -1;         // индекс пресета, показанный в списке
     int lastCount = -1;
     int shownNote = -2;
     int shownQuality = -1;

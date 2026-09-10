@@ -77,6 +77,27 @@ namespace
         juce::Optional<PositionInfo> getPosition() const override { return PositionInfo {}; }
     };
 
+    /** Возвращает параметры к значениям по умолчанию. С сессии 15 плагин открывается
+        на фабричном пресете Chord Pad (#48) — это верно для пользователя, но тесты
+        меряют движок, а не продуктовое решение, и база у них обязана быть одна и та же
+        независимо от того, какой пресет сегодня стоит нулевым. Сам пресет по умолчанию
+        проверяется отдельно, в разделе пресетов. */
+    void engineDefaults (MidiDelayProcessor& proc)
+    {
+        for (auto* p : proc.getParameters())
+            p->setValueNotifyingHost (p->getDefaultValue());
+    }
+
+    /** Значение параметра в тех же единицах, что в окне. Через сырое значение APVTS,
+        а не через нормализованное: сверять пресет с таблицей в ISSUES надо в тех же
+        числах, какими она написана. */
+    float getParam (const MidiDelayProcessor& proc, const char* id)
+    {
+        auto* v = proc.apvts.getRawParameterValue (id);
+        CHECK (v != nullptr);
+        return v->load();
+    }
+
     void setParam (MidiDelayProcessor& proc, const char* id, float value)
     {
         auto* p = proc.apvts.getParameter (id);
@@ -310,9 +331,15 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         }
     }
 
-    const int total = input.getNumSamples();
+    // Длина куска ключом seconds=: критерий #48 просит пятнадцатисекундный ролик,
+    // а автопоиск берёт тридцать. Обрезается после выбора куска, а не вместо него.
+    const int total = overrides.containsKey ("seconds")
+        ? juce::jmin (input.getNumSamples(),
+                      static_cast<int> (sr * overrides["seconds"].getDoubleValue()))
+        : input.getNumSamples();
 
     MidiDelayProcessor proc;
+    engineDefaults (proc);
     // Sync гасится: команды рендера задают время в миллисекундах, посчитанных под темп
     // материала руками (noteMs, delayTime). Включить его обратно можно ключом sync=1,
     // и тогда темп задаётся ключом bpm= — иначе сетка встанет на фолбэк 120.
@@ -346,11 +373,29 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         setParam (proc, "filterHi", 20000.0f);
     }
 
+    // Фабричный пресет ключом preset=N (#48). Идёт после базы рендера и до ручных
+    // значений: пресет обязан перебивать умолчания рендера — иначе слушали бы не его, —
+    // а названное руками обязано перебивать пресет.
+    if (overrides.containsKey ("preset"))
+    {
+        const int index = overrides["preset"].getIntValue();
+
+        if (index < 0 || index >= proc.getNumPrograms())
+        {
+            std::printf ("нет такого пресета: %d\n", index);
+            return 1;
+        }
+
+        proc.setCurrentProgram (index);
+        std::printf ("  пресет %d: %s\n", index, proc.getProgramName (index).toRawUTF8());
+    }
+
     // Ручные значения идут последними: они обязаны перебивать и умолчания, и то,
     // что выключил режим без colour.
     for (const auto& id : overrides.getAllKeys())
     {
-        if (id == "noteMs" || id == "startS" || id == "notes" || id == "bpm")
+        if (id == "noteMs" || id == "startS" || id == "notes" || id == "bpm"
+            || id == "preset" || id == "drySeconds" || id == "seconds")
             continue;   // настройки рендера, а не параметры плагина
 
         if (proc.apvts.getParameter (id) == nullptr)
@@ -401,12 +446,25 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     const int gap = static_cast<int> (sr * (pluck ? 0.03 : 0.05));
     const int firstNote = static_cast<int> (sr * 0.5);
 
+    // Демо «сухой -> эффект» одним файлом (#48): первые drySeconds плагин обойдён,
+    // дальше включается. Слушать два файла подряд и держать в голове первый — не то же
+    // самое, что услышать переход. Заодно это кроссфейд обхода (ADR 0003) на живом
+    // голосе, а не на синусе.
+    const double drySeconds = overrides.containsKey ("drySeconds")
+                                  ? overrides["drySeconds"].getDoubleValue() : 0.0;
+    if (drySeconds > 0.0)
+        setParam (proc, "bypass", 1.0f);
+
     juce::AudioBuffer<float> out (2, total);
     juce::AudioBuffer<float> block (2, blockSize);
 
     for (int start = 0; start < total; start += blockSize)
     {
         const int n = juce::jmin (blockSize, total - start);
+
+        if (drySeconds > 0.0 && start >= static_cast<int> (drySeconds * sr)
+            && start < static_cast<int> (drySeconds * sr) + blockSize)
+            setParam (proc, "bypass", 0.0f);
 
         for (int ch = 0; ch < 2; ++ch)
             block.copyFrom (ch, 0, input, ch, start, n);
@@ -520,6 +578,7 @@ static int benchmark (const juce::String& mode, const juce::String& formants)
     constexpr double seconds = 20.0;
 
     MidiDelayProcessor proc;
+    engineDefaults (proc);
     setParam (proc, "quality", mode == "fast" ? 0.0f : 1.0f);
     setParam (proc, "sync", 0.0f);          // цифра бенча обязана мериться на том же времени
     setParam (proc, "delayTime", 400.0f);
@@ -617,6 +676,7 @@ int main (int argc, char* argv[])
     // --- Раскладки шин ---------------------------------------------------------
     {
         MidiDelayProcessor proc;
+        engineDefaults (proc);
         plainLoop (proc);
         using Set = juce::AudioChannelSet;
 
@@ -638,6 +698,7 @@ int main (int argc, char* argv[])
     // --- Смещение дилея и ноль аллокаций ---------------------------------------
     {
         MidiDelayProcessor proc;
+        engineDefaults (proc);
         plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 16384;
@@ -725,6 +786,7 @@ int main (int argc, char* argv[])
     // --- Микс, гейн и обход без щелчков (#11) ----------------------------------
     {
         MidiDelayProcessor proc;
+        engineDefaults (proc);
         plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 16384;
@@ -945,6 +1007,7 @@ int main (int argc, char* argv[])
         //    старте ноты заливает своё окно историей. Итого 9600 + 5762 сэмпла.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             constexpr int blockSize = 512;
             juce::AudioBuffer<float> buffer (2, blockSize);
@@ -1014,6 +1077,7 @@ int main (int argc, char* argv[])
             for (const int blockSize : { 64, 128, 512, 2048 })
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 plainLoop (proc);
                 setup (proc, blockSize);
 
@@ -1076,6 +1140,7 @@ int main (int argc, char* argv[])
         //    игнорирует), так что унисон здесь ничего не теряет.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize, 10.0f, 300.0f);
@@ -1139,6 +1204,7 @@ int main (int argc, char* argv[])
         // 4. Педаль сустейна: note off при нажатой педали ничего не гасит, гасит подъём.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize, 1.0f, 5.0f);   // release 5 мс — укладывается в один блок
@@ -1171,6 +1237,7 @@ int main (int argc, char* argv[])
         // 5. Незнакомые сообщения не роняют плагин и не будят голоса.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             constexpr int blockSize = 512;
             setup (proc, blockSize);
@@ -1218,6 +1285,7 @@ int main (int argc, char* argv[])
                                         float rootKeyAfter, double expected)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "delayTime", 200.0f);   // больше латентности обоих движков
             setParam (proc, "feedback", 0.0f);
@@ -1303,6 +1371,7 @@ int main (int argc, char* argv[])
                                juce::AudioBuffer<float>& out)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 1.0f);       // форманты живут только в HQ
             setParam (proc, "formants", formantHold ? 1.0f : 0.0f);
@@ -1436,6 +1505,7 @@ int main (int argc, char* argv[])
     // --- Состояние -------------------------------------------------------------
     {
         MidiDelayProcessor proc;
+        engineDefaults (proc);
         plainLoop (proc);
         setParam (proc, "delayTime", 250.0f);
         setParam (proc, "feedback", 40.0f);
@@ -1490,6 +1560,7 @@ int main (int argc, char* argv[])
         const auto tailPeak = [] (float quality)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", quality);
             setParam (proc, "delayTime", 150.0f);
@@ -1532,6 +1603,7 @@ int main (int argc, char* argv[])
     // на старте ноты. Проверяется тем, что слышно, — непрерывностью сигнала.
     {
         MidiDelayProcessor proc;
+        engineDefaults (proc);
         plainLoop (proc);
         constexpr double sr = 48000.0;
         constexpr int blockSize = 4096;
@@ -1615,6 +1687,7 @@ int main (int argc, char* argv[])
         const auto tailPeak = [] (bool hq, float delayMs, double* minDelayMs = nullptr)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", hq ? 1.0f : 0.0f);
             setParam (proc, "delayTime", delayMs);
@@ -1686,6 +1759,7 @@ int main (int argc, char* argv[])
         // кольцо, крутящееся на заказанных 20 мс под хвостом на 120, село бы гребёнкой.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 0.0f);
             setParam (proc, "delayTime", 20.0f);     // втрое ниже предела Fast
@@ -1774,6 +1848,7 @@ int main (int argc, char* argv[])
         // и промах в триоли можно не заметить.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             setParam (proc, "sync", 1.0f);
 
             auto* division = proc.apvts.getParameter ("division");
@@ -1818,6 +1893,7 @@ int main (int argc, char* argv[])
             const auto bpmWith = [] (juce::AudioPlayHead* playHead)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 setParam (proc, "sync", 1.0f);
                 proc.setPlayHead (playHead);
                 proc.setPlayConfigDetails (2, 2, sr, blockSize);
@@ -1855,6 +1931,7 @@ int main (int argc, char* argv[])
             const auto syncTailPeak = [] (double bpm, int divisionIndex, double* requested)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 setParam (proc, "sync", 1.0f);
                 setParam (proc, "division", static_cast<float> (divisionIndex));
                 setParam (proc, "diffusion", 0.0f);
@@ -1949,6 +2026,7 @@ int main (int argc, char* argv[])
                                                float* loudest, bool* finite)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 setParam (proc, "sync", 1.0f);
                 setParam (proc, "division", 5.0f);      // 1/4
                 setParam (proc, "diffusion", 0.0f);
@@ -2061,6 +2139,7 @@ int main (int argc, char* argv[])
                                       int* alignment = nullptr)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             setParam (proc, "quality", 0.0f);
             setParam (proc, "sync", 0.0f);   // меряется тайминг петли: время задаёт ручка, не сетка
             setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
@@ -2168,6 +2247,7 @@ int main (int argc, char* argv[])
             const auto steadyLevel = [&] (float feedbackPercent, float hiHz)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 setParam (proc, "sync", 0.0f);   // замер уровней петли: время задаёт ручка, не сетка
                 setParam (proc, "quality", 0.0f);
                 setParam (proc, "delayTime", delayMs);
@@ -2216,6 +2296,7 @@ int main (int argc, char* argv[])
             const auto firstRepeatTone = [&] (double frequency, float loHz, float hiHz)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 setParam (proc, "sync", 0.0f);   // замер уровней петли: время задаёт ручка, не сетка
                 setParam (proc, "quality", 0.0f);
                 setParam (proc, "delayTime", delayMs);
@@ -2265,6 +2346,7 @@ int main (int argc, char* argv[])
         // ещё и меняет длину круга — то есть третий узел в той же петле (#46).
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             setParam (proc, "sync", 0.0f);   // замер уровней петли: время задаёт ручка, не сетка
             setParam (proc, "quality", 0.0f);
             setParam (proc, "delayTime", delayMs);
@@ -2339,6 +2421,7 @@ int main (int argc, char* argv[])
                               double& underSignal, double& inPause)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 0.0f);
             setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
@@ -2408,6 +2491,7 @@ int main (int argc, char* argv[])
             const auto pitchSpreadCents = [&] (float modulation, float feedbackPercent)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 plainLoop (proc);
                 setParam (proc, "quality", 0.0f);
                 setParam (proc, "delayTime", delayMs);
@@ -2509,6 +2593,7 @@ int main (int argc, char* argv[])
         const auto balances = [&] (bool pingPong, double& first, double& second)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 0.0f);
             setParam (proc, "delayTime", 200.0f);
@@ -2602,6 +2687,7 @@ int main (int argc, char* argv[])
                                    double& correlation)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             setParam (proc, "sync", 0.0f);
             setParam (proc, "delayTime", 250.0f);
             setParam (proc, "mix", 100.0f);          // меряется хвост, а не сухой под ним
@@ -2696,6 +2782,11 @@ int main (int argc, char* argv[])
             { "width 200, diffusion 50",              200.0f, false, 50.0f },
             { "width 200, diffusion 100",             200.0f, false, 100.0f },
             { "width 100, ping-pong, diffusion 50",   100.0f, true,  50.0f },
+            // Ровно то, что стоит в пресете Sung Vocal (#48): Width 150 одобрен ухом
+            // в сессии 13, но между замеренными 100 (-0,69 dB) и 200 (-3,02 dB) лежит
+            // вся разница между «незаметно» и «в моно вдвое тише». Строка стоит здесь,
+            // чтобы число было, а не мнение.
+            { "width 150, ping-pong, diffusion 50",   150.0f, true,  50.0f },
             { "width 200, ping-pong, diffusion 100",  200.0f, true,  100.0f },
         };
 
@@ -2742,6 +2833,7 @@ int main (int argc, char* argv[])
                                 int* latency = nullptr)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
             setParam (proc, "quality", 1.0f);      // HQ: от него считается выравнивание
@@ -2838,6 +2930,7 @@ int main (int argc, char* argv[])
             const auto onset = [&] (float offsetMs)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 plainLoop (proc);
                 setParam (proc, "timeMode", 0.0f);
                 setParam (proc, "quality", 1.0f);
@@ -2902,6 +2995,7 @@ int main (int argc, char* argv[])
             CHECK (peakIndex (out) == 20000 + 960);
 
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 1.0f);
             setParam (proc, "timeMode", 0.0f);
@@ -2943,6 +3037,7 @@ int main (int argc, char* argv[])
         const auto tailRun = [&] (float feedbackPercent)
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setParam (proc, "quality", 1.0f);
             setParam (proc, "delayTime", delayMs);
@@ -3077,6 +3172,7 @@ int main (int argc, char* argv[])
             const int totalBlocks = static_cast<int> (rate.seconds * rate.sr / blockSize);
 
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             proc.setPlayConfigDetails (2, 2, rate.sr, blockSize);
             proc.prepareToPlay (rate.sr, blockSize);
 
@@ -3219,6 +3315,7 @@ int main (int argc, char* argv[])
             const auto sustainLevel = [&setup] (int velocity)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 plainLoop (proc);
                 setup (proc, 1.0f, 300.0f);
 
@@ -3249,6 +3346,7 @@ int main (int argc, char* argv[])
             const auto tailEnd = [&setup] (int holdBlocks)
             {
                 MidiDelayProcessor proc;
+                engineDefaults (proc);
                 plainLoop (proc);
                 setup (proc, 1.0f, 50.0f);   // release 50 мс = 2400 сэмплов
 
@@ -3288,6 +3386,7 @@ int main (int argc, char* argv[])
         //    Ни щелчка, ни залипшего голоса — ровно то, чего требует #16.
         {
             MidiDelayProcessor proc;
+            engineDefaults (proc);
             plainLoop (proc);
             setup (proc, 50.0f, 100.0f);   // атака 50 мс = 2400 сэмплов
 
@@ -3332,6 +3431,448 @@ int main (int argc, char* argv[])
             // Голос освободился: спад доехал ровно до нуля, а не завис на остатке.
             CHECK (buffer.getSample (0, blockSize - 1) == 0.0f);
         }
+    }
+
+    // --- Насыщение в петле (#44) -----------------------------------------------
+    // Ограничитель стоит на отводе обратной связи, и проверяется ровно это: на feedback 0
+    // плагин обязан остаться линейным (отвод равен нулю, ограничителю нечего трогать),
+    // а на 95 % — перестать быть линейным, иначе он ничего не делает и его надо убрать.
+    // Линейность меряется отношением уровней на двух амплитудах входа: у линейной
+    // системы оно равно отношению амплитуд, у ограниченной — меньше.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+        constexpr int blocks = 400;                  // 4,3 с: петля успевает набрать круги
+
+        const auto tailLevel = [&] (float feedback, float amplitude)
+        {
+            MidiDelayProcessor proc;
+            engineDefaults (proc);
+            setParam (proc, "sync", 0.0f);
+            setParam (proc, "delayTime", 250.0f);
+            setParam (proc, "mix", 100.0f);          // меряется хвост, а не сухой
+            setParam (proc, "feedback", feedback);
+            setParam (proc, "diffusion", 0.0f);
+            setParam (proc, "modulation", 0.0f);
+            setParam (proc, "ducking", 0.0f);        // жмёт wet по сухому, замеру мешает
+            setParam (proc, "filterLo", 20.0f);
+            setParam (proc, "filterHi", 20000.0f);
+            setParam (proc, "attack", 1.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            double phase = 0.0, sum = 0.0;
+            long counted = 0;
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = static_cast<float> (amplitude * std::sin (phase));
+                    phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                // Нота 60 — унисон при Root Key C: питчер ничего не транспонирует,
+                // и в замер не лезет его собственная нелинейность.
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);
+
+                if (b < blocks / 2)
+                    continue;                        // первая половина — разгон петли
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const double x = block.getSample (0, i);
+                    sum += x * x;
+                    ++counted;
+                }
+            }
+
+            CHECK (counted > 0);
+            return std::sqrt (sum / counted);
+        };
+
+        // Отношение амплитуд входа шестикратное; у линейной системы такое же
+        // отношение выходов.
+        constexpr float quiet = 0.15f, loud = 0.9f;
+
+        const double cleanRatio = tailLevel (0.0f, loud) / tailLevel (0.0f, quiet);
+        const double hotRatio   = tailLevel (95.0f, loud) / tailLevel (95.0f, quiet);
+
+        std::printf ("  #44 отношение выходов на входах 0,15 и 0,9 (линейное — 6,00):"
+                     " feedback 0 %% — %.2f, feedback 95 %% — %.2f\n", cleanRatio, hotRatio);
+
+        // Без обратной связи ограничителю нечего трогать: плагин линеен. Допуск 1 %
+        // на фазовый вокодер — он решает по магнитудам, и на два порядка амплитуды
+        // подряд бит-в-бит не обязан.
+        CHECK (std::abs (cleanRatio - 6.0) < 0.06);
+
+        // С обратной связью петля упирается в потолок: тихий вход проходит нетронутым,
+        // громкий подрезан, отношение падает. Если однажды станет ровно шесть —
+        // ограничитель перестал работать, и эта строка об этом скажет.
+        CHECK (hotRatio < 5.5);
+
+        // И потолок настоящий. Граница считается, а не выдумывается: в кольцо пишется
+        // сухой плюс ограниченный отвод, то есть не больше amplitude + loopCeiling,
+        // и следующий круг читает уже это. Потолок кольца — 0,9 + 1,0 = 1,9,
+        // и среднеквадратичный уровень хвоста обязан лежать ниже него.
+        const double hotLevel = tailLevel (95.0f, loud);
+        std::printf ("  #44 уровень хвоста на входе 0,9 и feedback 95 %%: %.2f\n", hotLevel);
+        CHECK (hotLevel < 1.9);
+    }
+
+    // --- Живой темп: сетка едет за хостом на ходу (#20) -------------------------
+    // Заменяет ту часть ручной проверки в FL, которую офлайн-тест умеет: до сессии 15
+    // темп подсовывался фиксированным на весь прогон, и «сетка едет за проектом»
+    // проверялось тем, что при другом BPM другой прогон даёт другое время. Это не то же
+    // самое: хост меняет темп в середине, между блоками, и плагин обязан пересчитать
+    // сетку к следующей ноте, а не к следующему открытию проекта.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int longBlock = 16384;
+
+        MidiDelayProcessor proc;
+        engineDefaults (proc);
+        setParam (proc, "sync", 1.0f);
+        setParam (proc, "division", 5.0f);      // 1/4
+        setParam (proc, "mix", 100.0f);
+        setParam (proc, "feedback", 0.0f);
+        setParam (proc, "diffusion", 0.0f);
+        setParam (proc, "modulation", 0.0f);
+        setParam (proc, "ducking", 0.0f);
+        setParam (proc, "filterLo", 20.0f);
+        setParam (proc, "filterHi", 20000.0f);
+        setParam (proc, "attack", 1.0f);
+
+        FixedTempoPlayHead playHead (120.0);
+        proc.setPlayHead (&playHead);
+        proc.setPlayConfigDetails (2, 2, sr, longBlock);
+        proc.prepareToPlay (sr, longBlock);
+
+        juce::AudioBuffer<float> block (2, longBlock);
+
+        // Импульс с нотой, дальше тишина: ищется, на каком сэмпле вышел хвост.
+        const auto tailPeak = [&]
+        {
+            // Сначала отпустить прошлую ноту и прогнать тишину: голос держится, пока
+            // нота нажата, и без этого замер нашёл бы пик от предыдущего темпа.
+            block.clear();
+            juce::MidiBuffer off;
+            off.addEvent (juce::MidiMessage::noteOff (1, 60), 0);
+            runBlock (proc, block, off);
+
+            for (int b = 0; b < 3; ++b)
+            {
+                block.clear();
+                runBlock (proc, block);
+            }
+
+            int peak = -1;
+            float peakValue = 0.0f;
+
+            for (int b = 0; b < 4; ++b)
+            {
+                block.clear();
+
+                if (b == 0)
+                {
+                    block.setSample (0, 0, 1.0f);
+                    block.setSample (1, 0, 1.0f);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < longBlock; ++i)
+                    if (std::abs (block.getSample (0, i)) > peakValue)
+                    {
+                        peakValue = std::abs (block.getSample (0, i));
+                        peak = b * longBlock + i;
+                    }
+            }
+
+            CHECK (peakValue > 0.8f);
+            return peak;
+        };
+
+        // 120 BPM: четверть — ровно 500 мс, то же число, что стоит на ручке по умолчанию.
+        // Это третий пункт ручной проверки: при 120 включение Sync не двигает звук.
+        CHECK (std::abs (proc.requestedDelayMs() - 500.0) < 0.01);
+        CHECK (std::abs (proc.getSyncBpm() - 120.0) < 0.01);
+        const int peak120 = tailPeak();
+        CHECK (std::abs (peak120 - juce::roundToInt (0.500 * sr)) <= 48);
+
+        // Хост поменял темп в середине сессии. Сетка обязана поехать за ним.
+        playHead.bpm = 150.0;
+
+        const int peak150 = tailPeak();
+        CHECK (std::abs (proc.getSyncBpm() - 150.0) < 0.01);
+        CHECK (std::abs (proc.requestedDelayMs() - 400.0) < 0.01);
+        CHECK (std::abs (peak150 - juce::roundToInt (0.400 * sr)) <= 48);
+
+        playHead.bpm = 90.0;
+
+        const int peak90 = tailPeak();
+        CHECK (std::abs (proc.requestedDelayMs() - 666.67) < 0.01);
+        CHECK (std::abs (peak90 - juce::roundToInt (0.66667 * sr)) <= 48);
+
+        std::printf ("  живой темп 1/4: 120 BPM -> %d, 150 -> %d, 90 -> %d сэмплов\n",
+                     peak120, peak150, peak90);
+
+        // Ручка Delay Time при этом не двигалась: сетка меняет эффективное время,
+        // а не значение параметра. Иначе смена темпа проекта дралась бы с автоматизацией
+        // хоста и затирала выставленное пользователем число (тот же довод, что у #17).
+        CHECK (getParam (proc, "delayTime") == 500.0f);
+    }
+
+    // Непрерывный разгон темпа при звучащем хвосте: так ведёт себя автоматизация темпа
+    // в проекте. Заодно это второй пункт ручной проверки — смена делителя на ходу.
+    //
+    // Критерий тут относительный, и это не послабление. Абсолютный порог по отношению
+    // выброса к процентилю зависит от материала: у стресс-теста фон 0,09 (два тона плюс
+    // все ручки в рывках), здесь один тон и фон 0,02, и то же самое отношение получается
+    // вчетверо больше на исправном плагине. Сравнивается поэтому едущий темп с тем же
+    // прогоном на стоячем: разница между ними и есть цена движения темпа.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+        constexpr int totalBlocks = 900;
+
+        const auto run = [&] (bool movingTempo, double* percentileOut)
+        {
+            MidiDelayProcessor proc;
+            engineDefaults (proc);
+            setParam (proc, "sync", 1.0f);
+            setParam (proc, "mix", 60.0f);
+
+            FixedTempoPlayHead playHead (125.0);
+            proc.setPlayHead (&playHead);
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            std::vector<float> steps;
+            steps.reserve (static_cast<size_t> (totalBlocks) * blockSize);
+
+            double phase = 0.0;
+            float previous = 0.0f;
+
+            for (int b = 0; b < totalBlocks; ++b)
+            {
+                // Темп ползёт 90 -> 160 и обратно: и разгон, и торможение.
+                if (movingTempo)
+                    playHead.bpm = 125.0 + 35.0 * std::sin (b * 0.01);
+
+                if (b % 120 == 60)   // делитель меняется поверх едущего темпа
+                    setParam (proc, "division", static_cast<float> (2 + (b / 120) % 10));
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = static_cast<float> (0.3 * std::sin (phase));
+                    phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                juce::MidiBuffer midi;
+
+                if (b % 20 == 0)
+                    midi.addEvent (juce::MidiMessage::noteOn (1, 60 + (b / 20) % 8, 0.9f), 0);
+
+                runBlock (proc, block, midi);
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float value = block.getSample (0, i);
+                    CHECK (std::isfinite (value));
+                    steps.push_back (std::abs (value - previous));
+                    previous = value;
+                }
+            }
+
+            const auto tail = steps.begin() + static_cast<long> (steps.size() * 999 / 1000);
+            std::nth_element (steps.begin(), tail, steps.end());
+
+            *percentileOut = *tail;
+            return static_cast<double> (*std::max_element (steps.begin(), steps.end()));
+        };
+
+        double movingFloor = 0.0, steadyFloor = 0.0;
+        const double moving = run (true,  &movingFloor);
+        const double steady = run (false, &steadyFloor);
+
+        const double movingRatio = moving / juce::jmax (1.0e-6, movingFloor);
+        const double steadyRatio = steady / juce::jmax (1.0e-6, steadyFloor);
+
+        std::printf ("  темп на ходу 90-160 BPM: отношение %.1f, тот же прогон на 125 BPM: %.1f\n",
+                     movingRatio, steadyRatio);
+
+        // Полтора раза — это запас на то, что едущая сетка сама по себе даёт больше
+        // разных времён, а значит больше стыков голосов. Настоящий разрыв от смены темпа
+        // выехал бы кратно: смена времени рвёт на всю амплитуду хвоста, а не на четверть.
+        CHECK (movingRatio < 1.5 * steadyRatio);
+    }
+
+    // --- Фабричные пресеты (#48) -----------------------------------------------
+    // Пресет — это не «набор красивых чисел», а обещание: выбрал имя — получил ровно
+    // тот звук, независимо от того, что стояло раньше. Проверяется само обещание:
+    // все названные значения доехали, всё неназванное вернулось к умолчанию,
+    // выбор переживает сохранение проекта и не щёлкает на звучащем хвосте.
+    {
+        MidiDelayProcessor proc;
+
+        // Плагин открывается на Chord Pad, а не на тихом подкладе — это и есть #48.
+        CHECK (proc.getNumPrograms() == 6);
+        CHECK (proc.getCurrentProgram() == 0);
+        CHECK (proc.getProgramName (0) == "Chord Pad");
+        CHECK (getParam (proc, "timeMode") > 0.5f);    // Follow
+        CHECK (getParam (proc, "mix") == 70.0f);
+        CHECK (getParam (proc, "feedback") == 0.0f);
+
+        // Ни один пресет не задаёт время миллисекундами: 857 мс верны ровно при
+        // 140 BPM и врут при любом другом темпе проекта. Время — только делителем.
+        // Проверяется тем, что delayTime после любого пресета равен умолчанию.
+        const float defaultDelay = 500.0f;
+
+        for (int i = 0; i < proc.getNumPrograms(); ++i)
+        {
+            proc.setCurrentProgram (i);
+            CHECK (proc.getCurrentProgram() == i);
+            CHECK (proc.getProgramName (i).isNotEmpty());
+            CHECK (getParam (proc, "delayTime") == defaultDelay);
+
+            // Имена в UI только ASCII (CLAUDE.md): кириллица в окне рассыпается.
+            for (auto c : proc.getProgramName (i))
+                CHECK (c >= 32 && c < 127);
+        }
+
+        // Пресет — снимок целиком. Ghost Choir поднимает release до 1500 и режет верх;
+        // после него Arp Echo обязан звучать ровно так же, как на свежем экземпляре,
+        // а не тащить чужой хвост. Это единственное место, где ошибка была бы не видна
+        // глазами: параметр, который пресет не называет, просто остался бы чужим.
+        proc.setCurrentProgram (3);                    // Ghost Choir
+        CHECK (getParam (proc, "release") == 1500.0f);
+        CHECK (getParam (proc, "filterHi") == 6000.0f);
+
+        proc.setCurrentProgram (1);                    // Arp Echo
+        CHECK (getParam (proc, "release") == 300.0f);  // умолчание вернулось
+        CHECK (getParam (proc, "filterHi") == 12000.0f);
+        CHECK (getParam (proc, "feedback") == 45.0f);  // а своё встало
+        CHECK (getParam (proc, "division") == 7.0f);   // 1/8.
+        CHECK (getParam (proc, "sync") > 0.5f);
+
+        // Обход — состояние пользователя, а не звука: пресет его не трогает.
+        // Иначе выбор пресета на выключенном плагине включал бы его молча.
+        setParam (proc, "bypass", 1.0f);
+        proc.setCurrentProgram (4);
+        CHECK (getParam (proc, "bypass") > 0.5f);
+        setParam (proc, "bypass", 0.0f);
+
+        // Индекс за границами списка не должен ни падать, ни менять звук.
+        proc.setCurrentProgram (99);
+        CHECK (proc.getCurrentProgram() == 4);
+        CHECK (proc.getProgramName (99).isEmpty());
+
+        // Выбор переживает сохранение и загрузку проекта. Параметры едут сами через
+        // APVTS, а вот индекс — отдельным полем, иначе окно после загрузки показывало бы
+        // чужое имя. И наоборот: загрузка не имеет права звать applyPreset, иначе
+        // подкрученное после выбора пресета затиралось бы при каждом открытии проекта.
+        proc.setCurrentProgram (5);                    // Dense Rap
+        setParam (proc, "mix", 33.0f);                 // и рука пользователя поверх
+
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+
+        MidiDelayProcessor restored;
+        engineDefaults (restored);
+        restored.setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+
+        CHECK (restored.getCurrentProgram() == 5);
+        CHECK (getParam (restored, "mix") == 33.0f);   // рука пользователя пережила
+        CHECK (getParam (restored, "ducking") == 80.0f);
+        CHECK (getParam (restored, "division") == 0.0f);
+    }
+
+    // Смена пресета на звучащем хвосте. Пресет двигает два десятка параметров разом —
+    // это худший случай для всего, что включается по месту, и сессия 14 нашла ровно
+    // такой разрыв у фильтров петли. Детектор тот же, что в стресс-тесте: отношение
+    // худшего шага к 99,9-му процентилю, а не голый максимум.
+    //
+    // Chord Pad (пресет 0) в перебор не входит: он единственный меняет Time Mode,
+    // а смена Time Mode — объявленный разрыв (ADR 0006, ревизия в разделе анти-клика).
+    // Прятать его нечем: в этот момент меняется репортуемая хосту латентность,
+    // и хост сам пересобирает конвейер.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+        constexpr int totalBlocks = 900;               // ~9,6 с
+
+        MidiDelayProcessor proc;
+        engineDefaults (proc);
+        proc.setPlayConfigDetails (2, 2, sr, blockSize);
+        proc.prepareToPlay (sr, blockSize);
+
+        juce::AudioBuffer<float> block (2, blockSize);
+        std::vector<float> steps;
+        steps.reserve (static_cast<size_t> (totalBlocks) * blockSize);
+
+        double phase = 0.0;
+        float previous = 0.0f;
+        int nextPreset = 1;
+
+        for (int b = 0; b < totalBlocks; ++b)
+        {
+            for (int i = 0; i < blockSize; ++i)
+            {
+                const auto v = static_cast<float> (0.3 * std::sin (phase));
+                phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                block.setSample (0, i, v);
+                block.setSample (1, i, v);
+            }
+
+            juce::MidiBuffer midi;
+
+            if (b % 30 == 0)
+                midi.addEvent (juce::MidiMessage::noteOn (1, 60 + (b / 30) % 12, 0.9f), 0);
+
+            // Пресет меняется чаще, чем нота успевает отзвучать: хвост в этот момент
+            // заведомо звучит, иначе замер мерил бы тишину.
+            if (b % 50 == 25)
+            {
+                proc.setCurrentProgram (nextPreset);
+                nextPreset = 1 + (nextPreset % 5);     // 1..5, без Chord Pad
+            }
+
+            runBlock (proc, block, midi);
+            CHECK (allocations.load() == 0);
+
+            for (int i = 0; i < blockSize; ++i)
+            {
+                const float value = block.getSample (0, i);
+                CHECK (std::isfinite (value));
+                steps.push_back (std::abs (value - previous));
+                previous = value;
+            }
+        }
+
+        const auto tail = steps.begin() + static_cast<long> (steps.size() * 999 / 1000);
+        std::nth_element (steps.begin(), tail, steps.end());
+
+        const double percentile = *tail;
+        const double worst = *std::max_element (steps.begin(), steps.end());
+        const double ratio = worst / juce::jmax (1.0e-6, percentile);
+
+        std::printf ("  смена пресета на хвосте: худший шаг %.4f, 99,9%% %.4f, отношение %.1f\n",
+                     worst, percentile, ratio);
+
+        // Порог тот же, что в стресс-тесте всех разрывов: там на исправном плагине
+        // отношение держится около 5, и 8 оставляет запас, но ловит настоящий выброс.
+        CHECK (ratio < 8.0);
     }
 
     std::printf ("test_processor: OK\n");

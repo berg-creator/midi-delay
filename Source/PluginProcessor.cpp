@@ -1,6 +1,89 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
+namespace
+{
+    /** Один параметр пресета: идентификатор и значение в тех же единицах, что в окне —
+        миллисекунды, проценты, герцы, индекс списка. Не нормализованное 0..1: сверять
+        такую таблицу с STRATEGY.md §5 глазами было бы невозможно. */
+    struct Setting { const char* id; float value; };
+
+    /** Порядок пресетов — он же порядок в меню хоста, и нулевой открывается по умолчанию.
+        Сначала четыре «по звуку» из STRATEGY.md §5, потом два «по материалу» (#48):
+        разрез по материалу появился в сессии 13, когда те же настройки, перенесённые
+        с распевного вокала на плотную читку, дали кашу. Материал диктует настройки
+        сильнее, чем вкус, и одним рядом «по звуку» не обойтись.
+
+        Время задано делителем (`division`), а не миллисекундами. Это не стиль: 857 мс
+        верны ровно при 140 BPM и врут при любом другом темпе проекта, а нотная
+        длительность едет за темпом сама (#20).
+
+        Чего в таблице нет — то стоит по умолчанию: applyPreset сначала возвращает
+        все параметры к значениям по умолчанию и только потом кладёт эти. */
+
+    // Держишь аккорд — слог становится пэдом. Follow: хвост поёт то, что звучит прямо
+    // сейчас, поэтому delay time здесь не при чём и остаётся по умолчанию.
+    // Латентность в Follow просится у хоста — это объявленное исключение (ADR 0006),
+    // и пресет по умолчанию наследует его вместе с режимом.
+    const Setting chordPad[] {
+        { "timeMode", 1 }, { "mix", 70 }, { "attack", 60 }, { "release", 800 },
+        { "voices", 8 }, { "feedback", 0 }, { nullptr, 0 }
+    };
+
+    // Эхо не повторяет ноту, а арпеджирует по сыгранному. Пунктирная восьмая уводит
+    // повторы с сетки долей — на ней слышно, что повторяется мелодия, а не сигнал.
+    const Setting arpEcho[] {
+        { "timeMode", 0 }, { "sync", 1 }, { "division", 7 }, { "feedback", 45 },
+        { "voices", 8 }, { "attack", 1 }, { nullptr, 0 }
+    };
+
+    // Суб-октава на слоге. Root Key вверху списка (B): тогда почти всё, что играется
+    // на клавиатуре, лежит ниже унисона и уходит вниз. Pitch Range 24 — чтобы две
+    // октавы вниз были достижимы, Low Cut выключен — иначе низ и срезался бы.
+    const Setting octaveDrop[] {
+        { "rootKey", 11 }, { "pitchRange", 24 }, { "mix", 60 }, { "filterLo", 20 },
+        { nullptr, 0 }
+    };
+
+    // Размазанный хор по бокам. High Cut 6 кГц убирает из хвоста согласные, и он
+    // перестаёт спорить с сухим за разборчивость.
+    const Setting ghostChoir[] {
+        { "quality", 1 }, { "width", 100 }, { "mix", 45 }, { "release", 1500 },
+        { "filterHi", 6000 }, { nullptr, 0 }
+    };
+
+    // Разрез по материалу, половина первая: распевный вокал. Числа не выдуманы —
+    // это тот самый набор, про который пользователь сказал «вообще топчик, вроде то,
+    // что я и задумывал изначально» (сессия 13, таблица в ISSUES #48). Полтакта там
+    // было записано как 857 мс при 140 BPM, то есть половинная.
+    const Setting sungVocal[] {
+        { "sync", 1 }, { "division", 2 }, { "mix", 40 }, { "feedback", 15 },
+        { "ducking", 50 }, { "pingPong", 1 }, { "width", 150 }, { nullptr, 0 }
+    };
+
+    // Половина вторая: плотная читка. Слоги идут вчетверо чаще, и всё, что работало
+    // на распевном, накладывается само на себя. Лечится не тембром, а разрежением:
+    // целый такт вместо полтакта, один повтор без обратной связи, тихо и глубоко
+    // приседая под сухим. Проверено рендерами сессии 14 — «оба варианта чёткие».
+    // Width 100, а не 150: читка идёт в клуб и в радио, а ping-pong на широком Width
+    // роняет моно-сумму (замер в ISSUES #23).
+    const Setting denseRap[] {
+        { "sync", 1 }, { "division", 0 }, { "mix", 25 }, { "feedback", 0 },
+        { "ducking", 80 }, { "pingPong", 1 }, { "width", 100 }, { nullptr, 0 }
+    };
+
+    struct Preset { const char* name; const Setting* settings; };
+
+    const Preset presets[] {
+        { "Chord Pad",   chordPad },
+        { "Arp Echo",    arpEcho },
+        { "Octave Drop", octaveDrop },
+        { "Ghost Choir", ghostChoir },
+        { "Sung Vocal",  sungVocal },
+        { "Dense Rap",   denseRap },
+    };
+}
+
 MidiDelayProcessor::MidiDelayProcessor()
     : AudioProcessor (BusesProperties()
         .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
@@ -31,6 +114,12 @@ MidiDelayProcessor::MidiDelayProcessor()
     pFilterLo   = apvts.getRawParameterValue ("filterLo");
     pFilterHi   = apvts.getRawParameterValue ("filterHi");
     bypassParam = apvts.getParameter ("bypass");
+
+    // Плагин открывается на Chord Pad, а не на тихом подкладе: демо «послушайте,
+    // как почти ничего не изменилось» не существует (STRATEGY.md §3 и §5, #48).
+    // Значения по умолчанию самих параметров при этом не тронуты — они остаются тем,
+    // к чему возвращает хост по «сбросить параметр», и тем, от чего считает applyPreset.
+    applyPreset (0);
 }
 
 //==============================================================================
@@ -687,7 +776,21 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
 
             // Feedback снимается ДО питч-стадии: голоса читают уже записанное кольцо,
             // и транспонирование в петлю не попадает. Инвариант из CLAUDE.md.
-            float lineIn = dry + (delayed + blend * (diffused - delayed)) * feedback;
+            const float recirculated = (delayed + blend * (diffused - delayed)) * feedback;
+
+            // Мягкое ограничение в петле (#44). Стоит на одном лишь отводе обратной
+            // связи, а не на сумме с сухим, и это единственное место, где оно верно:
+            // на сумме оно красило бы и первый проход тоже, а критерий задачи требует
+            // положения органов, при котором хвост бит-в-бит чистый. На feedback 0
+            // отвод равен нулю ровно, и ограничитель не делает ничего вообще.
+            //
+            // Ручки Drive нарочно нет. Замер сессии 14 (#21) показал, что петля
+            // на 95 % идёт вниз, а не вразнос, — значит это не защита от разгона,
+            // а потолок на горячем материале, и ручке нечего было бы объяснять
+            // пользователю. Порог 0,7 нормальный хвост не задевает: там уровень
+            // круга около 0,33. ponytail: колено фиксировано; Drive как параметр —
+            // если по слуху окажется, что характер нужен, а не потолок.
+            float lineIn = dry + softLimit (recirculated);
 
             // Фильтры стоят на входе кольца, а не на выходе wet (#22). На выходе это
             // был бы просто эквалайзер; здесь первый хвост окрашен один раз, второй
@@ -820,10 +923,48 @@ double MidiDelayProcessor::getTailLengthSeconds() const
 }
 
 //==============================================================================
+int MidiDelayProcessor::getNumPrograms()
+{
+    return static_cast<int> (std::size (presets));
+}
+
+const juce::String MidiDelayProcessor::getProgramName (int index)
+{
+    return juce::isPositiveAndBelow (index, std::size (presets)) ? presets[index].name
+                                                                 : juce::String();
+}
+
+void MidiDelayProcessor::setCurrentProgram (int index)
+{
+    if (! juce::isPositiveAndBelow (index, std::size (presets)))
+        return;
+
+    currentProgram = index;
+    applyPreset (index);
+    updateHostDisplay();
+}
+
+void MidiDelayProcessor::applyPreset (int index)
+{
+    // Сначала всё к умолчаниям, потом настройки пресета поверх. Порядок важен:
+    // без сброса пресет читался бы как «поправки к тому, что стояло раньше»,
+    // и звучал бы по-разному в зависимости от того, откуда в него пришли.
+    for (auto* p : getParameters())
+        if (auto* withId = dynamic_cast<juce::AudioProcessorParameterWithID*> (p))
+            if (withId->paramID != "bypass")
+                p->setValueNotifyingHost (p->getDefaultValue());
+
+    for (const auto* setting = presets[index].settings; setting->id != nullptr; ++setting)
+        if (auto* param = apvts.getParameter (setting->id))
+            param->setValueNotifyingHost (param->convertTo0to1 (setting->value));
+}
+
+//==============================================================================
 void MidiDelayProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty ("stateVersion", stateVersion, nullptr);
+    state.setProperty ("preset", currentProgram, nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
@@ -839,7 +980,15 @@ void MidiDelayProcessor::setStateInformation (const void* data, int sizeInBytes)
 
     // Версия пока одна, и незнакомые поля APVTS игнорирует сама. Когда появится
     // вторая — развилка миграции встанет ровно сюда, до replaceState.
-    apvts.replaceState (juce::ValueTree::fromXml (*xml));
+    const auto state = juce::ValueTree::fromXml (*xml);
+
+    // Индекс пресета — только подпись в окне: сами параметры приезжают из состояния,
+    // и applyPreset здесь звать нельзя, иначе загрузка проекта затирала бы всё,
+    // что пользователь подкрутил после выбора пресета.
+    currentProgram = juce::jlimit (0, getNumPrograms() - 1,
+                                   static_cast<int> (state.getProperty ("preset", 0)));
+
+    apvts.replaceState (state);
 }
 
 //==============================================================================
