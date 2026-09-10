@@ -18,7 +18,13 @@ public:
     void prepare (double sampleRate, int maxBlockSamples);
     void reset();
 
-    void setDelaySamples (double delaySamples);   // латентность питчера вычитает голос
+    /** Время дилея для голосов, которые ещё не начались. Звучащих не трогает нарочно —
+        голос это отвод кольца, и сдвинуть его посреди ноты значит склеить два куска
+        звука встык. Замерено: смена делителя 1/8 -> 1/2 на звучащей ноте давала разрыв
+        0,84 при пороге 0,05, и вылезал он через латентность питчера после самой смены.
+        Новое время подхватывает следующая нота (#20, #25). Латентность питчера
+        вычитает голос. */
+    void setDelaySamples (double delaySamples);
     void setEnvelope (float attackMs, float releaseMs);
     void setVoiceLimit (int numVoices);           // параметр Voices, не больше maxVoices
     void setEngine (PitchEngine engine);          // Quality и режим Follow вместе

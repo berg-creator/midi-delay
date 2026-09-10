@@ -40,6 +40,10 @@ private:
     bool shownClamped = false;   // delay time сейчас подтянут до предела движка (#17)
     bool shownFollow = false;    // режим Follow: хвост стоит на ноте (ADR 0006)
     int shownAlignment = -1;     // сколько мс плагин просит скомпенсировать у хоста
+    bool shownSync = false;      // время задано нотной длительностью, а не ручкой (#20)
+    int shownDivision = -1;      // индекс делителя
+    int shownBpm = -1;           // темп хоста, округлённый: перерисовывать окно
+                                 // от дрожания в сотых долях BPM незачем
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiDelayEditor)
 };

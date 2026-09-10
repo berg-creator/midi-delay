@@ -37,10 +37,13 @@ void VoiceManager::reset()
 
 void VoiceManager::setDelaySamples (double newDelaySamples)
 {
+    // Только запоминается: раздача звучащим голосам была бы прыжком позиции чтения,
+    // то есть склейкой двух кусков кольца встык. Голос забирает это число один раз,
+    // в noteOn и в steal. Развилка описана в самой задаче #20: «либо с кроссфейдом,
+    // либо на границе следующей ноты» — кроссфейд стоил бы второго питчера на голос,
+    // а граница ноты бесплатна и для MIDI-ведомого дилея честнее: хвост, который
+    // уже поёт, не обязан перестраиваться под ручку, которую крутят прямо сейчас.
     delaySamples = newDelaySamples;
-
-    for (auto& v : voices)
-        v.setDelaySamples (newDelaySamples);
 }
 
 void VoiceManager::setEnvelope (float attackMs, float releaseMs)

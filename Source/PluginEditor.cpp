@@ -3,22 +3,22 @@
 namespace
 {
     /** Порядок органов в окне и он же порядок чтения слева направо. Список явный,
-        а не «все параметры подряд»: division заведён в APVTS, но ни к чему не
-        подключён (#20), и показывать мёртвую ручку — врать. Как только его
-        подключат, он встанет сюда одной строкой.
+        а не «все параметры подряд»: показывать орган, ни к чему не подключённый, —
+        врать. Sync и Note Division появились здесь в сессии 14 вместе с #20;
+        до этого division висел в APVTS мёртвым и потому в окно не выводился.
 
         Строки сгруппированы по смыслу: время, характер хвоста, выход, высота,
         огибающая. Это ещё не интерфейс (#26, #27), но покрутить уже можно осмысленно. */
     const char* const layout[] {
-        "timeMode",  "delayTime",  "midiOffset", "feedback",
-        "diffusion", "modulation", "filterLo",   "filterHi",
-        "width",     "pingPong",   "ducking",    "mix",
-        "outputGain","quality",    "formants",   "rootKey",
-        "pitchRange","voices",     "attack",     "release",
-        "bypass",
+        "timeMode",  "delayTime",  "sync",       "division",
+        "midiOffset","feedback",   "diffusion",  "modulation",
+        "filterLo",  "filterHi",   "width",      "pingPong",
+        "ducking",   "mix",        "outputGain", "quality",
+        "formants",  "rootKey",    "pitchRange", "voices",
+        "attack",    "release",    "bypass",
     };
 
-    constexpr int headerHeight = 114;
+    constexpr int headerHeight = 132;
     constexpr int cellWidth = 152;
     constexpr int cellHeight = 96;
     constexpr int columns = 4;
@@ -111,13 +111,19 @@ void MidiDelayEditor::timerCallback()
     const auto note  = proc.lastNote.load (std::memory_order_relaxed);
     const auto quality = static_cast<int> (proc.apvts.getRawParameterValue ("quality")
                                                ->load (std::memory_order_relaxed));
-    const auto clamped = proc.apvts.getRawParameterValue ("delayTime")
-                             ->load (std::memory_order_relaxed) < proc.getMinDelayMs();
+    // Сравнивается заказанное время, а не ручка: на Sync ручка стоит на месте,
+    // а под предел движка уезжает именно нотная длительность (#20 против #17).
+    const auto clamped = proc.requestedDelayMs() < proc.getMinDelayMs();
     const auto follow = proc.isFollowMode();
     const auto alignment = juce::roundToInt (proc.getAlignmentMs());
+    const auto sync = proc.isSyncMode();
+    const auto division = static_cast<int> (proc.apvts.getRawParameterValue ("division")
+                                                ->load (std::memory_order_relaxed));
+    const auto bpm = juce::roundToInt (proc.getSyncBpm());
 
     if (count != lastCount || note != shownNote || quality != shownQuality
-        || clamped != shownClamped || follow != shownFollow || alignment != shownAlignment)
+        || clamped != shownClamped || follow != shownFollow || alignment != shownAlignment
+        || sync != shownSync || division != shownDivision || bpm != shownBpm)
     {
         lastCount = count;
         shownNote = note;
@@ -125,6 +131,9 @@ void MidiDelayEditor::timerCallback()
         shownClamped = clamped;
         shownFollow = follow;
         shownAlignment = alignment;
+        shownSync = sync;
+        shownDivision = division;
+        shownBpm = bpm;
         repaint();
     }
 }
@@ -183,6 +192,19 @@ void MidiDelayEditor::paint (juce::Graphics& g)
     // В Follow движок свой и предела на время нет: там показывается то, что важно
     // именно в этом режиме, — сколько плагин просит скомпенсировать у хоста.
     // Если хост этого не делает, хвост уедет от сухого ровно на это число.
+    // Сетка. Без этой строки нотная длительность — это число, которое не с чем сверить:
+    // ни темпа не видно, ни того, во что он превратился в миллисекундах. Отдельная
+    // строка, а не хвост к строке движка, потому что предел движка (#17) на быстрых
+    // темпах и мелких делителях подтягивает время вверх, и оба числа надо видеть сразу.
+    g.setColour (juce::Colours::grey);
+    g.setFont (juce::FontOptions (12.0f));
+    g.drawText (shownSync
+                    ? "Sync: " + proc.apvts.getParameter ("division")->getCurrentValueAsText()
+                        + " at " + juce::String (proc.getSyncBpm(), 1) + " BPM = "
+                        + juce::String (proc.requestedDelayMs(), 1) + " ms"
+                    : "Sync: off - delay time set in ms",
+                header.removeFromTop (17), juce::Justification::centredLeft, false);
+
     const auto minDelay = proc.getMinDelayMs();
     auto engineText = juce::String (shownFollow ? "Mode: Follow - tail sits on the note"
                                     : shownQuality > 0 ? "Mode: Free - HQ (Signalsmith)"

@@ -8,6 +8,8 @@ MidiDelayProcessor::MidiDelayProcessor()
       apvts (*this, nullptr, "MidiDelayState", createParameterLayout())
 {
     pDelayTime  = apvts.getRawParameterValue ("delayTime");
+    pSync       = apvts.getRawParameterValue ("sync");
+    pDivision   = apvts.getRawParameterValue ("division");
     pFeedback   = apvts.getRawParameterValue ("feedback");
     pMix        = apvts.getRawParameterValue ("mix");
     pOutputGain = apvts.getRawParameterValue ("outputGain");
@@ -48,18 +50,34 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
     params.push_back (std::make_unique<AudioParameterBool> (
         ParameterID { "bypass", 1 }, "Bypass", false));
 
+    // 500 мс, а не 400: при 120 BPM это ровно четверть. Прежние 400 не попадали
+    // ни в одну сетку (восьмая 250, четверть 500), то есть значение по умолчанию
+    // промахивалось мимо главного сценария плагина. Теперь выключение Sync при
+    // 120 BPM оставляет ровно то же время, и переключатель не двигает звук.
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "delayTime", 1 }, "Delay Time",
-        Range { 1.0f, 2000.0f, 0.01f, 0.35f }, 400.0f,
+        Range { 1.0f, 2000.0f, 0.01f, 0.35f }, 500.0f,
         AudioParameterFloatAttributes().withLabel ("ms")));
 
     // Режим времени. Free — обычный дилей. Follow — хвост поёт то, что звучит прямо
     // сейчас: мелодия повторяется нота в ноту, латентность питчера уходит в репорт
-    // хосту (ADR 0006). Tempo Sync встанет сюда третьим пунктом задачей #20.
+    // хосту (ADR 0006).
     params.push_back (std::make_unique<AudioParameterChoice> (
         ParameterID { "timeMode", 1 }, "Time Mode",
         StringArray { "Free", "Follow" }, 0));
 
+    // Tempo Sync (#20) — галка, а не третий пункт Time Mode. Разбор развилки в issue;
+    // коротко: Sync отвечает на вопрос «чем задано время», Time Mode — на вопрос
+    // «откуда хвост читает», и это разные вопросы. Третий пункт списка запретил бы
+    // Follow вместе с сеткой, хотя интервал повторов обратной связи в Follow есть
+    // и держать его нотной длительностью осмысленно ровно так же, как в Free.
+    // Включена по умолчанию: сценарий, ради которого плагин задуман, ритмический —
+    // хвост обязан попадать в сетку трека, а не «примерно туда».
+    params.push_back (std::make_unique<AudioParameterBool> (
+        ParameterID { "sync", 1 }, "Tempo Sync", true));
+
+    // Порядок значений и таблица divisionBeats в заголовке — одно целое: индекс
+    // отсюда идёт туда напрямую. Менять только вместе.
     params.push_back (std::make_unique<AudioParameterChoice> (
         ParameterID { "division", 1 }, "Note Division",
         StringArray { "1/1", "1/2.", "1/2", "1/2T", "1/4.", "1/4", "1/4T",
@@ -243,10 +261,19 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     duckDepthSmoothed.reset (currentSampleRate, smoothingSeconds);
     loCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
     hiCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
+    loMixSmoothed.reset (currentSampleRate, smoothingSeconds);
+    hiMixSmoothed.reset (currentSampleRate, smoothingSeconds);
+
+    // Темп снимается уже здесь, а не только в первом блоке. Иначе первый блок
+    // отработал бы на фолбэке, и на больших размерах блока это слышно: голос берёт
+    // позицию чтения один раз на сегмент, и хвост выходит дважды — по старому
+    // времени и по новому. Хост отдавать playhead в prepare не обязан; если не отдал,
+    // всё как было, и первый блок поправит сам.
+    refreshHostBpm();
 
     // Первый блок после prepare не должен въезжать в значения рампой.
     delaySamplesSmoothed.setCurrentAndTargetValue (
-        static_cast<float> (juce::jmax (pDelayTime->load() * 0.001 * currentSampleRate,
+        static_cast<float> (juce::jmax (requestedDelayMs() * 0.001 * currentSampleRate,
                                         getMinDelayMs() * 0.001 * currentSampleRate)));
     mixSmoothed.setCurrentAndTargetValue (pMix->load() * 0.01f);
     gainSmoothed.setCurrentAndTargetValue (
@@ -257,6 +284,8 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     duckDepthSmoothed.setCurrentAndTargetValue (pDucking->load() * 0.01f);
     loCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterLo->load()));
     hiCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterHi->load()));
+    loMixSmoothed.setCurrentAndTargetValue (pFilterLo->load() > filterLoOff ? 1.0f : 0.0f);
+    hiMixSmoothed.setCurrentAndTargetValue (pFilterHi->load() < filterHiOff ? 1.0f : 0.0f);
 
     // В Free с неотрицательным офсетом здесь ноль, и инвариант ANALYSIS §5 цел:
     // латентность питчера вычитается из позиции чтения, а не выставляется хосту.
@@ -288,6 +317,21 @@ float MidiDelayProcessor::onePoleCoeff (float frequencyHz) const
                                    * juce::jmax (0.0f, frequencyHz) / currentSampleRate);
 
     return static_cast<float> (juce::jlimit (0.0, 1.0, a));
+}
+
+void MidiDelayProcessor::refreshHostBpm()
+{
+    // Ничего не пишется, пока хост не дал осмысленного числа, — тогда держится
+    // последнее известное: хост, переставший отдавать темп на паузе, не должен
+    // ронять сетку на фолбэк посреди хвоста. Сам фолбэк живёт в начальном значении
+    // hostBpm: в Standalone playhead нет вовсе, и без него тут было бы деление на ноль.
+    // Границы 20..999 — это граница доверия к хосту, а не вкусовщина: темп 0 или
+    // отрицательный уронил бы сетку в бесконечность, и молча.
+    if (auto* playHead = getPlayHead())
+        if (const auto position = playHead->getPosition())
+            if (const auto bpm = position->getBpm())
+                if (*bpm > 0.0)
+                    hostBpm.store (juce::jlimit (20.0, 999.0, *bpm), std::memory_order_relaxed);
 }
 
 double MidiDelayProcessor::engineLatencyMs() const
@@ -327,6 +371,25 @@ int MidiDelayProcessor::getUnisonNote() const
 bool MidiDelayProcessor::isFollowMode() const
 {
     return pTimeMode->load (std::memory_order_relaxed) > 0.5f;
+}
+
+bool MidiDelayProcessor::isSyncMode() const
+{
+    return pSync->load (std::memory_order_relaxed) > 0.5f;
+}
+
+double MidiDelayProcessor::requestedDelayMs() const
+{
+    if (! isSyncMode())
+        return pDelayTime->load (std::memory_order_relaxed);
+
+    // Кламп индекса — не паранойя: значение приезжает из состояния проекта, а список
+    // делителей когда-нибудь укоротится, и читать за конец таблицы из-за старого
+    // пресета плагин не должен.
+    const int index = juce::jlimit (0, static_cast<int> (std::size (divisionBeats)) - 1,
+                                    static_cast<int> (pDivision->load (std::memory_order_relaxed)));
+
+    return divisionBeats[index] * 60000.0 / hostBpm.load (std::memory_order_relaxed);
 }
 
 double MidiDelayProcessor::getAlignmentMs() const
@@ -377,6 +440,10 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     const float feedback = pFeedback->load (std::memory_order_relaxed) * 0.01f;
 
+    // Темп хоста для Sync (#20). Снимается каждый блок: темп автоматизируют, и сетка
+    // обязана ехать вместе с ним.
+    refreshHostBpm();
+
     // Режим и Quality снимаются до delay time: предел на время — функция движка (#17),
     // а движок в Follow навязан режимом, а не параметром качества.
     const bool follow = isFollowMode();
@@ -420,8 +487,17 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     // В Follow предела нет: голос читает кольцо по выравниванию, а delay time там задаёт
     // только интервал повторов обратной связи.
     delaySamplesSmoothed.setTargetValue (static_cast<float> (juce::jmax (
-        pDelayTime->load (std::memory_order_relaxed) * 0.001 * currentSampleRate,
+        requestedDelayMs() * 0.001 * currentSampleRate,
         getMinDelayMs() * 0.001 * currentSampleRate)));
+
+    // Время для нот, которые начнутся в этом блоке. Раз на блок, до разбора MIDI:
+    // нота, пришедшая нулевым сэмплом, случается раньше первого renderSegment,
+    // и снятое там значение до неё бы не доехало. Звучащих голосов это не касается —
+    // они забрали своё в noteOn и держат до конца ноты (VoiceManager::setDelaySamples).
+    // Внутри блока значение не обновляется: разница за один блок — это доля рампы
+    // в 50 мс, и она есть только пока ручку крутят.
+    voiceManager.setDelaySamples (blockAlignment
+                                  + (follow ? 0.0 : delaySamplesSmoothed.getCurrentValue()));
 
     mixSmoothed.setTargetValue (pMix->load (std::memory_order_relaxed) * 0.01f);
     gainSmoothed.setTargetValue (juce::Decibels::decibelsToGain (
@@ -433,8 +509,8 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     const float loHz = pFilterLo->load (std::memory_order_relaxed);
     const float hiHz = pFilterHi->load (std::memory_order_relaxed);
 
-    blockUseLo = loHz > filterLoOff;
-    blockUseHi = hiHz < filterHiOff;
+    loMixSmoothed.setTargetValue (loHz > filterLoOff ? 1.0f : 0.0f);
+    hiMixSmoothed.setTargetValue (hiHz < filterHiOff ? 1.0f : 0.0f);
 
     diffusionSmoothed.setTargetValue (pDiffusion->load (std::memory_order_relaxed) * 0.01f);
     modDepthSmoothed.setTargetValue (pModulation->load (std::memory_order_relaxed) * 0.01f);
@@ -534,15 +610,11 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
                                         int startSample, int numSamples,
                                         int numChannels, float feedback)
 {
-    // Значение снимается на границе сегмента, а не по сэмплу: голос читает кольцо
-    // блоком, одним смещением на весь сегмент. При статичном delay time это то же
-    // самое число, и результат не зависит от размера блока.
-    // Позиция чтения голоса = выравнивание + время дилея; латентность питчера
-    // вычтет сам голос. В Follow времени нет: голос читает ровно то, что звучит
-    // сейчас, и весь его отступ — это выравнивание (ADR 0006).
-    voiceManager.setDelaySamples (blockAlignment
-                                  + (blockFollow ? 0.0 : delaySamplesSmoothed.getCurrentValue()));
-
+    // Позиция чтения голоса = выравнивание + время дилея; латентность питчера вычтет
+    // сам голос. В Follow времени нет: голос читает ровно то, что звучит сейчас,
+    // и весь его отступ — это выравнивание (ADR 0006). Раздаётся это число раз
+    // на блок, в processBlock, а не здесь: с сессии 14 голос забирает его в noteOn
+    // и до конца ноты не меняет.
     const float* const* linePointers = lineInput.getArrayOfReadPointers();
     const int end = startSample + numSamples;
 
@@ -591,6 +663,8 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
 
         const float loCoeff = loCoeffSmoothed.getNextValue();
         const float hiCoeff = hiCoeffSmoothed.getNextValue();
+        const float loMix = loMixSmoothed.getNextValue();
+        const float hiMix = hiMixSmoothed.getNextValue();
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
@@ -620,17 +694,22 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             // два, и хвост темнеет с каждым кругом — то, ради чего фильтры в дилее
             // и нужны. Однополюсные и без резонанса: резонансный биквад в петле
             // при feedback 95 % — классический способ получить свист.
-            if (blockUseHi)
-            {
-                hiState[ch] += hiCoeff * (lineIn - hiState[ch]);
-                lineIn = hiState[ch];
-            }
+            // Однополюсники крутятся всегда, даже когда ручка на краю и фильтр обойдён,
+            // а подмешивается результат множителем. Две разные вещи, и обе нужны.
+            // Крутятся — чтобы состояние не застаивалось: замороженное держит кусок
+            // звука, который был в петле минуту назад, и в момент возврата фильтра
+            // вычитается именно он. Множитель — чтобы возврат не был мгновенным:
+            // булев обход переключался на границе блока разом, и вход кольца прыгал
+            // ровно на loState. Замер #25 на рывках Low Cut: шаг 0,28 при фоне 0,013,
+            // отношение 22 против полутора у всех прочих параметров. Наружу это
+            // выезжало через голос, то есть позже и не на границе блока, — оттого
+            // и выглядело как склейка посреди хвоста, а не как щелчок фильтра.
+            // На нуле множителя выход бит-в-бит прежний: «выключено» значит выключено.
+            hiState[ch] += hiCoeff * (lineIn - hiState[ch]);
+            lineIn += hiMix * (hiState[ch] - lineIn);
 
-            if (blockUseLo)
-            {
-                loState[ch] += loCoeff * (lineIn - loState[ch]);
-                lineIn -= loState[ch];
-            }
+            loState[ch] += loCoeff * (lineIn - loState[ch]);
+            lineIn -= loMix * loState[ch];
 
             lineInput.setSample (ch, i, lineIn);
         }
@@ -717,7 +796,10 @@ double MidiDelayProcessor::getMinDelayMs() const
 
 double MidiDelayProcessor::getTailLengthSeconds() const
 {
-    const double delaySeconds = pDelayTime->load (std::memory_order_relaxed) * 0.001;
+    // От заказанного, а не от ручки: на Sync ручка может стоять где угодно, а хвост
+    // длится столько, сколько велит сетка. Кламп на предел движка тут не нужен —
+    // подтягивание времени вверх хвост только укорачивает относительно оценки.
+    const double delaySeconds = requestedDelayMs() * 0.001;
     const double feedback     = pFeedback->load (std::memory_order_relaxed) * 0.01;
 
     // Сколько кругов до -60 dB: feedback^n = 0.001. При нулевом feedback круг ровно один.
