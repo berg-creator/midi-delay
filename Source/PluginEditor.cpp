@@ -87,6 +87,18 @@ namespace
         return height;
     }
 
+    /** Базовый размер окна: раскладка считается в нём всегда, а ресайз (#29) только
+        масштабирует готовое. 672 x 766 — то, что пользователь посмотрел на снимках
+        сессии 16 и признал нормальным (ISSUES #26, «Вердикт по снимкам»). */
+    int baseWidth()  { return columns * cellWidth + 2 * margin; }
+    int baseHeight() { return headerHeight + laneHeight + laneGap + layoutHeight() + margin; }
+
+    /** Пределы масштаба. Снизу 0,75: подписи набраны 11,5 пункта, и ниже этого они
+        превращаются в серую рябь. Сверху 1,5: 1008 x 1149 — уже больше высоты
+        ноутбучного экрана, и дальше окно просто не поместится. */
+    constexpr float minScale = 0.75f;
+    constexpr float maxScale = 1.5f;
+
     bool isBlackKey (int note) noexcept
     {
         switch (note % 12)
@@ -244,6 +256,16 @@ void BergLookAndFeel::drawComboBox (juce::Graphics& g, int width, int height, bo
 NoteLane::NoteLane (MidiDelayProcessor& p) : proc (p)
 {
     setInterceptsMouseClicks (false, false);
+
+    // Снимок берётся сразу, а не с первым тиком: до него поля shown* держат значения,
+    // с которых начинались, и лента рисует «MIDI не доехал» поверх звучащего аккорда.
+    // В хосте это один кадр из тридцати и не видно, а в снимке окна (--shot) кадр
+    // ровно один — сессия 17 поймала на этом два кадра из четырёх.
+    //
+    // Это та же ловушка, что #27 нашла в редакторе: там paint читает состояние прямо
+    // у процессора. Здесь так нельзя — кэш ленты держит гаснущие уровни хвостов,
+    // то есть он не только детектор перерисовки, — поэтому лечится заполнением.
+    timerCallback();
     startTimerHz (30);
 }
 
@@ -468,15 +490,40 @@ MidiDelayEditor::MidiDelayEditor (MidiDelayProcessor& p)
         // не расходится с этим списком.
         proc.setCurrentProgram (presetBox.getSelectedItemIndex());
     };
-    addAndMakeVisible (presetBox);
-    addAndMakeVisible (lane);
+    addAndMakeVisible (content);
+    content.addAndMakeVisible (presetBox);
+    content.addAndMakeVisible (lane);
 
     for (const auto& slot : layout)
         if (addControl (slot.id))
             controlGroups.add (slot.group);
 
-    setSize (columns * cellWidth + 2 * margin,
-             headerHeight + laneHeight + laneGap + layoutHeight() + margin);
+    // Ресайз (#29). Соотношение сторон закреплено: раскладка масштабируется целиком,
+    // и окно другой пропорции показывало бы её растянутой, а не перестроенной.
+    //
+    // Сохранённый масштаб снимается здесь, до setResizeLimits, и это не стиль:
+    // setResizeLimits внутри зовёт setBoundsConstrained на текущих (нулевых) границах,
+    // окно на миг становится минимальным, resized успевает записать 0.75 в процессор —
+    // и прочитанный после него «сохранённый» масштаб оказывается только что затёртым.
+    // Окно открывалось минимальным всегда, независимо от состояния.
+    const auto saved = juce::jlimit (minScale, maxScale, proc.editorScale);
+
+    setResizable (true, true);
+    setResizeLimits (juce::roundToInt (baseWidth()  * minScale),
+                     juce::roundToInt (baseHeight() * minScale),
+                     juce::roundToInt (baseWidth()  * maxScale),
+                     juce::roundToInt (baseHeight() * maxScale));
+
+    // Соотношение ставится после пределов, а не до: setResizeLimits трогает тот же
+    // самый ограничитель по умолчанию и зовёт setBoundsConstrained на текущих
+    // (то есть нулевых) границах.
+    if (auto* c = getConstrainer())
+        c->setFixedAspectRatio (static_cast<double> (baseWidth()) / baseHeight());
+
+    // Размер берётся из состояния плагина, а не сбрасывается на базовый: окно,
+    // забывающее свой размер при каждом открытии, — это ровно то, на что жалуются.
+    setSize (juce::roundToInt (baseWidth() * saved),
+             juce::roundToInt (baseHeight() * saved));
 
     // Разложить контекст сразу, а не ждать первого тика: окно открывается уже верным.
     refreshContext();
@@ -503,14 +550,14 @@ bool MidiDelayEditor::addControl (const juce::String& parameterId)
     caption->setJustificationType (juce::Justification::centred);
     caption->setColour (juce::Label::textColourId, textColour);
     caption->setFont (juce::FontOptions (11.5f));
-    addAndMakeVisible (caption);
+    content.addAndMakeVisible (caption);
 
     if (auto* choice = dynamic_cast<juce::AudioParameterChoice*> (param))
     {
         auto* box = new juce::ComboBox();
         box->addItemList (choice->choices, 1);
         controls.add (box);
-        addAndMakeVisible (box);
+        content.addAndMakeVisible (box);
         comboLinks.add (new juce::AudioProcessorValueTreeState::ComboBoxAttachment (
             proc.apvts, parameterId, *box));
         return true;
@@ -522,7 +569,7 @@ bool MidiDelayEditor::addControl (const juce::String& parameterId)
         // а «on» рядом с ним — это то же слово дважды.
         auto* toggle = new juce::ToggleButton();
         controls.add (toggle);
-        addAndMakeVisible (toggle);
+        content.addAndMakeVisible (toggle);
         buttonLinks.add (new juce::AudioProcessorValueTreeState::ButtonAttachment (
             proc.apvts, parameterId, *toggle));
         return true;
@@ -537,7 +584,7 @@ bool MidiDelayEditor::addControl (const juce::String& parameterId)
     // слайдера, а не у LookAndFeel: поставленный там transparent до него не доезжает.
     slider->setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
     controls.add (slider);
-    addAndMakeVisible (slider);
+    content.addAndMakeVisible (slider);
     sliderLinks.add (new juce::AudioProcessorValueTreeState::SliderAttachment (
         proc.apvts, parameterId, *slider));
     return true;
@@ -588,11 +635,25 @@ void MidiDelayEditor::setContext (const juce::String& parameterId, bool inert,
 
 void MidiDelayEditor::resized()
 {
+    // Масштаб задаётся шириной: высота привязана к ней закреплённым соотношением,
+    // и считать его по обеим сторонам значит получить два слегка разных числа.
+    const auto scale = static_cast<float> (getWidth()) / static_cast<float> (baseWidth());
+
+    content.setBounds (0, 0, baseWidth(), baseHeight());
+    content.setTransform (juce::AffineTransform::scale (scale));
+
+    // Размер запоминается сразу, а не по закрытию окна: закрытия может и не быть —
+    // проект сохраняют с открытым окном чаще, чем с закрытым.
+    proc.editorScale = juce::jlimit (minScale, maxScale, scale);
+}
+
+void MidiDelayEditor::layoutContent()
+{
     // Список пресетов — в шапке справа, на одной строке с названием плагина:
     // это первое, что трогают, и оно не должно теряться в сетке одинаковых ручек.
-    presetBox.setBounds (getWidth() - margin - 210, margin, 210, 26);
+    presetBox.setBounds (baseWidth() - margin - 210, margin, 210, 26);
 
-    lane.setBounds (margin, headerHeight, getWidth() - 2 * margin, laneHeight);
+    lane.setBounds (margin, headerHeight, baseWidth() - 2 * margin, laneHeight);
 
     bands.clearQuick();
 
@@ -610,7 +671,7 @@ void MidiDelayEditor::resized()
         const int rows = (count + columns - 1) / columns;
 
         bands.add (GroupBand { juce::String (bands.size() + 1) + "  " + group.toUpperCase(),
-                               { margin, y, getWidth() - 2 * margin,
+                               { margin, y, baseWidth() - 2 * margin,
                                  bandHeader + rows * cellHeight } });
 
         y += bandHeader;
@@ -681,9 +742,17 @@ void MidiDelayEditor::timerCallback()
 
 void MidiDelayEditor::paint (juce::Graphics& g)
 {
+    // Слой закрывает окно целиком, но округление масштаба может оставить по краю
+    // полоску в пиксель. Она должна быть цветом фона, а не дырой в окне.
+    g.fillAll (bgColour);
+}
+
+void MidiDelayEditor::paintContent (juce::Graphics& g)
+{
     g.fillAll (bgColour);
 
-    auto header = getLocalBounds().removeFromTop (headerHeight).reduced (margin, 10);
+    auto header = juce::Rectangle<int> (baseWidth(), baseHeight())
+                      .removeFromTop (headerHeight).reduced (margin, 10);
 
     g.setColour (textColour);
     g.setFont (juce::FontOptions (20.0f, juce::Font::bold));

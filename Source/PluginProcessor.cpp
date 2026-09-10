@@ -64,9 +64,12 @@ namespace
     // это тот самый набор, про который пользователь сказал «вообще топчик, вроде то,
     // что я и задумывал изначально» (сессия 13, таблица в ISSUES #48). Полтакта там
     // было записано как 857 мс при 140 BPM, то есть половинная.
+    // Width 100, а не 150: вердикт сессии 17 (ISSUES #23). Вопрос был задан прямо —
+    // ширина или моносовместимость, — и выбрана моносовместимость. Потеря в моно
+    // падает с 1,61 dB до 0,69 dB, разлёт остаётся: его делает ping-pong, а не Width.
     const Setting sungVocal[] {
         { "sync", 1 }, { "division", 2 }, { "mix", 40 }, { "feedback", 15 },
-        { "ducking", 50 }, { "pingPong", 1 }, { "width", 150 }, { nullptr, 0 }
+        { "ducking", 50 }, { "pingPong", 1 }, { "width", 100 }, { nullptr, 0 }
     };
 
     // Половина вторая: плотная читка. Слоги идут вчетверо чаще, и всё, что работало
@@ -989,6 +992,7 @@ void MidiDelayProcessor::getStateInformation (juce::MemoryBlock& destData)
     auto state = apvts.copyState();
     state.setProperty ("stateVersion", stateVersion, nullptr);
     state.setProperty ("preset", currentProgram, nullptr);
+    state.setProperty ("editorScale", editorScale, nullptr);
 
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
@@ -1011,6 +1015,12 @@ void MidiDelayProcessor::setStateInformation (const void* data, int sizeInBytes)
     // что пользователь подкрутил после выбора пресета.
     currentProgram = juce::jlimit (0, getNumPrograms() - 1,
                                    static_cast<int> (state.getProperty ("preset", 0)));
+
+    // Масштаб окна (#29). Границы те же, что у редактора, и проверяются здесь тоже:
+    // состояние приходит из файла проекта, то есть извне, и «0» в этом поле означал бы
+    // окно нулевого размера. Поля нет у проектов, сохранённых до сессии 17, — тогда 1.0.
+    editorScale = juce::jlimit (0.75f, 1.5f,
+                                static_cast<float> (state.getProperty ("editorScale", 1.0)));
 
     apvts.replaceState (state);
 }

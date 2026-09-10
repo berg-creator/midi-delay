@@ -677,7 +677,7 @@ int main (int argc, char* argv[])
     // увидеть его можно только запустив хост, а хост в эстафету промптов не помещается.
     // Заодно это единственная проверка, что редактор создаётся, отрисовывается
     // и разрушается без падения, — pluginval то же самое делает дольше и молча.
-    //   ./build/ProcessorTest_artefacts/Release/ProcessorTest --shot editor.png [пресет]
+    //   ./build/ProcessorTest_artefacts/Release/ProcessorTest --shot editor.png [пресет] [silent] [масштаб]
     if (argc >= 3 && juce::String (argv[1]) == "--shot")
     {
         MidiDelayProcessor proc;
@@ -690,7 +690,23 @@ int main (int argc, char* argv[])
         // клавиатуру. Иначе половина того, ради чего #27 делалась, на картинке не видна.
         // Слово silent четвёртым аргументом снимает второе состояние — то, ради которого
         // #27 и заводилась: MIDI не доехал, и это должно быть видно с первого взгляда.
-        const bool silent = argc >= 5 && juce::String (argv[4]) == "silent";
+        // Хвостовые аргументы разбираются по виду, а не по месту: масштаб (#29)
+        // нужен и с аккордом, и без него, а держать для этого пустышку в четвёртой
+        // позиции — это способ однажды опечататься и не заметить.
+        bool silent = false;
+        float pixelScale = 1.0f;
+
+        for (int i = 4; i < argc; ++i)
+        {
+            const juce::String arg (argv[i]);
+
+            if (arg == "silent")
+                silent = true;
+            else if (arg == "retina")
+                pixelScale = 2.0f;      // экран вдвое плотнее, окно того же размера (#29)
+            else if (arg.getFloatValue() > 0.0f)
+                proc.editorScale = arg.getFloatValue();
+        }
 
         juce::AudioBuffer<float> block (2, 512);
         fillDC (block, 0.4f);
@@ -723,7 +739,12 @@ int main (int argc, char* argv[])
         std::this_thread::sleep_for (std::chrono::milliseconds (100));
         juce::Timer::callPendingTimersSynchronously();
 
-        const auto image = editor->createComponentSnapshot (editor->getLocalBounds(), true);
+        // Плотность пикселей задаётся снимку, а не окну: Retina — это когда та же
+        // точка раскладки рисуется четырьмя пикселями, а не когда окно становится
+        // вдвое больше. Если бы что-то в оформлении было растровым или считалось
+        // в целых пикселях, здесь оно поехало бы, а на 1.0 выглядело бы целым.
+        const auto image = editor->createComponentSnapshot (editor->getLocalBounds(),
+                                                            true, pixelScale);
         const auto file = juce::File::getCurrentWorkingDirectory()
                               .getChildFile (juce::String::fromUTF8 (argv[2]));
         file.deleteFile();
@@ -2848,10 +2869,10 @@ int main (int argc, char* argv[])
             { "width 200, diffusion 50",              200.0f, false, 50.0f },
             { "width 200, diffusion 100",             200.0f, false, 100.0f },
             { "width 100, ping-pong, diffusion 50",   100.0f, true,  50.0f },
-            // Ровно то, что стоит в пресете Sung Vocal (#48): Width 150 одобрен ухом
-            // в сессии 13, но между замеренными 100 (-0,69 dB) и 200 (-3,02 dB) лежит
-            // вся разница между «незаметно» и «в моно вдвое тише». Строка стоит здесь,
-            // чтобы число было, а не мнение.
+            // Строка, из-за которой Sung Vocal в сессии 17 переехал на Width 100:
+            // между замеренными 100 (-0,69 dB) и 200 (-3,02 dB) лежит вся разница
+            // между «незаметно» и «в моно вдвое тише», и 150 отдаёт больше половины
+            // пути. В пресете этого значения больше нет, в шкале — остаётся.
             { "width 150, ping-pong, diffusion 50",   150.0f, true,  50.0f },
             { "width 200, ping-pong, diffusion 100",  200.0f, true,  100.0f },
         };
@@ -3862,6 +3883,62 @@ int main (int argc, char* argv[])
         CHECK (getParam (restored, "mix") == 33.0f);   // рука пользователя пережила
         CHECK (getParam (restored, "ducking") == 80.0f);
         CHECK (getParam (restored, "division") == 0.0f);
+    }
+
+    // Масштаб окна переживает сохранение и не пускает внутрь мусор (#29).
+    // Проверяется здесь, а не в редакторе: поле живёт в процессоре именно затем,
+    // чтобы пережить закрытие окна, и ломается оно на загрузке состояния.
+    {
+        MidiDelayProcessor proc;
+        engineDefaults (proc);
+        proc.editorScale = 1.25f;
+
+        juce::MemoryBlock state;
+        proc.getStateInformation (state);
+
+        MidiDelayProcessor restored;
+        engineDefaults (restored);
+        restored.setStateInformation (state.getData(), static_cast<int> (state.getSize()));
+        CHECK (std::abs (restored.editorScale - 1.25f) < 1.0e-6f);
+
+        // Состояние приходит из файла проекта, то есть извне: и ноль, и десятка
+        // должны упереться в пределы редактора, а не доехать до setSize.
+        for (const float bad : { 0.0f, -3.0f, 10.0f })
+        {
+            MidiDelayProcessor source;
+            engineDefaults (source);
+            source.editorScale = bad;
+
+            juce::MemoryBlock block;
+            source.getStateInformation (block);
+
+            MidiDelayProcessor guarded;
+            engineDefaults (guarded);
+            guarded.setStateInformation (block.getData(), static_cast<int> (block.getSize()));
+            CHECK (guarded.editorScale >= 0.75f && guarded.editorScale <= 1.5f);
+        }
+
+        // Проект, сохранённый до сессии 17, поля не содержит — и должен открыться
+        // в базовом размере, а не в нулевом.
+        MidiDelayProcessor old;
+        engineDefaults (old);
+        auto legacy = old.apvts.copyState();
+        legacy.setProperty ("stateVersion", 1, nullptr);
+        legacy.setProperty ("preset", 0, nullptr);
+
+        juce::MemoryBlock block;
+
+        if (auto xml = legacy.createXml())
+            juce::AudioProcessor::copyXmlToBinary (*xml, block);
+
+        MidiDelayProcessor fresh;
+        engineDefaults (fresh);
+        fresh.editorScale = 1.4f;                      // заведомо не 1.0, чтобы было что стереть
+        fresh.setStateInformation (block.getData(), static_cast<int> (block.getSize()));
+        CHECK (std::abs (fresh.editorScale - 1.0f) < 1.0e-6f);
+
+        std::printf ("  масштаб окна: 1.25 пережил сохранение, мусор обрезан, "
+                     "старый проект открывается в 1.0\n");
     }
 
     // Смена пресета на звучащем хвосте. Пресет двигает два десятка параметров разом —
