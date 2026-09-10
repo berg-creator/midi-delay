@@ -315,7 +315,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     // что выключил режим без colour.
     for (const auto& id : overrides.getAllKeys())
     {
-        if (id == "noteMs" || id == "startS")
+        if (id == "noteMs" || id == "startS" || id == "notes")
             continue;   // настройки рендера, а не параметры плагина
 
         if (proc.apvts.getParameter (id) == nullptr)
@@ -343,8 +343,16 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     static constexpr int melody[] { 60, 64, 67, 72 };
     static constexpr int pluckPattern[] { 60, 64, 67, 64, 69, 67, 64, 60 };
 
-    const int* notes = pluck ? pluckPattern : melody;
-    const int numNotes = pluck ? 8 : 4;
+    // Свой паттерн ключом notes=71,74,78,74. Зашитый годится только для до-мажора:
+    // у материала своя тональность, и ноты не из неё дают не гармонию, а фальшь.
+    std::vector<int> custom;
+
+    for (const auto& part : juce::StringArray::fromTokens (overrides["notes"], ",", ""))
+        if (part.trim().isNotEmpty())
+            custom.push_back (part.getIntValue());
+
+    const int* notes = ! custom.empty() ? custom.data() : (pluck ? pluckPattern : melody);
+    const int numNotes = ! custom.empty() ? static_cast<int> (custom.size()) : (pluck ? 8 : 4);
     const double noteSeconds = overrides.containsKey ("noteMs")
         ? overrides["noteMs"].getDoubleValue() * 0.001 : (pluck ? 0.25 : 1.0);
     const int noteLength = static_cast<int> (sr * noteSeconds);
