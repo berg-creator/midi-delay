@@ -63,7 +63,7 @@ macOS 26, arm64, clang 21, cmake 4.4, ninja, gh 2.96. JUCE 9.0.2 в `libs/JUCE`.
 
 Сборка: `cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build`.
 Плагины копируются в `~/Library/Audio/Plug-Ins/` автоматически.
-Валидация AU: `auval -v aumf Mdly Mkev`.
+Валидация AU: `auval -v aumf Mdly Berg`.
 
 ## Стиль
 Ponytail: самое простое решение, которое действительно работает. Не строить абстракций

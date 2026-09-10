@@ -93,6 +93,14 @@ void Voice::setEngine (PitchEngine engine)
         shifter = engineFor (engine);
 }
 
+void Voice::setFormantHold (bool shouldHold)
+{
+    // Обоим движкам, а не активному: варигонка про форманты ничего не знает и молча
+    // проглотит вызов, зато переключение Quality посреди работы не потеряет настройку.
+    if (fastShifter != nullptr) fastShifter->setFormantHold (shouldHold);
+    if (hqShifter   != nullptr) hqShifter->setFormantHold (shouldHold);
+}
+
 int Voice::getLatencySamples (PitchEngine engine) const
 {
     const PitchShifter* e = engineFor (engine);

@@ -45,7 +45,7 @@ cmake --build build
 ```
 
 Плагины копируются в `~/Library/Audio/Plug-Ins/` автоматически.
-Валидация AU: `auval -v aumf Mdly Mkev`.
+Валидация AU: `auval -v aumf Mdly Berg`.
 
 **JUCE 9.0.2**, зафиксирован на теге в `libs/JUCE` (submodule).
 

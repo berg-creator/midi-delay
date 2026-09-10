@@ -147,6 +147,34 @@ private:
     static constexpr float filterLoOff = 20.0f;
     static constexpr float filterHiOff = 20000.0f;
 
+    /** Глубина модуляции на полной ручке, в миллисекундах (#46). Четыре — это верх
+        диапазона из описания задачи. Выше начинается эффект, а не характер: скорость
+        изменения задержки — это и есть уход высоты, и сигнал, прошедший n кругов,
+        испытал его n раз. Замерено: на значениях по умолчанию (20 %, feedback 35 %)
+        уход 3,5 цента — под порогом слышимости; на полной ручке и feedback 90 %
+        уже 40 центов, и это сознательно крайнее положение обеих ручек. */
+    static constexpr float modulationMaxMs = 4.0f;
+
+    /** Частоты двух генераторов дрейфа, Гц. Несоизмеримые нарочно: сумма не имеет
+        общего периода, и дрейф не читается как ровное качание. Обе в нижней половине
+        диапазона 0,1-3 Гц из описания задачи — это wow ленточной машины, а не вибрато. */
+    static constexpr double modulationRateA = 0.23;
+    static constexpr double modulationRateB = 0.37;
+
+    /** Ducking (#47). Полная ручка — минус 12 dB, верх диапазона из описания задачи.
+        Порог не заводится: детектор смотрит на амплитуду сухого, и полное приседание
+        наступает на -12 dBFS (отсюда четвёрка). ponytail: без порога и без knee;
+        если материал окажется тише, ручка Ducking всё равно остаётся у пользователя. */
+    static constexpr float duckingMaxDepth = 0.75f;   // 1 - 10^(-12/20)
+    static constexpr float duckingSensitivity = 4.0f;
+
+    /** Времена детектора огибающей. 10 мс — атака, за которую слог успевает задавить
+        хвост, но щелчок не превращается в дырку; 250 мс — спад, за который хвост
+        успевает вернуться в паузе между фразами. Константы, а не ручки: две лишние
+        ручки в окне стоят дороже, чем разница между 200 и 300 мс. */
+    static constexpr double duckAttackMs = 10.0;
+    static constexpr double duckReleaseMs = 250.0;
+
     /** Потолок оценки хвоста. При feedback 95 % и delay 2 с честные 135 кругов
         дали бы четыре с половиной минуты досчёта после каждой дорожки. */
     static constexpr double maxTailSeconds = 20.0;
@@ -184,6 +212,21 @@ private:
         при крутке среза слышен одинаково что от частоты, что от коэффициента. */
     juce::SmoothedValue<float> diffusionSmoothed, loCoeffSmoothed, hiCoeffSmoothed;
 
+    /** Глубина модуляции и глубина приседания. Сглаживаются по той же причине,
+        что и всё остальное: обе едут прямо по звучащему хвосту. */
+    juce::SmoothedValue<float> modDepthSmoothed, duckDepthSmoothed;
+
+    /** Фазы генераторов дрейфа, 0..1. Крутятся всегда, даже на нуле глубины: узел,
+        включаемый по месту, дал бы скачок позиции чтения при первом же движении ручки.
+        Та же схема, что у диффузора (находки сессии 12). */
+    double modPhaseA = 0.0, modPhaseB = 0.0;
+
+    /** Огибающая сухого для ducking, по одному состоянию на канал. */
+    float duckEnv[2] {};
+
+    /** Коэффициенты детектора, считаются в prepareToPlay. */
+    float duckAttackCoeff = 1.0f, duckReleaseCoeff = 1.0f;
+
     /** Состояния однополюсников петли, по одному на канал (#22). Шины не бывают
         шире стерео — см. isBusesLayoutSupported. */
     float loState[2] {}, hiState[2] {};
@@ -203,10 +246,13 @@ private:
     std::atomic<float>* pRootKey    = nullptr;
     std::atomic<float>* pPitchRange = nullptr;
     std::atomic<float>* pQuality    = nullptr;
+    std::atomic<float>* pFormants   = nullptr;
     std::atomic<float>* pTimeMode   = nullptr;
     std::atomic<float>* pMidiOffset = nullptr;
     std::atomic<float>* pWidth      = nullptr;
     std::atomic<float>* pDiffusion  = nullptr;
+    std::atomic<float>* pModulation = nullptr;
+    std::atomic<float>* pDucking    = nullptr;
     std::atomic<float>* pFilterLo   = nullptr;
     std::atomic<float>* pFilterHi   = nullptr;
 

@@ -18,10 +18,13 @@ MidiDelayProcessor::MidiDelayProcessor()
     pRootKey    = apvts.getRawParameterValue ("rootKey");
     pPitchRange = apvts.getRawParameterValue ("pitchRange");
     pQuality    = apvts.getRawParameterValue ("quality");
+    pFormants   = apvts.getRawParameterValue ("formants");
     pTimeMode   = apvts.getRawParameterValue ("timeMode");
     pMidiOffset = apvts.getRawParameterValue ("midiOffset");
     pWidth      = apvts.getRawParameterValue ("width");
     pDiffusion  = apvts.getRawParameterValue ("diffusion");
+    pModulation = apvts.getRawParameterValue ("modulation");
+    pDucking    = apvts.getRawParameterValue ("ducking");
     pFilterLo   = apvts.getRawParameterValue ("filterLo");
     pFilterHi   = apvts.getRawParameterValue ("filterHi");
     bypassParam = apvts.getParameter ("bypass");
@@ -86,6 +89,22 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         Range { 0.0f, 100.0f, 0.1f }, 50.0f,
         AudioParameterFloatAttributes().withLabel ("%")));
 
+    // Модуляция времени (#46). Крутится всегда, подмешивается глубиной: на нуле
+    // ручки позиция чтения ровно та же, что была, бит-в-бит. Модулируется петля,
+    // а не позиция чтения голосов — почему именно так, в комментарии renderSegment.
+    params.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "modulation", 1 }, "Modulation",
+        Range { 0.0f, 100.0f, 0.1f }, 20.0f,
+        AudioParameterFloatAttributes().withLabel ("%")));
+
+    // Приседание хвоста под сухим (#47). Ноль по умолчанию: приседание — это решение
+    // про микс, а не про звук самого дилея, и молча жать хвост у того, кто открыл
+    // плагин впервые, значит соврать ему про то, как эффект звучит.
+    params.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "ducking", 1 }, "Ducking",
+        Range { 0.0f, 100.0f, 0.1f }, 0.0f,
+        AudioParameterFloatAttributes().withLabel ("%")));
+
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "filterLo", 1 }, "Low Cut",
         Range { 20.0f, 2000.0f, 1.0f, 0.35f }, 100.0f,
@@ -129,6 +148,16 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
     params.push_back (std::make_unique<AudioParameterChoice> (
         ParameterID { "quality", 1 }, "Quality",
         StringArray { "Fast", "HQ" }, 1));
+
+    // Форманты (#24). Hold по умолчанию: голос, поднятый на октаву с едущими
+    // формантами, — это бурундук, а подклад из бурундука в микс не садится.
+    // Shift оставлен не «для совместимости»: у синтетического источника сдвинутые
+    // форманты — часть звука, и растянутый вверх пэд звучит именно так, как задумано.
+    // Работает только на HQ: варигонка растягивает спектр целиком, формант для неё
+    // физически не существует. Разница Fast и HQ — это разница характера.
+    params.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "formants", 1 }, "Formants",
+        StringArray { "Shift", "Hold" }, 1));
 
     // Ручной калибровочный винт под MIDI-роутинг FL Studio: см. ANALYSIS §6.2.
     // Диапазон ±100 как в #18. Плюс — событие держится в очереди и стоит только её;
@@ -176,6 +205,13 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     diffuser.clear();
     loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
 
+    // Дрейф и детектор приседания (#46, #47). Фазы с нуля, огибающая с нуля:
+    // после prepare плагин обязан быть в том же состоянии, что после конструктора.
+    modPhaseA = modPhaseB = 0.0;
+    duckEnv[0] = duckEnv[1] = 0.0f;
+    duckAttackCoeff  = onePoleCoeff (static_cast<float> (1000.0 / (juce::MathConstants<double>::twoPi * duckAttackMs)));
+    duckReleaseCoeff = onePoleCoeff (static_cast<float> (1000.0 / (juce::MathConstants<double>::twoPi * duckReleaseMs)));
+
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
     voiceManager.setEngine (pQuality->load() > 0.5f ? PitchEngine::hq : PitchEngine::fast);
@@ -191,6 +227,8 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     gainSmoothed.reset (currentSampleRate, smoothingSeconds);
     bypassSmoothed.reset (currentSampleRate, bypassSeconds);
     diffusionSmoothed.reset (currentSampleRate, smoothingSeconds);
+    modDepthSmoothed.reset (currentSampleRate, smoothingSeconds);
+    duckDepthSmoothed.reset (currentSampleRate, smoothingSeconds);
     loCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
     hiCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
 
@@ -203,6 +241,8 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
         juce::Decibels::decibelsToGain (pOutputGain->load()));
     bypassSmoothed.setCurrentAndTargetValue (pBypass->load() < 0.5f ? 1.0f : 0.0f);
     diffusionSmoothed.setCurrentAndTargetValue (pDiffusion->load() * 0.01f);
+    modDepthSmoothed.setCurrentAndTargetValue (pModulation->load() * 0.01f);
+    duckDepthSmoothed.setCurrentAndTargetValue (pDucking->load() * 0.01f);
     loCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterLo->load()));
     hiCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterHi->load()));
 
@@ -221,6 +261,7 @@ void MidiDelayProcessor::releaseResources()
     dryDelay.clear();
     diffuser.clear();
     loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
+    duckEnv[0] = duckEnv[1] = 0.0f;
     midiQueue.clear();
     midiCarry.clear();
     voiceManager.reset();
@@ -331,6 +372,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     voiceManager.setEngine (wantHq ? PitchEngine::hq : PitchEngine::fast);
     voiceManager.setWidth (pWidth->load (std::memory_order_relaxed));
+    voiceManager.setFormantHold (pFormants->load (std::memory_order_relaxed) > 0.5f);
 
     // Выравнивание: на сколько сэмплов весь плагин отстаёт от собственного входа.
     // Сухой сигнал придерживается ровно на столько же, и это же число просится
@@ -382,6 +424,8 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     blockUseHi = hiHz < filterHiOff;
 
     diffusionSmoothed.setTargetValue (pDiffusion->load (std::memory_order_relaxed) * 0.01f);
+    modDepthSmoothed.setTargetValue (pModulation->load (std::memory_order_relaxed) * 0.01f);
+    duckDepthSmoothed.setTargetValue (pDucking->load (std::memory_order_relaxed) * 0.01f);
     loCoeffSmoothed.setTargetValue (onePoleCoeff (loHz));
     hiCoeffSmoothed.setTargetValue (onePoleCoeff (hiHz));
 
@@ -436,6 +480,7 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
         const float mix  = mixSmoothed.getNextValue();
         const float gain = gainSmoothed.getNextValue();
         const float wetPath = bypassSmoothed.getNextValue();
+        const float duckDepth = duckDepthSmoothed.getNextValue();   // вне цикла каналов: рампа одна на сэмпл
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
@@ -445,7 +490,21 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
                 ? dryDelay.read (ch, static_cast<double> (numSamples - i + blockAlignment))
                 : buffer.getSample (ch, i);
 
-            const float wet = wetBuffer.getSample (ch, i);
+            // Ducking (#47). Детектор снимает ровно тот сухой, который уходит в микс,
+            // а не сырой вход. Это расхождение с промптом сессии, и оно намеренное:
+            // в Follow весь плагин опаздывает от входа на выравнивание, и хвост тоже —
+            // значит детектор на сыром входе присел бы на 180 мс раньше сухого, то есть
+            // до того, как слог вообще прозвучал. Взятый после линии, он совпадает
+            // с сухим в обоих режимах Time Mode, а это и есть критерий задачи.
+            const float rectified = std::abs (dry);
+            duckEnv[ch] += (rectified > duckEnv[ch] ? duckAttackCoeff : duckReleaseCoeff)
+                         * (rectified - duckEnv[ch]);
+
+            // На нуле ручки множитель ровно единица — выход бит-в-бит прежний.
+            const float duck = 1.0f - duckDepth * duckingMaxDepth
+                             * juce::jmin (1.0f, duckEnv[ch] * duckingSensitivity);
+
+            const float wet = wetBuffer.getSample (ch, i) * duck;
 
             const float processed = (dry * (1.0f - mix) + wet * mix) * gain;
 
@@ -474,9 +533,40 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
     const float* const* linePointers = lineInput.getArrayOfReadPointers();
     const int end = startSample + numSamples;
 
+    // Шаг фаз дрейфа за сэмпл. Считается на сегмент, а не на сэмпл: частоты — константы.
+    const double modStepA = modulationRateA / currentSampleRate;
+    const double modStepB = modulationRateB / currentSampleRate;
+    const auto modScale = static_cast<float> (modulationMaxMs * 0.001 * currentSampleRate);
+
     for (int i = startSample; i < end; ++i)
     {
         const float delaySamples = delaySamplesSmoothed.getNextValue();
+
+        // Модуляция времени (#46). Модулируется позиция чтения ПЕТЛИ, а не голосов,
+        // и это решение, а не умолчание. Дрожание, поданное на вход питчера, фазовый
+        // вокодер воспроизвёл бы честно — то есть оно стало бы уходом высоты, а критерий
+        // задачи требует ровно обратного: «не читается как расстройка». В петле же
+        // дрейф расцепляет круги между собой, накапливается от повтора к повтору
+        // и высоты хвоста не трогает вовсе — тот самый ленточный характер.
+        //
+        // Генераторы крутятся всегда и подмешиваются глубиной, как диффузор:
+        // на нуле ручки позиция чтения ровно прежняя, бит-в-бит, и включение
+        // не даёт скачка (находки сессии 12).
+        modPhaseA += modStepA;
+        modPhaseB += modStepB;
+        if (modPhaseA >= 1.0) modPhaseA -= 1.0;
+        if (modPhaseB >= 1.0) modPhaseB -= 1.0;
+
+        const auto drift = static_cast<float> (
+            0.6 * std::sin (juce::MathConstants<double>::twoPi * modPhaseA)
+          + 0.4 * std::sin (juce::MathConstants<double>::twoPi * modPhaseB));
+
+        // Смещение только в плюс, то есть петля дышит в сторону удлинения. Знакопеременное
+        // на минимальном delay time упиралось бы в нижний предел кольца, и дрейф стал бы
+        // односторонним сам — молча и только на коротких временах. Цена честного варианта:
+        // постоянная составляющая в полглубины, до 2 мс на полной ручке. Против 400 мс
+        // петли это не слышно, а вот разное поведение на разных временах слышно бы было.
+        const float modOffset = modDepthSmoothed.getNextValue() * modScale * (0.5f * (drift + 1.0f));
 
         // Диффузия (#45). Цепочка алл-пассов крутится всегда, даже на нуле ручки:
         // так она остаётся прогретой, и ввод её в петлю не даёт ни щелчка, ни всплеска
@@ -494,7 +584,7 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             const float dry = buffer.getSample (ch, i);
             // Читаем до записи текущего сэмпла, поэтому смещение точное: writePos
             // ещё указывает на слот сэмпла i, и read(d) отдаёт ровно x[i - d].
-            const float delayed = delayBuffer.read (ch, delaySamples);
+            const float delayed = delayBuffer.read (ch, delaySamples + modOffset);
 
             // Вторая точка чтения — та же петля, укороченная на длину цепочки:
             // алл-пасс при любом g несёт свои M сэмплов задержки, и без этого вычета
@@ -504,7 +594,7 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             // упирается в длину цепочки; отдельные длины под короткую петлю — если
             // такой режим кому-то понадобится.
             const float shifted = delayBuffer.read (ch, juce::jmax (2.0f,
-                delaySamples - static_cast<float> (diffuser.getDelaySamples (ch))));
+                delaySamples + modOffset - static_cast<float> (diffuser.getDelaySamples (ch))));
 
             const float diffused = diffuser.process (ch, shifted, diffusionGain);
 
@@ -620,7 +710,18 @@ double MidiDelayProcessor::getTailLengthSeconds() const
     // Сколько кругов до -60 dB: feedback^n = 0.001. При нулевом feedback круг ровно один.
     const double rounds = feedback > 0.001 ? std::log (0.001) / std::log (feedback) : 1.0;
 
-    return juce::jmin (delaySeconds * rounds, maxTailSeconds);
+    // Круг длиннее заказанного времени на среднее смещение дрейфа — половину глубины (#46).
+    const double modSeconds = pModulation->load (std::memory_order_relaxed) * 0.01
+                            * modulationMaxMs * 0.0005;
+
+    // Диффузия удлиняет затухание: алл-пасс добавляет петле фазу, то есть на части частот
+    // удлиняет её круг, и при feedback 95 % замеренное затухание идёт как 0,97 за круг
+    // вместо 0,95 (находки сессии 12). В кругах это log(0,95)/log(0,97) = 1,7 раза.
+    // Без этой поправки хост при офлайн-сведении обрезает хвост раньше, чем тот стих.
+    const double diffusion = pDiffusion->load (std::memory_order_relaxed) * 0.01;
+
+    return juce::jmin ((delaySeconds + modSeconds) * rounds * (1.0 + 0.7 * diffusion),
+                       maxTailSeconds);
 }
 
 //==============================================================================

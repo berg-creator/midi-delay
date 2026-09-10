@@ -29,9 +29,15 @@ if(MSVC)
     target_compile_options(signalsmith-stretch INTERFACE /bigobj)
 endif()
 
+# Имя компании, а не автора: под ним пойдут и бесплатный плагин, и платные следом
+# (STRATEGY §1). В метаданных обычный регистр, капслок остаётся начертанию логотипа —
+# в списке производителей DAW слово капсом читается как крик, а Berg не аббревиатура.
 juce_add_plugin(MidiDelay
-    COMPANY_NAME            "mke"
-    PLUGIN_MANUFACTURER_CODE Mkev
+    COMPANY_NAME            "Berg"
+    # Меняется вместе с именем: идентификатор AU это пара кодов, и до первого релиза
+    # его менять бесплатно, а после — значит потерять чужие сохранённые проекты.
+    # Валидация теперь: auval -v aumf Mdly Berg.
+    PLUGIN_MANUFACTURER_CODE Berg
     PLUGIN_CODE             Mdly
     PRODUCT_NAME            "MIDI Delay"
     FORMATS                 VST3 AU Standalone

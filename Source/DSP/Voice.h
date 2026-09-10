@@ -37,6 +37,11 @@ public:
         именно так, написано в Voice.cpp у самого латча. */
     void setEngine (PitchEngine engine);
 
+    /** Форманты на месте или едут вместе с высотой (#24). В отличие от движка
+        не латчится на старте ноты: это флаг спектральной огибающей, менять его
+        на живом звуке безопасно, и слышать разницу переключателя надо сразу. */
+    void setFormantHold (bool shouldHold);
+
     void noteOn (int midiNote, float velocity, float ratio, double delaySamples, float pan);
     void noteOff();
 

@@ -16,6 +16,16 @@ namespace
         сэмпл перепрыгнул бы окно и кроссфейд перестал бы прятать заворот. */
     constexpr double minRatio = 0.25;
     constexpr double maxRatio = 4.0;
+
+    /** Выше этой частоты спектр не транспонируется, а сдвигается на постоянную
+        величину (#24). Смысл в шипящих: «с» — это шум в полосе 5-10 кГц, и на октаве
+        вверх честное транспонирование уносит его в свист под Найквистом. Речевые
+        форманты кончаются к 4 кГц, так что музыкальной информации выше 8 кГц нет —
+        там только шум согласных, которому всё равно, куда его перенесли.
+        Число подобрано под речь; для синтетического источника оно может быть другим,
+        но заводить под это ручку не за чем — предел слышен только на больших
+        сдвигах вверх, и там он всегда к лучшему. */
+    constexpr double tonalityLimitHz = 8000.0;
 }
 
 VarispeedShifter::VarispeedShifter (double newWindowMs)
@@ -129,8 +139,21 @@ void SignalsmithShifter::prepare (double sampleRate, int)
     // вдвое меньше. Латентность здесь платится минимальным delay time, а не задержкой
     // хоста (ANALYSIS §5), поэтому такое окно вообще можно себе позволить. См. ADR 0005.
     impl->stretch.configure (1, static_cast<int> (sr * 0.18f), static_cast<int> (sr * 0.045f));
-    impl->stretch.setTransposeFactor (1.0f);
+
+    // Библиотека меряет частоты в долях sample rate, а не в герцах: binToFreq делит
+    // на длину БПФ. Пересчёт здесь, чтобы 8 кГц оставались 8 кГц на любой частоте
+    // дискретизации.
+    tonalityLimit = static_cast<float> (tonalityLimitHz / sr);
+
     ratio = 1.0f;
+    impl->stretch.setTransposeFactor (1.0f, tonalityLimit);
+
+    // Форманты на месте, пока едет высота (#24): без этого голос, поднятый на октаву,
+    // становится бурундуком. Стоит это только на транспонированных голосах — внутри
+    // библиотеки компенсация включается как formantCompensation && mappedFrequencies,
+    // а mappedFrequencies истинно только при freqMultiplier != 1. На унисоне даром.
+    formantHold = true;
+    impl->stretch.setFormantSemitones (0.0f, true);
 
     // Обе половины: анализ смотрит назад на полокна, синтез копит выход ещё на полокна.
     // Сумма — та самая константа, которую прячет в delay time голос (ADR 0002).
@@ -156,7 +179,24 @@ void SignalsmithShifter::setRatio (float newRatio)
         return;
 
     ratio = clamped;
-    impl->stretch.setTransposeFactor (clamped);
+    impl->stretch.setTransposeFactor (clamped, tonalityLimit);
+}
+
+void SignalsmithShifter::setFormantHold (bool shouldHold)
+{
+    // Тот же приём, что в setRatio: setFormantFactor трогает несколько полей движка,
+    // и звать его на каждый сегмент незачем.
+    if (shouldHold == formantHold)
+        return;
+
+    formantHold = shouldHold;
+
+    // Второй аргумент — вся разница. false: спектральная огибающая едет вместе
+    // с высотой, то есть ровно поведение варигонки, и для пэда это часть звука.
+    // true: огибающая остаётся на месте, транспонируется только тон.
+    // Переключение действует со следующего спектра и разрыва не даёт: меняется
+    // амплитуда полос, а не фаза, — щёлкать тут нечему.
+    impl->stretch.setFormantSemitones (0.0f, shouldHold);
 }
 
 void SignalsmithShifter::process (const float* in, float* out, int numSamples)

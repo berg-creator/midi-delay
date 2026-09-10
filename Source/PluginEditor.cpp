@@ -11,10 +11,10 @@ namespace
         огибающая. Это ещё не интерфейс (#26, #27), но покрутить уже можно осмысленно. */
     const char* const layout[] {
         "timeMode",  "delayTime",  "midiOffset", "feedback",
-        "diffusion", "filterLo",   "filterHi",   "width",
-        "mix",       "outputGain", "quality",    "bypass",
-        "rootKey",   "pitchRange", "voices",     "attack",
-        "release",
+        "diffusion", "modulation", "filterLo",   "filterHi",
+        "width",     "ducking",    "mix",        "outputGain",
+        "quality",   "formants",   "rootKey",    "pitchRange",
+        "voices",    "attack",     "release",    "bypass",
     };
 
     constexpr int headerHeight = 114;

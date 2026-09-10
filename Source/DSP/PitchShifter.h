@@ -23,6 +23,12 @@ public:
     /** 1.0 — без сдвига, 2.0 — октава вверх. Дёргается из аудиопотока, должно быть дёшево. */
     virtual void setRatio (float ratio) = 0;
 
+    /** Держать форманты на месте, пока едет высота (#24). Пустой по умолчанию, и это
+        не заглушка «на потом»: varispeed растягивает спектр целиком, формант для него
+        физически не существует — держать там нечего. Разница Fast и HQ — это разница
+        характера, а не «быстрый и медленный». */
+    virtual void setFormantHold (bool) {}
+
     virtual void process (const float* in, float* out, int numSamples) = 0;
 
     /** Внутренняя латентность движка в сэмплах. Прячется в delay time (#17), поэтому
@@ -72,6 +78,7 @@ public:
     void prepare (double sampleRate, int maxBlockSamples) override;
     void reset() override;
     void setRatio (float ratio) override;
+    void setFormantHold (bool shouldHold) override;
     void process (const float* in, float* out, int numSamples) override;
     int getLatencySamples() const override;
 
@@ -81,6 +88,8 @@ private:
 
     int latency = 0;       // inputLatency + outputLatency, константа между вызовами prepare
     float ratio = 1.0f;    // последнее заданное значение: движок дёргаем только на смене
+    float tonalityLimit = 0.0f;   // предел транспонирования, доля sample rate
+    bool formantHold = true;      // последнее заданное значение, дёргаем только на смене
 };
 
 /** Эталон: вход копируется в выход, ratio игнорируется, латентность ноль. Была

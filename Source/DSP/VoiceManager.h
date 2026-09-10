@@ -22,6 +22,7 @@ public:
     void setEnvelope (float attackMs, float releaseMs);
     void setVoiceLimit (int numVoices);           // параметр Voices, не больше maxVoices
     void setEngine (PitchEngine engine);          // Quality и режим Follow вместе
+    void setFormantHold (bool shouldHold);        // параметр Formants (#24)
 
     /** Раскидка голосов по стерео (#23): 0 — все в центре, 100 % — умеренно,
         200 % — крайние голоса в упор влево и вправо. Параметр Width. */
@@ -62,6 +63,7 @@ private:
     int voiceLimit = maxVoices;
     float spread = 0.5f;          // 0..1, из параметра Width
     PitchEngine engine = PitchEngine::hq;
+    bool formantHold = true;
     double sampleRate = 44100.0;
     double delaySamples = 2.0;
     bool sustainDown = false;

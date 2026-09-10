@@ -12,10 +12,12 @@
 #include <juce_audio_formats/juce_audio_formats.h>
 
 #include <atomic>
+#include <functional>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <new>
+#include <chrono>
 #include <thread>
 #include <algorithm>
 #include <vector>
@@ -58,13 +60,16 @@ namespace
         CHECK (std::abs (proc.apvts.getRawParameterValue (id)->load() - value) < 0.01f);
     }
 
-    /** Выключает окраску петли: фильтры на краях диапазона, диффузия в нуле. Почти
+    /** Выключает окраску петли: фильтры на краях диапазона, диффузия и дрейф в нуле,
+        приседание выключено. Почти
         все замеры ниже меряют тайминг и уровни, и окраска в них только мешает; те
         тесты, что меряют её саму, ставят значения руками. Заодно замеры перестают
         зависеть от того, какие значения выбраны значениями по умолчанию. */
     void plainLoop (MidiDelayProcessor& proc)
     {
         setParam (proc, "diffusion", 0.0f);
+        setParam (proc, "modulation", 0.0f);
+        setParam (proc, "ducking", 0.0f);
         setParam (proc, "filterLo", 20.0f);
         setParam (proc, "filterHi", 20000.0f);
     }
@@ -137,9 +142,14 @@ namespace
     питчер, а не обвязку. Пятый аргумент colour оставляет все значения по умолчанию,
     то есть даёт плагин таким, каким его услышит пользователь: это A/B к тому же файлу,
     одной командой.
-    Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] */
+    Слово shift в хвосте команды переводит форманты в Shift (#24) — это A/B к Hold
+    на том же файле и одной командой, ровно как colour к окраске петли. Там же можно
+    выставить любой параметр по имени: feedback=75 modulation=60. Это дешевле, чем
+    заводить флаг под каждую ручку, которую захочется послушать в следующий раз.
+    Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] [shift] [id=value ...] */
 static int renderDemo (const juce::String& path, const juce::String& mode,
-                       const juce::String& inputPath, bool colour)
+                       const juce::String& inputPath, bool colour, bool formantShift,
+                       const juce::StringPairArray& overrides)
 {
     const bool hq     = mode != "fast";
     const bool follow = mode == "follow";
@@ -266,6 +276,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     setParam (proc, "pitchRange", 12.0f);
     setParam (proc, "quality", hq ? 1.0f : 0.0f);
     setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+    setParam (proc, "formants", formantShift ? 0.0f : 1.0f);
     // Без colour окраска петли и обратная связь выключаются руками — слышно голый
     // питчер. С colour не выставляется ничего: остаются значения по умолчанию,
     // то есть ровно то, что услышит пользователь, открыв плагин. Числа тут
@@ -274,8 +285,24 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     {
         setParam (proc, "feedback", 0.0f);
         setParam (proc, "diffusion", 0.0f);
+        setParam (proc, "modulation", 0.0f);
+        setParam (proc, "ducking", 0.0f);
         setParam (proc, "filterLo", 20.0f);
         setParam (proc, "filterHi", 20000.0f);
+    }
+
+    // Ручные значения идут последними: они обязаны перебивать и умолчания, и то,
+    // что выключил режим без colour.
+    for (const auto& id : overrides.getAllKeys())
+    {
+        if (proc.apvts.getParameter (id) == nullptr)
+        {
+            std::printf ("нет такого параметра: %s\n", id.toRawUTF8());
+            return 1;
+        }
+
+        setParam (proc, id.toRawUTF8(), overrides[id].getFloatValue());
+        std::printf ("  %s = %s\n", id.toRawUTF8(), overrides[id].toRawUTF8());
     }
 
     proc.setPlayConfigDetails (2, 2, sr, blockSize);
@@ -335,9 +362,75 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     writer->writeFromAudioSampleBuffer (out, 0, total);
     writer.reset();
 
-    std::printf ("rendered %s (%.1f s, %s%s%s)\n", file.getFullPathName().toRawUTF8(),
+    std::printf ("rendered %s (%.1f s, %s%s%s, formants %s)\n", file.getFullPathName().toRawUTF8(),
                  total / sr, hq ? "hq" : "fast", follow ? ", follow" : "",
-                 colour ? ", colour" : "");
+                 colour ? ", colour" : "", formantShift ? "shift" : "hold");
+    return 0;
+}
+
+/** Замер стоимости процессора. Не тест — тесты не решают, что 12 % это много.
+    Худший случай из ADR 0005: восемь голосов, все транспонированные (аккорд, а не
+    одна нота — компенсация формант стоит только на сдвинутых голосах), 48 кГц,
+    блок 512, окраска петли по умолчанию. Считается доля ядра: сколько реального
+    времени ушло на обсчёт секунды звука.
+    Запуск: ProcessorTest --bench [fast|hq] [hold|shift] */
+static int benchmark (const juce::String& mode, const juce::String& formants)
+{
+    constexpr double sr = 48000.0;
+    constexpr int blockSize = 512;
+    constexpr double seconds = 20.0;
+
+    MidiDelayProcessor proc;
+    setParam (proc, "quality", mode == "fast" ? 0.0f : 1.0f);
+    setParam (proc, "delayTime", 400.0f);
+    setParam (proc, "mix", 100.0f);
+    setParam (proc, "feedback", 35.0f);
+    setParam (proc, "voices", 8.0f);
+    setParam (proc, "release", 2000.0f);
+    setParam (proc, "formants", formants == "shift" ? 0.0f : 1.0f);
+
+    proc.setPlayConfigDetails (2, 2, sr, blockSize);
+    proc.prepareToPlay (sr, blockSize);
+
+    // Восемь разных нот, ни одной в унисон: на унисоне HQ не строит частотную карту,
+    // и замер вышел бы вдвое оптимистичнее правды (риск 4 сессии 13).
+    juce::MidiBuffer chord;
+    for (int k = 0; k < 8; ++k)
+        chord.addEvent (juce::MidiMessage::noteOn (1, 61 + k, 0.9f), 0);
+
+    juce::AudioBuffer<float> block (2, blockSize);
+    const int blocks = static_cast<int> (sr * seconds / blockSize);
+    double phase = 0.0;
+
+    // Прогрев: первый блок аллоцирует таблицы БПФ внутри библиотеки, и его время
+    // к установившейся стоимости отношения не имеет.
+    block.clear();
+    proc.processBlock (block, chord);
+
+    const auto started = std::chrono::steady_clock::now();
+
+    for (int b = 0; b < blocks; ++b)
+    {
+        for (int i = 0; i < blockSize; ++i)
+        {
+            phase += 220.0 / sr;
+            if (phase >= 1.0) phase -= 1.0;
+
+            const auto v = static_cast<float> (0.25 * (2.0 * phase - 1.0));
+            block.setSample (0, i, v);
+            block.setSample (1, i, v);
+        }
+
+        juce::MidiBuffer midi;
+        proc.processBlock (block, midi);
+    }
+
+    const double elapsed = std::chrono::duration<double> (
+        std::chrono::steady_clock::now() - started).count();
+
+    std::printf ("%s, formants %s: %.1f %% ядра (%.2f с на %.0f с звука)\n",
+                 mode == "fast" ? "fast" : "hq", formants.toRawUTF8(),
+                 100.0 * elapsed / seconds, elapsed, seconds);
     return 0;
 }
 
@@ -351,10 +444,34 @@ int main (int argc, char* argv[])
     // с кириллицей превращается в мохибейку ещё до открытия файла. Это та же ловушка,
     // что с текстами в окне плагина (CLAUDE.md), только с другой стороны — на входе.
     if (argc >= 3 && juce::String (argv[1]) == "--render")
+    {
+        // Хвост команды — набор слов без порядка: colour и shift ищутся где угодно
+        // после имени файла. Позиционные флаги тут кончились бы «пустой строкой,
+        // чтобы добраться до шестого аргумента».
+        bool colour = false, formantShift = false;
+        juce::StringPairArray overrides;
+
+        for (int i = 5; i < argc; ++i)
+        {
+            const juce::String flag (juce::String::fromUTF8 (argv[i]));
+
+            if (flag.contains ("="))
+                overrides.set (flag.upToFirstOccurrenceOf ("=", false, false),
+                               flag.fromFirstOccurrenceOf ("=", false, false));
+
+            colour       = colour       || flag == "colour";
+            formantShift = formantShift || flag == "shift";
+        }
+
         return renderDemo (juce::String::fromUTF8 (argv[2]),
                            argc >= 4 ? juce::String::fromUTF8 (argv[3]) : juce::String ("hq"),
                            argc >= 5 ? juce::String::fromUTF8 (argv[4]) : juce::String(),
-                           argc >= 6 && juce::String (argv[5]) == "colour");
+                           colour, formantShift, overrides);
+    }
+
+    if (argc >= 2 && juce::String (argv[1]) == "--bench")
+        return benchmark (argc >= 3 ? juce::String (argv[2]) : juce::String ("hq"),
+                          argc >= 4 ? juce::String (argv[3]) : juce::String ("hold"));
 
     // --- Раскладки шин ---------------------------------------------------------
     {
@@ -1025,6 +1142,156 @@ int main (int argc, char* argv[])
         CHECK (std::abs (tailFrequency (72, 0.0f, 12.0f, 5.0f, 2.0 * f0) - 2.0 * f0) < 2.0);
     }
 
+    // --- Форманты и предел тональности (#24) -----------------------------------
+    // Две правки питчера, обе слышны только на больших сдвигах и обе молча
+    // отваливаются, если перепутать аргумент. Предел тональности проверяется точным
+    // числом: выше него частоты не умножаются, а сдвигаются на постоянную величину,
+    // и на октаве вверх тон 6 кГц обязан прийти не на 12 кГц, а ниже — иначе шипящие
+    // уезжают в свист. Форманты — центром тяжести спектра: при Hold спектральная
+    // огибающая остаётся на месте, при Shift едет вместе с высотой.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 4096;
+        constexpr int blocks = 24;
+        constexpr int total = blockSize * blocks;
+        constexpr int measureFrom = total / 2;
+
+        /** Хвост на ноте 72 (ровно октава вверх от Root). Материал задаётся снаружи:
+            синус меряет частоту, пила с наклоном спектра — центр тяжести. */
+        const auto tail = [&] (bool formantHold, const std::function<float (int)>& material,
+                               juce::AudioBuffer<float>& out)
+        {
+            MidiDelayProcessor proc;
+            plainLoop (proc);
+            setParam (proc, "quality", 1.0f);       // форманты живут только в HQ
+            setParam (proc, "formants", formantHold ? 1.0f : 0.0f);
+            setParam (proc, "delayTime", 200.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "release", 300.0f);
+            setParam (proc, "width", 0.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            out.setSize (2, total);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float v = material (b * blockSize + i);
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0, 72) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);   // форманты не аллоцируют в потоке
+
+                for (int ch = 0; ch < 2; ++ch)
+                    out.copyFrom (ch, b * blockSize, block, ch, 0, blockSize);
+            }
+
+            CHECK (out.getMagnitude (0, measureFrom, total - measureFrom) > 0.02f);
+        };
+
+        /** Доля энергии выше 1,2 кГц. Это и есть «бурундук», выраженный числом:
+            транспонирование без компенсации тащит формантную область вверх, и энергия
+            перетекает в верх спектра. Центр тяжести здесь хуже — его держат внизу
+            первые две гармоники, и он почти не двигается. Считается по гармоникам
+            хвоста, а не по равномерной сетке: сетка попадает между ними, и результат
+            начинает зависеть от того, куда она легла. */
+        const auto highEnergyShare = [&] (const juce::AudioBuffer<float>& x, double fundamental)
+        {
+            double low = 0.0, high = 0.0;
+
+            // До 5 кГц: выше начинает работать предел тональности, и там гармоники
+            // уже не кратны основному тону (проверка 1).
+            for (double f = fundamental; f < 5000.0; f += fundamental)
+            {
+                const double a = amplitudeAt (x, measureFrom, total - measureFrom, f, sr);
+
+                (f > 1200.0 ? high : low) += a * a;
+            }
+
+            return low > 0.0 ? high / low : 0.0;
+        };
+
+        juce::AudioBuffer<float> out;
+
+        // 1. Предел тональности. Тон 6 кГц на октаве вверх: библиотека считает предел
+        //    как 8000/sqrt(2) = 5657 Гц, и всё, что выше, переносится сдвигом на эту же
+        //    величину. Значит 6000 -> 11657, а не 12000. Разница в 343 Гц — это и есть
+        //    разница между «шипящая переехала» и «шипящая ушла в свист».
+        {
+            const double tone = 6000.0;
+            const double limit = 8000.0 / std::sqrt (2.0);
+            const double expected = tone + limit;
+
+            tail (true, [tone] (int n) { return static_cast<float> (0.4 * std::sin (
+                juce::MathConstants<double>::twoPi * tone * n / sr)); }, out);
+
+            const double got = dominantFrequency (out, measureFrom, total - measureFrom,
+                                                  expected, 500.0, sr);
+
+            CHECK (std::abs (got - expected) < 60.0);
+            CHECK (got < 2.0 * tone - 200.0);   // и это точно не честное удвоение
+        }
+
+        // 2. Форманты. Материал — модель гласной: пила 120 Гц через три резонатора
+        //    на 700, 1200 и 2600 Гц. Пила через простой фильтр тут не годится вовсе:
+        //    у неё нет формант, и компенсации нечего держать — замер на таком материале
+        //    показывает что угодно, кроме того, что проверяется (проверено, сессия 13).
+        {
+            const auto vowel = [] (int n)
+            {
+                static double phase = 0.0;
+                static double y1[3] {}, y2[3] {};
+
+                if (n == 0) { phase = 0.0; y1[0] = y1[1] = y1[2] = y2[0] = y2[1] = y2[2] = 0.0; }
+
+                phase += 120.0 / sr;
+                if (phase >= 1.0) phase -= 1.0;
+
+                const double source = 0.2 * (2.0 * phase - 1.0);
+                static constexpr double formantHz[3] { 700.0, 1200.0, 2600.0 };
+                static constexpr double weight[3] { 1.0, 0.6, 0.3 };
+                double sum = 0.0;
+
+                for (int k = 0; k < 3; ++k)
+                {
+                    constexpr double r = 0.97;
+                    const double w = juce::MathConstants<double>::twoPi * formantHz[k] / sr;
+                    const double y = source * (1.0 - r) + 2.0 * r * std::cos (w) * y1[k] - r * r * y2[k];
+
+                    y2[k] = y1[k];
+                    y1[k] = y;
+                    sum += weight[k] * y;
+                }
+
+                return static_cast<float> (sum);
+            };
+
+            tail (true, vowel, out);
+            const double held = highEnergyShare (out, 240.0);
+
+            tail (false, vowel, out);
+            const double shifted = highEnergyShare (out, 240.0);
+
+            std::printf ("  форманты на октаве вверх: энергия выше 1,2 кГц — "
+                         "Hold %.3f, Shift %.3f\n", held, shifted);
+
+            // Замерено: Hold 0,06, Shift 0,27 — вчетверо. Порог вдвое ниже
+            // измеренного, чтобы проверка ловила отвал компенсации, а не дрожала
+            // от версии библиотеки.
+            CHECK (shifted > held * 2.0);
+        }
+    }
+
     // --- Состояние -------------------------------------------------------------
     {
         MidiDelayProcessor proc;
@@ -1357,6 +1624,7 @@ int main (int argc, char* argv[])
             setParam (proc, "bypass", 0.0f);
             setParam (proc, "attack", 1.0f);
             setParam (proc, "diffusion", diffusion);
+            setParam (proc, "modulation", 0.0f);   // замер тайминга: дрейф позиции чтения тут мешает
             setParam (proc, "filterLo", loHz);
             setParam (proc, "filterHi", hiHz);
 
@@ -1460,6 +1728,7 @@ int main (int argc, char* argv[])
                 setParam (proc, "bypass", 0.0f);
                 setParam (proc, "attack", 1.0f);
                 setParam (proc, "diffusion", 0.0f);
+                setParam (proc, "modulation", 0.0f);
                 setParam (proc, "filterLo", 20.0f);
                 setParam (proc, "filterHi", hiHz);
 
@@ -1505,6 +1774,7 @@ int main (int argc, char* argv[])
                 setParam (proc, "bypass", 0.0f);
                 setParam (proc, "attack", 1.0f);
                 setParam (proc, "diffusion", 0.0f);
+                setParam (proc, "modulation", 0.0f);
                 setParam (proc, "filterLo", loHz);
                 setParam (proc, "filterHi", hiHz);
 
@@ -1538,8 +1808,9 @@ int main (int argc, char* argv[])
             }
         }
 
-        // Диффузия и фильтры вместе при feedback 95 % не разгоняют петлю. Проверять
-        // надо именно вместе: по отдельности усиление меняется слабее.
+        // Диффузия, фильтры и дрейф вместе при feedback 95 % не разгоняют петлю. Проверять
+        // надо именно вместе: по отдельности усиление меняется слабее, а модуляция
+        // ещё и меняет длину круга — то есть третий узел в той же петле (#46).
         {
             MidiDelayProcessor proc;
             setParam (proc, "quality", 0.0f);
@@ -1550,6 +1821,7 @@ int main (int argc, char* argv[])
             setParam (proc, "bypass", 0.0f);
             setParam (proc, "attack", 1.0f);
             setParam (proc, "diffusion", 100.0f);
+            setParam (proc, "modulation", 100.0f);
             setParam (proc, "filterLo", 100.0f);
             setParam (proc, "filterHi", 12000.0f);
 
@@ -1592,6 +1864,178 @@ int main (int argc, char* argv[])
             // и есть та «глубина», ради которой диффузия и ставится.
             CHECK (peak < 5.5f);
             CHECK (lateTail < earlyTail * 0.6f);
+        }
+    }
+
+    // --- Модуляция времени и ducking (#46, #47) ---------------------------------
+    // Обе правки обязаны быть невидимы на нуле ручки — это уже доказано выше точным
+    // числом в отклике петли (проверка «Diffusion 0» зовёт оба параметра в ноль).
+    // Здесь проверяется то, ради чего они заведены: дрейф расцепляет круги, а хвост
+    // приседает под сухим и возвращается в паузе, одинаково в обоих Time Mode.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 8192;
+        constexpr float delayMs = 200.0f;
+        constexpr double tone = 1000.0;   // 200 периодов в петле: круги складываются в фазе
+
+        /** Прогон с тоном заданной длительности и тишиной до конца. Возвращает
+            установившийся уровень тона под сигналом и уровень хвоста в паузе. */
+        const auto run = [&] (float modulation, float ducking, bool follow,
+                              int drivenBlocks, int totalBlocks,
+                              double& underSignal, double& inPause)
+        {
+            MidiDelayProcessor proc;
+            plainLoop (proc);
+            setParam (proc, "quality", 0.0f);
+            setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "feedback", 90.0f);
+            setParam (proc, "mix", 100.0f);     // на выходе только хвост
+            setParam (proc, "outputGain", 0.0f);
+            setParam (proc, "bypass", 0.0f);
+            setParam (proc, "attack", 1.0f);
+            setParam (proc, "release", 2000.0f);
+            setParam (proc, "width", 0.0f);
+            setParam (proc, "modulation", modulation);
+            setParam (proc, "ducking", ducking);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            underSignal = inPause = 0.0;
+
+            for (int b = 0; b < totalBlocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = b < drivenBlocks
+                        ? static_cast<float> (0.25 * std::sin (juce::MathConstants<double>::twoPi
+                                                               * tone * (b * blockSize + i) / sr))
+                        : 0.0f;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);   // дрейф и детектор не аллоцируют
+
+                // Последний блок под сигналом — там петля уже установилась.
+                if (b == drivenBlocks - 1)
+                    underSignal = amplitudeAt (block, blockSize / 2, blockSize / 2, tone, sr);
+
+                // Первый блок после конца сигнала: детектор к этому моменту отпустил
+                // (спад 250 мс, блок 170 мс — два блока с запасом), а хвост ещё звучит.
+                if (b == drivenBlocks + 2)
+                    inPause = amplitudeAt (block, blockSize / 2, blockSize / 2, tone, sr);
+            }
+        };
+
+        double open = 0.0, drifting = 0.0, unused = 0.0;
+
+        // 1. Дрейф расцепляет круги. Тон стоит ровно на резонансе петли: без модуляции
+        //    двенадцать кругов складываются в фазе и уровень вырастает почти в 1/(1-0,9).
+        //    Дрейф в 4 мс — это четыре периода тона, то есть круги перестают совпадать
+        //    по фазе, и резонанс садится. Это и есть «металлический призвук слабее»,
+        //    выраженное числом: металлика петли — и есть её резонансы.
+        run (0.0f,   0.0f, false, 12, 16, open,     unused);
+        run (100.0f, 0.0f, false, 12, 16, drifting, unused);
+
+        std::printf ("  дрейф: резонанс петли на feedback 90 %% — без %.3f, с дрейфом %.3f\n",
+                     open, drifting);
+
+        CHECK (drifting < open * 0.7);
+
+        // 1б. И дрейф не превращается в расстройку. Уход высоты в хвосте — это цена
+        //     метода: скорость изменения задержки и есть сдвиг высоты, а сигнал,
+        //     прошедший n кругов, испытал его n раз. Значит мерить надо не первый
+        //     повтор, а длинный хвост на высоком feedback — то есть худший случай.
+        {
+            const auto pitchSpreadCents = [&] (float modulation, float feedbackPercent)
+            {
+                MidiDelayProcessor proc;
+                plainLoop (proc);
+                setParam (proc, "quality", 0.0f);
+                setParam (proc, "delayTime", delayMs);
+                setParam (proc, "feedback", feedbackPercent);
+                setParam (proc, "mix", 100.0f);
+                setParam (proc, "outputGain", 0.0f);
+                setParam (proc, "bypass", 0.0f);
+                setParam (proc, "attack", 1.0f);
+                setParam (proc, "release", 2000.0f);
+                setParam (proc, "width", 0.0f);
+                setParam (proc, "modulation", modulation);
+
+                proc.setPlayConfigDetails (2, 2, sr, 4096);
+                proc.prepareToPlay (sr, 4096);
+
+                juce::AudioBuffer<float> block (2, 4096);
+                double lo = 1.0e9, hi = -1.0e9;
+
+                for (int b = 0; b < 120; ++b)   // 10 с: 2 с сигнала, дальше только хвост
+                {
+                    for (int i = 0; i < 4096; ++i)
+                    {
+                        const auto v = b < 24
+                            ? static_cast<float> (0.25 * std::sin (juce::MathConstants<double>::twoPi
+                                                                   * tone * (b * 4096 + i) / sr))
+                            : 0.0f;
+                        block.setSample (0, i, v);
+                        block.setSample (1, i, v);
+                    }
+
+                    runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+
+                    // Только по хвосту и только пока он слышен: в затихшем блоке
+                    // «самая сильная составляющая» — это уже шум округления.
+                    if (b > 26 && block.getMagnitude (0, 0, 4096) > 0.05f)
+                    {
+                        const double f = dominantFrequency (block, 0, 4096, tone, 40.0, sr);
+                        lo = juce::jmin (lo, f);
+                        hi = juce::jmax (hi, f);
+                    }
+                }
+
+                return hi > 0.0 ? 1200.0 * std::log2 (hi / lo) : 0.0;
+            };
+
+            // Глубина 0 — ровно ноль центов, а не «почти»: позиция чтения не тронута,
+            // и это то же доказательство бит-в-бит, что и точное число в отклике петли.
+            CHECK (pitchSpreadCents (0.0f, 90.0f) < 0.01);
+
+            // Значение по умолчанию на значении по умолчанию: 3,5 цента при feedback 35 %.
+            // Порог слышимости расстройки — единицы центов, и дрейф под ним. На полной
+            // ручке и feedback 90 % замерено 40 центов, но это уже сознательно крайнее
+            // положение обеих ручек, и там дрейф — заявленный характер, а не дефект.
+            const double atDefaults = pitchSpreadCents (20.0f, 35.0f);
+
+            std::printf ("  дрейф на значениях по умолчанию: %.1f центов\n", atDefaults);
+            CHECK (atDefaults < 8.0);
+        }
+
+        // 2. Ducking. Под сухим хвост садится, в паузе возвращается — и это два разных
+        //    числа, а не одно: детектор обязан отпускать, иначе приседание было бы просто
+        //    тише сделанным wet.
+        for (const bool follow : { false, true })
+        {
+            double flatUnder = 0.0, flatPause = 0.0, duckUnder = 0.0, duckPause = 0.0;
+
+            run (0.0f, 0.0f,   follow, 12, 16, flatUnder, flatPause);
+            run (0.0f, 100.0f, follow, 12, 16, duckUnder, duckPause);
+
+            std::printf ("  ducking (%s): под сухим %.3f -> %.3f, в паузе %.3f -> %.3f\n",
+                         follow ? "follow" : "free", flatUnder, duckUnder, flatPause, duckPause);
+
+            // Полная ручка — это -12 dB, то есть четверть. Порог 0,45 берёт с запасом
+            // на то, что детектор едет по огибающей, а не стоит на полке.
+            CHECK (duckUnder < flatUnder * 0.45);
+
+            // А в паузе хвост обязан вернуться: приседание ушло, осталось затухание петли.
+            CHECK (duckPause > flatPause * 0.8);
+
+            // И то же самое в обоих режимах Time Mode — детектор берёт сухой оттуда же,
+            // откуда его берёт микс, и выравнивание Follow на приседание не влияет.
+            CHECK (duckUnder / flatUnder > 0.05);
         }
     }
 

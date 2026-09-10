@@ -17,9 +17,12 @@ void VoiceManager::prepare (double newSampleRate, int maxBlockSamples)
     nextAge = 0;
     sustainDown = false;
 
-    // prepare пересоздал движки, а значит сбросил и латч: вернуть выбор параметра.
+    // prepare пересоздал движки, а значит сбросил и латч: вернуть выбор параметров.
     for (auto& v : voices)
+    {
         v.setEngine (engine);
+        v.setFormantHold (formantHold);
+    }
 }
 
 void VoiceManager::reset()
@@ -115,6 +118,17 @@ void VoiceManager::setEngine (PitchEngine newEngine)
 
     for (auto& v : voices)
         v.setEngine (newEngine);
+}
+
+void VoiceManager::setFormantHold (bool shouldHold)
+{
+    if (shouldHold == formantHold)
+        return;
+
+    formantHold = shouldHold;
+
+    for (auto& v : voices)
+        v.setFormantHold (shouldHold);
 }
 
 int VoiceManager::getLatencySamples (PitchEngine which) const
