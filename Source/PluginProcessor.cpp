@@ -79,9 +79,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
     // Плотность диффузии хвоста (#45): 0 — цепочка алл-пассов обойдена целиком
     // и выход бит-в-бит совпадает с простым дилеем, дальше растёт коэффициент g.
     // Потолок 0,7 — выше алл-пасс Шрёдера начинает звенеть металлом.
+    // Значение по умолчанию выбрано на слух: пользователь послушал рендеры сессии 12,
+    // на 60 % звона не услышал и попросил для умолчания вариант понейтральнее.
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "diffusion", 1 }, "Diffusion",
-        Range { 0.0f, 100.0f, 0.1f }, 35.0f,
+        Range { 0.0f, 100.0f, 0.1f }, 50.0f,
         AudioParameterFloatAttributes().withLabel ("%")));
 
     params.push_back (std::make_unique<AudioParameterFloat> (

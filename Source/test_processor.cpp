@@ -133,9 +133,10 @@ namespace
     и согласные, то есть ровно слабое место фазового вокодера.
     Рендер воспроизводим: зерно случайной фазы у HQ-движка фиксировано.
     Mix 100 %: слушаем сам движок, а не то, как он прячется за сухим сигналом.
-    По умолчанию диффузия и фильтры петли выключены — рендер судит питчер, а не
-    обвязку. Пятый аргумент colour включает окраску петли (#45, #22) и обратную
-    связь: это A/B к тому же файлу без окраски, одной командой.
+    По умолчанию диффузия, фильтры петли и обратная связь выключены — рендер судит
+    питчер, а не обвязку. Пятый аргумент colour оставляет все значения по умолчанию,
+    то есть даёт плагин таким, каким его услышит пользователь: это A/B к тому же файлу,
+    одной командой.
     Запуск: ProcessorTest --render out.wav [fast|hq|follow] [input.wav] [colour] */
 static int renderDemo (const juce::String& path, const juce::String& mode,
                        const juce::String& inputPath, bool colour)
@@ -256,7 +257,6 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
 
     MidiDelayProcessor proc;
     setParam (proc, "delayTime", 400.0f);
-    setParam (proc, "feedback", 0.0f);
     setParam (proc, "mix", 100.0f);
     setParam (proc, "outputGain", 0.0f);
     setParam (proc, "bypass", 0.0f);
@@ -266,12 +266,17 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     setParam (proc, "pitchRange", 12.0f);
     setParam (proc, "quality", hq ? 1.0f : 0.0f);
     setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
-    setParam (proc, "diffusion", colour ? 60.0f : 0.0f);
-    setParam (proc, "filterLo", colour ? 100.0f : 20.0f);
-    setParam (proc, "filterHi", colour ? 12000.0f : 20000.0f);
-
-    if (colour)
-        setParam (proc, "feedback", 45.0f);   // без повторов диффузию не услышать
+    // Без colour окраска петли и обратная связь выключаются руками — слышно голый
+    // питчер. С colour не выставляется ничего: остаются значения по умолчанию,
+    // то есть ровно то, что услышит пользователь, открыв плагин. Числа тут
+    // намеренно не дублируются — иначе рендер начнёт врать при первой же их правке.
+    if (! colour)
+    {
+        setParam (proc, "feedback", 0.0f);
+        setParam (proc, "diffusion", 0.0f);
+        setParam (proc, "filterLo", 20.0f);
+        setParam (proc, "filterHi", 20000.0f);
+    }
 
     proc.setPlayConfigDetails (2, 2, sr, blockSize);
     proc.prepareToPlay (sr, blockSize);
