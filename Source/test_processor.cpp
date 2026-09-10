@@ -155,6 +155,13 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         juce::AudioFormatManager formats;
         formats.registerBasicFormats();
 
+       #if JUCE_MAC || JUCE_IOS
+        // Не роскошь: материал для прослушивания приходит из диктофона и мессенджеров,
+        // и там сплошь AAC — иногда прямо под расширением .wav. registerBasicFormats
+        // знает только WAV и AIFF и на таком файле молча вернёт nullptr.
+        formats.registerFormat (new juce::CoreAudioFormat(), false);
+       #endif
+
         juce::File source (inputPath);
         std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (source));
 
@@ -281,10 +288,13 @@ int main (int argc, char* argv[])
 
     juce::ScopedJuceInitialiser_GUI juceInit;
 
+    // fromUTF8, а не конструктор из char*: тот трактует байты как ASCII, и путь
+    // с кириллицей превращается в мохибейку ещё до открытия файла. Это та же ловушка,
+    // что с текстами в окне плагина (CLAUDE.md), только с другой стороны — на входе.
     if (argc >= 3 && juce::String (argv[1]) == "--render")
-        return renderDemo (juce::String (argv[2]),
-                           argc >= 4 ? juce::String (argv[3]) : juce::String ("hq"),
-                           argc >= 5 ? juce::String (argv[4]) : juce::String(),
+        return renderDemo (juce::String::fromUTF8 (argv[2]),
+                           argc >= 4 ? juce::String::fromUTF8 (argv[3]) : juce::String ("hq"),
+                           argc >= 5 ? juce::String::fromUTF8 (argv[4]) : juce::String(),
                            argc >= 6 && juce::String (argv[5]) == "colour");
 
     // --- Раскладки шин ---------------------------------------------------------
