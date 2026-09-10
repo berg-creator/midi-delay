@@ -383,7 +383,9 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
             const int length = juce::jmin (noteLength, total - on);
 
             double phase = 0.0;
-            float env = 0.22f;
+            // Уровень плака: он тут аккомпанемент, а не солист. На слух 0,22 забивало
+            // и голос, и хвост — то есть ровно то, что проверялось, слышно не было.
+            float env = 0.03f;
             lp = 0.0f;
 
             for (int i = 0; i < length; ++i)
