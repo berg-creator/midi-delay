@@ -278,7 +278,11 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     setParam (proc, "pitchRange", 12.0f);
     setParam (proc, "quality", hq ? 1.0f : 0.0f);
     setParam (proc, "timeMode", follow ? 1.0f : 0.0f);
-    setParam (proc, "formants", formantShift ? 0.0f : 1.0f);
+    // Только когда слово shift названо явно: иначе рендер навязывал бы своё значение
+    // вместо умолчания, и с colour показывал бы не тот плагин, который откроет
+    // пользователь. Ровно тот же капкан, что был с числами окраски до сессии 12.
+    if (formantShift)
+        setParam (proc, "formants", 0.0f);
     // Без colour окраска петли и обратная связь выключаются руками — слышно голый
     // питчер. С colour не выставляется ничего: остаются значения по умолчанию,
     // то есть ровно то, что услышит пользователь, открыв плагин. Числа тут
@@ -297,6 +301,9 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     // что выключил режим без colour.
     for (const auto& id : overrides.getAllKeys())
     {
+        if (id == "noteMs")
+            continue;   // настройка рендера, а не параметр плагина
+
         if (proc.apvts.getParameter (id) == nullptr)
         {
             std::printf ("нет такого параметра: %s\n", id.toRawUTF8());
@@ -324,7 +331,9 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
 
     const int* notes = pluck ? pluckPattern : melody;
     const int numNotes = pluck ? 8 : 4;
-    const int noteLength = static_cast<int> (sr * (pluck ? 0.25 : 1.0));
+    const double noteSeconds = overrides.containsKey ("noteMs")
+        ? overrides["noteMs"].getDoubleValue() * 0.001 : (pluck ? 0.25 : 1.0);
+    const int noteLength = static_cast<int> (sr * noteSeconds);
     const int gap = static_cast<int> (sr * (pluck ? 0.03 : 0.05));
     const int firstNote = static_cast<int> (sr * 0.5);
 
@@ -357,6 +366,52 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
             out.copyFrom (ch, start, block, ch, 0, n);
     }
 
+    // Плак в миксе. Без него на слух нечего сравнивать: вопрос «попадает ли хвост
+    // в гармонию» без гармонии не имеет смысла. Синтез самый простой, какой звучит
+    // щипком, — пила с быстрым спадом через однополюсник. Играет он ровно те же ноты
+    // и в те же моменты, что уходят в плагин: это и есть проверка «хвост повторяет
+    // ноты плака», а не «хвост звучит как что-то».
+    if (pluck)
+    {
+        const auto decay = static_cast<float> (std::exp (-1.0 / (sr * 0.18)));
+        float lp = 0.0f;
+
+        for (int k = 0; firstNote + k * noteLength < total; ++k)
+        {
+            const int on = firstNote + k * noteLength;
+            const double frequency = 440.0 * std::pow (2.0, (notes[k % numNotes] - 69) / 12.0);
+            const int length = juce::jmin (noteLength, total - on);
+
+            double phase = 0.0;
+            float env = 0.22f;
+            lp = 0.0f;
+
+            for (int i = 0; i < length; ++i)
+            {
+                phase += frequency / sr;
+                if (phase >= 1.0) phase -= 1.0;
+
+                lp += 0.25f * (static_cast<float> (2.0 * phase - 1.0) - lp);
+                env *= decay;
+
+                for (int ch = 0; ch < 2; ++ch)
+                    out.addSample (ch, on + i, lp * env);
+            }
+        }
+
+        // Плак прибавлен поверх готового микса, значит пик мог уйти за единицу.
+        // Нормировать весь файл честнее, чем клиповать: клип слышен как хруст
+        // и его потом ищут в плагине, которого он не касается.
+        const float peak = juce::jmax (out.getMagnitude (0, 0, total), out.getMagnitude (1, 0, total));
+
+        if (peak > 0.99f)
+        {
+            out.applyGain (0.99f / peak);
+            std::printf ("  пик %.2f, файл приглушён на %.1f dB\n", peak,
+                         juce::Decibels::gainToDecibels (0.99f / peak));
+        }
+    }
+
     juce::File file (juce::File::getCurrentWorkingDirectory().getChildFile (path));
     file.deleteFile();
 
@@ -376,7 +431,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     std::printf ("rendered %s (%.1f s, %s%s%s%s, formants %s)\n", file.getFullPathName().toRawUTF8(),
                  total / sr, hq ? "hq" : "fast", follow ? ", follow" : "",
                  colour ? ", colour" : "", pluck ? ", pluck" : "",
-                 formantShift ? "shift" : "hold");
+                 proc.apvts.getRawParameterValue ("formants")->load() > 0.5f ? "hold" : "shift");
     return 0;
 }
 
