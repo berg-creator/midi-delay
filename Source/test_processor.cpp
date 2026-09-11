@@ -633,6 +633,273 @@ static int benchmark (const juce::String& mode, const juce::String& formants)
     return 0;
 }
 
+/** Регрессионные рендеры DSP (#34). Четыре сценария с фиксированным входом и MIDI —
+    чистый дилей, голос с питчем, аккорд, петля обратной связи с окраской по умолчанию —
+    сверяются с эталонами в tests/regression/. Ловят тихие поломки: каждый CHECK выше
+    мерит одно свойство, а эталон держит весь сигнал целиком.
+
+    Эталоны переписываются словом update — только когда звук изменён намеренно
+    и изменение услышано (вердикт уха главнее замера, CLAUDE.md), и коммитятся вместе
+    с правкой. Хвостом выставляется любой параметр поверх всех сценариев
+    (outputGain=0.1): так проверяется, что тест вообще способен упасть.
+    Запуск из корня репозитория: ProcessorTest --regress [update] [id=value ...] */
+static int regression (bool update, const juce::StringPairArray& overrides)
+{
+    constexpr double sr = 48000.0;
+    constexpr int blockSize = 512;
+
+    // Допуск — насколько выход может отойти от эталона в окне, относительно уровня
+    // эталона. Снизу его держит дрейф между платформами (x86_64 без FMA против arm64
+    // с FMA, замерено через Rosetta), сверху — наименьшая поломка, которую обязан
+    // поймать тест: +0,1 dB громкости дают -38,7 dB. Числа — ## [34].
+    // Пол -100 dBFS — для тихих окон, где относительная мера теряет смысл: ниже шума
+    // 16-битного файла расхождение не слышно ни в каком миксе.
+    constexpr double tolerance_dB = -60.0;
+    constexpr double absoluteFloor_dBFS = -100.0;
+    const double relativeTolerance = std::pow (10.0, tolerance_dB / 20.0);
+    const double absoluteFloor = std::pow (10.0, absoluteFloor_dBFS / 20.0);
+
+    struct Case
+    {
+        const char* name;
+        float quality;              // 0 Fast, 1 HQ
+        std::vector<int> notes;
+        float feedback;
+        bool colour;                // окраска петли по умолчанию, а не выключенная
+        double seconds;
+    };
+
+    // Оба движка, один голос и несколько, унисон и сдвиг. Нота 60 — унисон от Root Key C.
+    // Петля — на Fast нарочно. HQ на окрашенной петле расходится между платформами тем
+    // сильнее, чем тише хвост (-29 dB там, где хвост уже на -55 dBFS), и относительный
+    // допуск на нём не держится никакой. Петле движок не нужен: feedback снимается
+    // до питч-стадии. HQ покрыт сценарием voice.
+    const std::vector<Case> cases {
+        { "delay",    0.0f, { 60 },             0.0f,  false, 1.2 },
+        { "voice",    1.0f, { 67 },             0.0f,  false, 1.2 },
+        { "chord",    0.0f, { 60, 64, 67, 71 }, 0.0f,  false, 1.2 },
+        { "feedback", 0.0f, { 72 },             60.0f, true,  2.4 },
+    };
+
+    const auto dir = juce::File::getCurrentWorkingDirectory().getChildFile ("tests/regression");
+    juce::AudioFormatManager formats;
+    formats.registerBasicFormats();
+    juce::FlacAudioFormat flac;
+    bool failed = false;
+
+    for (const auto& c : cases)
+    {
+        const int total = static_cast<int> (sr * c.seconds);
+
+        MidiDelayProcessor proc;
+        engineDefaults (proc);
+
+        if (! c.colour)
+            plainLoop (proc);
+
+        setParam (proc, "sync", 0.0f);
+        setParam (proc, "quality", c.quality);
+        setParam (proc, "delayTime", 300.0f);
+        setParam (proc, "feedback", c.feedback);
+        setParam (proc, "mix", 50.0f);
+        setParam (proc, "attack", 5.0f);
+        setParam (proc, "release", 300.0f);
+
+        for (const auto& id : overrides.getAllKeys())
+            setParam (proc, id.toRawUTF8(), overrides[id].getFloatValue());
+
+        proc.setPlayConfigDetails (2, 2, sr, blockSize);
+        proc.prepareToPlay (sr, blockSize);
+
+        // Вход: пила 220 Гц на 0,4 с с фейдами по 5 мс, дальше тишина — повторы стоят
+        // в выходе отдельно от сухого. Нота встаёт на 700-й сэмпл, внутрь второго блока:
+        // смещение внутри блока тоже часть того, что держит эталон. Отпускается за 0,3 с
+        // до конца, чтобы в эталон попал и спад.
+        const int burst = static_cast<int> (sr * 0.4);
+        const int fade = static_cast<int> (sr * 0.005);
+        const int noteOn = 700;
+        const int noteOff = total - static_cast<int> (sr * 0.3);
+
+        juce::AudioBuffer<float> out (2, total);
+        juce::AudioBuffer<float> block (2, blockSize);
+        double phase = 0.0;
+
+        for (int start = 0; start < total; start += blockSize)
+        {
+            const int n = juce::jmin (blockSize, total - start);
+
+            for (int i = 0; i < n; ++i)
+            {
+                const int t = start + i;
+                phase += 220.0 / sr;
+                if (phase >= 1.0) phase -= 1.0;
+
+                const double gain = t >= burst ? 0.0 : juce::jmin (1.0, juce::jmin (t, burst - t) / double (fade));
+                const auto v = static_cast<float> (0.2 * gain * (2.0 * phase - 1.0));
+                block.setSample (0, i, v);
+                block.setSample (1, i, v);
+            }
+
+            juce::MidiBuffer midi;
+
+            for (const int note : c.notes)
+            {
+                if (noteOn  >= start && noteOn  < start + n) midi.addEvent (juce::MidiMessage::noteOn  (1, note, 0.9f), noteOn  - start);
+                if (noteOff >= start && noteOff < start + n) midi.addEvent (juce::MidiMessage::noteOff (1, note), noteOff - start);
+            }
+
+            // Последний блок короче: хост тоже так делает, и это часть сценария.
+            juce::AudioBuffer<float> view (block.getArrayOfWritePointers(), 2, n);
+            proc.processBlock (view, midi);
+
+            for (int ch = 0; ch < 2; ++ch)
+                out.copyFrom (ch, start, block, ch, 0, n);
+        }
+
+        const auto file = dir.getChildFile (juce::String (c.name) + ".flac");
+
+        if (update)
+        {
+            // 24 бита режут всё, что выше единицы, и эталон молча записал бы клип.
+            std::printf ("  #34 %s: пик %.3f\n", c.name, out.getMagnitude (0, total));
+            CHECK (out.getMagnitude (0, total) < 1.0f);
+
+            dir.createDirectory();
+            file.deleteFile();
+            std::unique_ptr<juce::OutputStream> stream = std::make_unique<juce::FileOutputStream> (file);
+            const auto writer = flac.createWriterFor (stream, juce::AudioFormatWriterOptions {}
+                                                                  .withSampleRate (sr)
+                                                                  .withNumChannels (2)
+                                                                  .withBitsPerSample (24));
+            CHECK (writer != nullptr);
+            CHECK (writer->writeFromAudioSampleBuffer (out, 0, total));
+            std::printf ("  #34 %s: эталон записан в %s\n", c.name, file.getFullPathName().toRawUTF8());
+            continue;
+        }
+
+        std::unique_ptr<juce::AudioFormatReader> reader (formats.createReaderFor (file));
+
+        if (reader == nullptr)
+        {
+            std::printf ("FAILED #34 %s: нет эталона %s\n"
+                         "  запускать из корня репозитория; эталон заводится словом update\n",
+                         c.name, file.getFullPathName().toRawUTF8());
+            return 1;
+        }
+
+        if (reader->sampleRate != sr || reader->numChannels != 2 || reader->lengthInSamples != total)
+        {
+            std::printf ("FAILED #34 %s: эталон другой формы (%.0f Гц, %d кан., %lld сэмплов, ждали %.0f, 2, %d)\n"
+                         "  сценарий изменён, а эталон нет\n",
+                         c.name, reader->sampleRate, static_cast<int> (reader->numChannels),
+                         static_cast<long long> (reader->lengthInSamples), sr, total);
+            failed = true;
+            continue;
+        }
+
+        juce::AudioBuffer<float> ref (2, total);
+        reader->read (&ref, 0, total, 0, true, true);
+
+        // Окна по 10 мс: одно число на файл утопило бы расхождение в тихом хвосте
+        // под громким сухим. 10 мс короче любого повтора и длиннее периода 220 Гц.
+        // Файл проходится целиком: первое расхождение показывает, где сломалось,
+        // худшее окно — насколько.
+        constexpr int window = 480;
+        double worstMargin_dB = 1.0e9;
+        int worstAt = 0, failAt = -1, failChannel = 0;
+        double failError = 0.0, failRef = 0.0, failGot = 0.0;
+
+        for (int from = 0; from + window <= total; from += window)
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                double e = 0.0, r = 0.0, g = 0.0;
+                const auto* pr = ref.getReadPointer (ch, from);
+                const auto* pg = out.getReadPointer (ch, from);
+
+                for (int i = 0; i < window; ++i)
+                {
+                    const double d = static_cast<double> (pg[i]) - pr[i];
+                    e += d * d;
+                    r += static_cast<double> (pr[i]) * pr[i];
+                    g += static_cast<double> (pg[i]) * pg[i];
+                }
+
+                const double errorRms = std::sqrt (e / window);
+                const double refRms = std::sqrt (r / window);
+                const double limit = std::max (refRms * relativeTolerance, absoluteFloor);
+                const double margin_dB = 20.0 * std::log10 (limit / std::max (errorRms, 1.0e-30));
+
+                if (margin_dB < worstMargin_dB)
+                {
+                    worstMargin_dB = margin_dB;
+                    worstAt = from;
+                }
+
+                if (errorRms > limit && failAt < 0)
+                {
+                    failAt = from;
+                    failChannel = ch;
+                    failError = errorRms;
+                    failRef = refRms;
+                    failGot = std::sqrt (g / window);
+                }
+            }
+
+        if (failAt < 0)
+        {
+            std::printf ("  #34 %s: совпадает с эталоном, запас до допуска %.0f dB (худшее окно %.2f с)\n",
+                         c.name, worstMargin_dB, worstAt / sr);
+            continue;
+        }
+
+        failed = true;
+        const auto dB = [] (double x) { return 20.0 * std::log10 (std::max (x, 1.0e-30)); };
+
+        std::printf ("FAILED #34 %s: разошлось с %.3f с, канал %s\n"
+                     "  ошибка %.1f dB от эталона при допуске %.0f dB; уровень эталона %.1f dBFS, сейчас %.1f dBFS\n"
+                     "  худшее окно %.2f с, за допуском на %.1f dB\n",
+                     c.name, failAt / sr, failChannel == 0 ? "L" : "R",
+                     dB (failError / std::max (failRef, 1.0e-30)), tolerance_dB,
+                     dB (failRef), dB (failGot), worstAt / sr, -worstMargin_dB);
+
+        // Подсказка, что именно разошлось, — по 100 мс от места расхождения.
+        // Коэффициент методом наименьших квадратов: если он один объясняет 99 % ошибки,
+        // разошлась громкость или полярность, а не сам звук. Сдвиг по времени отдельно
+        // не ищется: сухой идёт мимо дилея, целиком выход уехать не может, а сдвинутый
+        // хвост под несдвинутым сухим — это и есть «форма». Проверено пробой delayTime.
+        const int span = juce::jmin (static_cast<int> (sr * 0.1), total - failAt);
+        double cross = 0.0, refEnergy = 0.0, errorEnergy = 0.0;
+
+        for (int i = 0; i < span; ++i)
+        {
+            const double r = ref.getSample (failChannel, failAt + i);
+            const double g = out.getSample (failChannel, failAt + i);
+            cross += r * g;
+            refEnergy += r * r;
+            errorEnergy += (g - r) * (g - r);
+        }
+
+        const double gain = refEnergy > 0.0 ? cross / refEnergy : 0.0;
+        double residual = 0.0;
+
+        for (int i = 0; i < span; ++i)
+        {
+            const double d = out.getSample (failChannel, failAt + i) - gain * ref.getSample (failChannel, failAt + i);
+            residual += d * d;
+        }
+
+        if (refEnergy < 1.0e-12)
+            std::printf ("  в эталоне здесь тишина, а сейчас звук\n");
+        else if (residual < 0.01 * errorEnergy)
+            std::printf (gain < 0.0 ? "  перевернулась полярность, уровень %+.2f dB\n"
+                                    : "  разошёлся уровень: %+.2f dB, звук тот же\n", dB (std::abs (gain)));
+        else
+            std::printf ("  разошлась форма, не уровень: высота, тайминг хвоста, фаза или окраска\n");
+    }
+
+    return failed ? 1 : 0;
+}
+
 int main (int argc, char* argv[])
 {
     countedThread = std::this_thread::get_id();
@@ -672,6 +939,30 @@ int main (int argc, char* argv[])
     if (argc >= 2 && juce::String (argv[1]) == "--bench")
         return benchmark (argc >= 3 ? juce::String (argv[2]) : juce::String ("hq"),
                           argc >= 4 ? juce::String (argv[3]) : juce::String ("hold"));
+
+    if (argc >= 2 && juce::String (argv[1]) == "--regress")
+    {
+        bool update = false;
+        juce::StringPairArray overrides;
+
+        for (int i = 2; i < argc; ++i)
+        {
+            const juce::String arg (argv[i]);
+
+            if (arg == "update")
+                update = true;
+            else if (arg.contains ("="))
+                overrides.set (arg.upToFirstOccurrenceOf ("=", false, false),
+                               arg.fromFirstOccurrenceOf ("=", false, false));
+            else
+            {
+                std::printf ("непонятный аргумент: %s\n", argv[i]);
+                return 1;
+            }
+        }
+
+        return regression (update, overrides);
+    }
 
     // Снимок окна в PNG (#26, #27). Не украшение: интерфейс иначе правится вслепую —
     // увидеть его можно только запустив хост, а хост в эстафету промптов не помещается.
@@ -4122,6 +4413,12 @@ int main (int argc, char* argv[])
 
         std::printf ("  #27: три ноты -> три слота, хвост гаснет, сброс чистит картинку\n");
     }
+
+    // --- Регрессионные рендеры DSP (#34) ---------------------------------------
+    // Последними: они сверяют весь сигнал, и если сломано что-то из проверенного выше,
+    // внятнее упасть на CHECK с названным свойством, чем на «разошлось с эталоном».
+    if (regression (false, {}) != 0)
+        return 1;
 
     std::printf ("test_processor: OK\n");
     return 0;

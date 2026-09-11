@@ -132,10 +132,12 @@ uptime && ./build/ProcessorTest_artefacts/Release/ProcessorTest --bench hq hold
 
 ### Про Xcode
 
-Полного Xcode для разработки **не требуется** — хватает Command Line Tools.
+Полного Xcode **не требуется** — хватает Command Line Tools.
 Проверено на практике: все три формата собираются, universal binary собирается,
-`auval` проходит. Открытым остаётся вопрос подписи Developer ID и нотаризации
-для распространения — выясняется в задаче #33.
+`auval` проходит, pkg-установщик собирается и ставится (`scripts/package-mac.sh`).
+`notarytool` и `stapler` в Command Line Tools тоже есть, но в деле не запускались:
+подписывать нечем, пока нет членства в Apple Developer Program. Путь релиза целиком
+и что видит пользователь без подписи — [docs/RELEASE.md](docs/RELEASE.md).
 
 ## Навигация
 
@@ -148,6 +150,7 @@ uptime && ./build/ProcessorTest_artefacts/Release/ProcessorTest --bench hq hold
 | [docs/ISSUES.md](docs/ISSUES.md) | 50 задач с метками и критериями приёмки |
 | [docs/FL_STUDIO.md](docs/FL_STUDIO.md) | Как подать MIDI в плагин в FL Studio и как его откалибровать |
 | [docs/DAW_COMPAT.md](docs/DAW_COMPAT.md) | В каком хосте что проверено — и что не проверено, с причиной |
+| [docs/RELEASE.md](docs/RELEASE.md) | Сборка, pkg-установщик, подпись — и что видит пользователь без подписи |
 | [docs/adr/](docs/adr/) | Архитектурные решения: ядро на голосах, движок питчинга |
 | [prompts/README.md](prompts/README.md) | Как вести работу короткими сессиями |
 | [CLAUDE.md](CLAUDE.md) | Правила работы и технические инварианты |

@@ -50,6 +50,14 @@ jobs:
       - name: Собрать
         run: cmake --build build --config Release --parallel
 
+      # Офлайн-тесты процессора и регрессионные рендеры DSP (#34). Эталоны записаны
+      # на arm64 clang; укладывается ли MSVC в допуск, покажет первый же прогон.
+      - name: ProcessorTest
+        shell: bash
+        run: |
+          cmake --build build --config Release --target ProcessorTest --parallel
+          ./build/ProcessorTest_artefacts/Release/ProcessorTest
+
       - name: Скачать pluginval (macOS)
         if: runner.os == 'macOS'
         run: |

@@ -76,9 +76,10 @@ target_link_libraries(MidiDelay PRIVATE
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
 
-# Офлайн-тест процессора: аллокации, смещение дилея, состояние. Из сборки по умолчанию
-# исключён намеренно — у консольного приложения своя копия модулей JUCE, и в CI это
-# лишние минуты ради проверки, которая и так гоняется руками перед коммитом:
+# Офлайн-тест процессора: аллокации, смещение дилея, состояние, регрессионные рендеры
+# (#34). Из сборки по умолчанию исключён: у консольного приложения своя копия модулей
+# JUCE, и пересобирать её при каждой правке плагина незачем. CI собирает его отдельным
+# шагом — поломка звука обязана ловиться и там, а не только руками перед коммитом:
 #   cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Release/ProcessorTest
 juce_add_console_app(ProcessorTest PRODUCT_NAME "ProcessorTest")
 set_target_properties(ProcessorTest PROPERTIES EXCLUDE_FROM_ALL TRUE)
