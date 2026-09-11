@@ -120,6 +120,21 @@ public:
         от нуля только в Follow и при отрицательном MIDI Offset. */
     double getAlignmentMs() const;
 
+    /** Stereo Mode (#55) звучит хором: выбран Choir или Auto в Follow. Одно правило
+        на процессор и окно — подпись Stereo обязана говорить то, что слышно. */
+    bool isChoirStereo() const;
+
+    /** Прототипы развилок #55 для рендеров A/B — не параметры: хост их не видит, в проект
+        они не сохраняются. Пишут офлайн-рендер и тесты, читает processBlock раз на блок.
+        ponytail: удаляются вердиктом сессии 22 вместе с проигравшей веткой кода. */
+    struct Forks
+    {
+        bool choirPairs = false;        // Choir: нота парой голосов по бортам (развилка 1б)
+        bool classicPingPong = false;   // Ping-Pong: повторы прыгают по кольцу (развилка 2б)
+    };
+
+    Forks forks;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
 
@@ -147,6 +162,9 @@ private:
     /** Снять выбранный характер и его глубину 0..1 в blockCharacter и blockCharacterDepth
         (#56). Зовётся из prepareToPlay и раз на блок из processBlock. */
     void snapCharacter();
+
+    /** Во что сводятся Stereo, Auto и прототипы развилок (#55). */
+    StereoLayout stereoLayout() const;
 
     /** Пересчитать выравнивание и сказать его хосту. Только из потока сообщений:
         setLatencySamples дёргает хост, и звать его из processBlock нельзя. */
@@ -221,7 +239,8 @@ private:
         return std::copysign (loopKnee + (loopCeiling - loopKnee) * over / (1.0f + over), x);
     }
 
-    static constexpr int stateVersion = 1;
+    // Версия 2 (#55): галка pingPong стала списком stereo, миграция в setStateInformation.
+    static constexpr int stateVersion = 2;
 
     /** Выставляет все параметры пресета. Пресет — снимок целиком, а не набор поправок:
         всё, чего он не называет, возвращается к значению по умолчанию. Иначе Ghost Choir,
@@ -339,6 +358,10 @@ private:
         то же требование и та же схема, что у blend диффузора. */
     juce::SmoothedValue<float> loMixSmoothed, hiMixSmoothed;
 
+    /** Ввод кольца классического ping-pong (#55), 0..1: сухой в левый канал, отводы
+        крест-накрест. Рампа, а не флаг, — по той же причине, что у фильтров петли. */
+    juce::SmoothedValue<float> crossSmoothed;
+
     /** Диффузия и коэффициенты фильтров петли. Коэффициент сглаживается сам, а не
         пересчитывается по сэмплу: exp() на каждый сэмпл — это дорого, а зиппер
         при крутке среза слышен одинаково что от частоты, что от коэффициента. */
@@ -390,7 +413,7 @@ private:
     std::atomic<float>* pTimeMode   = nullptr;
     std::atomic<float>* pMidiOffset = nullptr;
     std::atomic<float>* pWidth      = nullptr;
-    std::atomic<float>* pPingPong   = nullptr;
+    std::atomic<float>* pStereo     = nullptr;
     std::atomic<float>* pDiffusion  = nullptr;
     std::atomic<float>* pModulation = nullptr;
     std::atomic<float>* pDucking    = nullptr;

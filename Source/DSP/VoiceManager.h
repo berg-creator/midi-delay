@@ -5,6 +5,16 @@
 
 class DelayBuffer;
 
+/** Как ноты расходятся по стерео (#55). К этому процессор сводит параметр Stereo вместе
+    с Auto и прототипами развилок — пулу остаётся только раздать пан. */
+enum class StereoLayout
+{
+    slots,      // Choir: разлёт по номеру слота, одиночная нота в центре (#23)
+    pairs,      // Choir парой: нота двумя голосами по бортам — прототип развилки 1б
+    alternate,  // Ping-Pong по нотам: нота в тишину в центр, дальше влево-вправо (#23, 2а)
+    crossed     // Ping-Pong классический: повторы прыгают по кольцу — прототип развилки 2б
+};
+
 /** Пул голосов: раздача, кража, рендер сегмента. Память только в prepare. Задача #13. */
 class VoiceManager
 {
@@ -34,13 +44,9 @@ public:
         200 % — крайние голоса в упор влево и вправо. Параметр Width. */
     void setWidth (float widthPercent);
 
-    /** Ping-pong (#23): ноты уходят попеременно влево и вправо, вместо раскидки
-        по номеру слота. Классический ping-pong — чередование повторов обратной связи —
-        в этой архитектуре не слышен вовсе: наружу хвост выходит только через голоса,
-        а голос читает моно-сумму кольца (ADR 0001) и усреднил бы чередование обратно.
-        Чередовать ноты для MIDI-ведомого дилея и осмысленнее: мелодия монофонная,
-        и разлёт попадает в её ритм, а не в интервал повторов. */
-    void setPingPong (bool shouldPingPong);
+    /** Раскладка стерео (#55). Звучащих голосов не трогает: пан и способ чтения кольца
+        голос забирает в noteOn, как и время. Width — размах во всех раскладках. */
+    void setStereoLayout (StereoLayout newLayout);
 
     /** Латентность движка в сэмплах, она же нижний предел delay time (#17) и
         выравнивание режима Follow (ADR 0006). Движок передаётся явно, а не берётся
@@ -80,19 +86,26 @@ private:
         тихий. Индекс, а не ссылка: от номера слота считается пан (#23). */
     int findVoiceFor (int midiNote);
 
+    /** Отдать ноту голосу в слоте: свободный стартует, занятый крадётся (#13). */
+    void startVoice (int slot, int midiNote, float velocity, float ratio, double delay, float pan);
+
     /** Пан голоса по номеру слота: нулевой в центре, дальше через одного вправо
         и влево. Порядок именно такой, потому что одиночная нота почти всегда
         попадает в нулевой слот — и обязана остаться по центру. */
     float panForSlot (int slot) const;
 
     std::array<Voice, maxVoices> voices;
-    std::vector<float> scratch;   // два моно-буфера подряд, общие на все голоса
+    std::vector<float> scratch;   // три моно-буфера подряд, общие на все голоса
     unsigned nextAge = 0;
     int blockSize = 0;
     int voiceLimit = maxVoices;
     float spread = 0.5f;          // 0..1, из параметра Width
-    bool pingPong = false;
-    bool pingPongRight = false;   // сторона следующей ноты
+    StereoLayout layout = StereoLayout::slots;
+    bool pingPongRight = false;   // сторона следующей ноты в alternate
+
+    // Пара хора (#55, развилка 1б). Стартовые числа из диапазона задачи, выбирает их ухо.
+    static constexpr float pairDetuneCents = 7.0f;
+    static constexpr double pairOffsetMs = 15.0;
     PitchEngine engine = PitchEngine::hq;
     bool formantHold = true;
     double sampleRate = 44100.0;

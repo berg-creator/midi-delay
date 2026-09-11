@@ -25,6 +25,8 @@ namespace
     // сейчас, поэтому delay time здесь не при чём и остаётся по умолчанию.
     // Латентность в Follow просится у хоста — это объявленное исключение (ADR 0006),
     // и пресет по умолчанию наследует его вместе с режимом.
+    // Character Clean — вердикт сессии 21 (#56): лёгкий Tape здесь ухом отклонён.
+    // Stereo не назван: Auto в Follow — это хор (#55).
     const Setting chordPad[] {
         { "timeMode", 1 }, { "mix", 70 }, { "attack", 60 }, { "release", 800 },
         { "voices", 8 }, { "feedback", 0 }, { nullptr, 0 }
@@ -55,9 +57,10 @@ namespace
 
     // Размазанный хор по бокам. High Cut 6 кГц убирает из хвоста согласные, и он
     // перестаёт спорить с сухим за разборчивость.
+    // Stereo Choir назван явно (#55): пресет в Free, и Auto сделал бы из хора ping-pong.
     const Setting ghostChoir[] {
         { "quality", 1 }, { "width", 100 }, { "mix", 45 }, { "release", 1500 },
-        { "filterHi", 6000 }, { nullptr, 0 }
+        { "filterHi", 6000 }, { "stereo", 1 }, { nullptr, 0 }
     };
 
     // Разрез по материалу, половина первая: распевный вокал. Числа не выдуманы —
@@ -67,9 +70,12 @@ namespace
     // Width 100, а не 150: вердикт сессии 17 (ISSUES #23). Вопрос был задан прямо —
     // ширина или моносовместимость, — и выбрана моносовместимость. Потеря в моно
     // падает с 1,61 dB до 0,69 dB, разлёт остаётся: его делает ping-pong, а не Width.
+    // Tape 30 — вердикт сессии 21 (#56): из Clean, Tape 30, Tape 70 и Lo-Fi 50 на этом
+    // пресете выбран Tape 30.
     const Setting sungVocal[] {
         { "sync", 1 }, { "division", 2 }, { "mix", 40 }, { "feedback", 15 },
-        { "ducking", 50 }, { "pingPong", 1 }, { "width", 100 }, { nullptr, 0 }
+        { "ducking", 50 }, { "stereo", 2 }, { "width", 100 },
+        { "character", 1 }, { "age", 30 }, { nullptr, 0 }
     };
 
     // Половина вторая: плотная читка. Слоги идут вчетверо чаще, и всё, что работало
@@ -80,7 +86,7 @@ namespace
     // роняет моно-сумму (замер в ISSUES #23).
     const Setting denseRap[] {
         { "sync", 1 }, { "division", 0 }, { "mix", 25 }, { "feedback", 0 },
-        { "ducking", 80 }, { "pingPong", 1 }, { "width", 100 }, { nullptr, 0 }
+        { "ducking", 80 }, { "stereo", 2 }, { "width", 100 }, { nullptr, 0 }
     };
 
     struct Preset { const char* name; const Setting* settings; };
@@ -118,7 +124,7 @@ MidiDelayProcessor::MidiDelayProcessor()
     pTimeMode   = apvts.getRawParameterValue ("timeMode");
     pMidiOffset = apvts.getRawParameterValue ("midiOffset");
     pWidth      = apvts.getRawParameterValue ("width");
-    pPingPong   = apvts.getRawParameterValue ("pingPong");
+    pStereo     = apvts.getRawParameterValue ("stereo");
     pDiffusion  = apvts.getRawParameterValue ("diffusion");
     pModulation = apvts.getRawParameterValue ("modulation");
     pDucking    = apvts.getRawParameterValue ("ducking");
@@ -239,11 +245,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         Range { 200.0f, 20000.0f, 1.0f, 0.35f }, 12000.0f,
         AudioParameterFloatAttributes().withLabel ("Hz")));
 
-    // Ping-pong (#23): ноты уходят попеременно влево и вправо. Размах берётся от Width,
-    // отдельной ручки у него нет — иначе в окне стояли бы две ручки ширины, и вторая
-    // объяснялась бы только тем, что первая работает в другом режиме.
-    params.push_back (std::make_unique<AudioParameterBool> (
-        ParameterID { "pingPong", 1 }, "Ping-Pong", false));
+    // Stereo Mode (#55) — вместо галки Ping-Pong и на её месте в списке: номера соседей
+    // не сдвигаются. Auto — умолчание, зависящее от режима: хор в Follow, ping-pong в Free.
+    // Не перещёлкивание значения при смене Time Mode: параметр, который переписывает себя
+    // от движения другого, ломает автоматизацию и undo хоста, а явный выбор Auto не трогает.
+    // Размах во всех режимах — Width: вторая ручка ширины объяснялась бы только тем,
+    // что первая работает в другом режиме.
+    params.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "stereo", 1 }, "Stereo",
+        StringArray { "Auto", "Choir", "Ping-Pong" }, 0));
 
     params.push_back (std::make_unique<AudioParameterFloat> (
         ParameterID { "width", 1 }, "Width",
@@ -372,6 +382,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     voiceManager.prepare (currentSampleRate, juce::jmax (1, maximumExpectedSamplesPerBlock));
     voiceManager.reset();
     voiceManager.setEngine (pQuality->load() > 0.5f ? PitchEngine::hq : PitchEngine::fast);
+    voiceManager.setStereoLayout (stereoLayout());
 
     // Нижний предел delay time — латентность движка (#17). Спрашивается у движка сразу
     // после его подготовки: зашитое число разъехалось бы с окном при первой же правке.
@@ -391,6 +402,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     loMixSmoothed.reset (currentSampleRate, smoothingSeconds);
     hiMixSmoothed.reset (currentSampleRate, smoothingSeconds);
     characterSmoothed.reset (currentSampleRate, smoothingSeconds);
+    crossSmoothed.reset (currentSampleRate, smoothingSeconds);
 
     // Темп снимается уже здесь, а не только в первом блоке. Иначе первый блок
     // отработал бы на фолбэке, и на больших размерах блока это слышно: голос берёт
@@ -415,6 +427,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     loMixSmoothed.setCurrentAndTargetValue (pFilterLo->load() > filterLoOff ? 1.0f : 0.0f);
     hiMixSmoothed.setCurrentAndTargetValue (pFilterHi->load() < filterHiOff ? 1.0f : 0.0f);
     characterSmoothed.setCurrentAndTargetValue (blockCharacterDepth);
+    crossSmoothed.setCurrentAndTargetValue (stereoLayout() == StereoLayout::crossed ? 1.0f : 0.0f);
 
     // В Free с неотрицательным офсетом здесь ноль, и инвариант ANALYSIS §5 цел:
     // латентность питчера вычитается из позиции чтения, а не выставляется хосту.
@@ -522,6 +535,21 @@ bool MidiDelayProcessor::isSyncMode() const
     return pSync->load (std::memory_order_relaxed) > 0.5f;
 }
 
+bool MidiDelayProcessor::isChoirStereo() const
+{
+    // Кламп индекса — значение приезжает из состояния проекта, как у делителя.
+    const int stereo = juce::jlimit (0, 2, static_cast<int> (pStereo->load (std::memory_order_relaxed)));
+    return stereo == 1 || (stereo == 0 && isFollowMode());
+}
+
+StereoLayout MidiDelayProcessor::stereoLayout() const
+{
+    if (isChoirStereo())
+        return forks.choirPairs ? StereoLayout::pairs : StereoLayout::slots;
+
+    return forks.classicPingPong ? StereoLayout::crossed : StereoLayout::alternate;
+}
+
 double MidiDelayProcessor::requestedDelayMs() const
 {
     if (! isSyncMode())
@@ -595,7 +623,11 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
 
     voiceManager.setEngine (wantHq ? PitchEngine::hq : PitchEngine::fast);
     voiceManager.setWidth (pWidth->load (std::memory_order_relaxed));
-    voiceManager.setPingPong (pPingPong->load (std::memory_order_relaxed) > 0.5f);
+    // Stereo Mode (#55). Звучащие голоса раскладку не видят: пан и чтение кольца голос
+    // забирает в noteOn. Кольцо классического ping-pong вводится рампой.
+    const auto layout = stereoLayout();
+    voiceManager.setStereoLayout (layout);
+    crossSmoothed.setTargetValue (layout == StereoLayout::crossed ? 1.0f : 0.0f);
     voiceManager.setFormantHold (pFormants->load (std::memory_order_relaxed) > 0.5f);
 
     // Выравнивание: на сколько сэмплов весь плагин отстаёт от собственного входа.
@@ -842,10 +874,15 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
         const float hiCoeff = hiCoeffSmoothed.getNextValue();
         const float loMix = loMixSmoothed.getNextValue();
         const float hiMix = hiMixSmoothed.getNextValue();
+        const float cross = crossSmoothed.getNextValue();
+
+        // Вход кольца собирается в два прохода: классический ping-pong (#55) кладёт отвод
+        // одного канала в другой, и до записи нужны отводы обоих.
+        float dryIn[2] {}, recirculated[2] {};
 
         for (int ch = 0; ch < numChannels; ++ch)
         {
-            const float dry = buffer.getSample (ch, i);
+            dryIn[ch] = buffer.getSample (ch, i);
             // Читаем до записи текущего сэмпла, поэтому смещение точное: writePos
             // ещё указывает на слот сэмпла i, и read(d) отдаёт ровно x[i - d].
             const float delayed = delayBuffer.read (ch, delaySamples + modOffset);
@@ -864,7 +901,29 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
 
             // Feedback снимается ДО питч-стадии: голоса читают уже записанное кольцо,
             // и транспонирование в петлю не попадает. Инвариант из CLAUDE.md.
-            const float recirculated = (delayed + blend * (diffused - delayed)) * feedback;
+            recirculated[ch] = (delayed + blend * (diffused - delayed)) * feedback;
+        }
+
+        // Классический ping-pong (#55, развилка 2б — прототип до вердикта сессии 22).
+        // Сухой моно-суммой в левый канал кольца, отводы крест-накрест: первый повтор
+        // в левом, второй в правом, и так дальше; голос читает каналы порознь (Voice::addTo).
+        // Рампой, а не флагом: флаг на границе блока прыгнул бы входом кольца, как булев
+        // обход фильтров петли (#25). Подмес линейный — каналы кольца коррелированы,
+        // и equal-power дал бы горб, как в ADR 0003. На нуле рампы ветка не исполняется,
+        // и прочие раскладки бит-в-бит прежние.
+        if (cross > 0.0f && numChannels > 1)
+        {
+            const float mono = 0.5f * (dryIn[0] + dryIn[1]);
+            const float leftTap = recirculated[0];
+
+            dryIn[0] += cross * (mono - dryIn[0]);
+            dryIn[1] -= cross * dryIn[1];
+            recirculated[0] += cross * (recirculated[1] - leftTap);
+            recirculated[1] += cross * (leftTap - recirculated[1]);
+        }
+
+        for (int ch = 0; ch < numChannels; ++ch)
+        {
 
             // Мягкое ограничение в петле (#44). Стоит на одном лишь отводе обратной
             // связи, а не на сумме с сухим, и это единственное место, где оно верно:
@@ -878,7 +937,7 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             // пользователю. Порог 0,7 нормальный хвост не задевает: там уровень
             // круга около 0,33. ponytail: колено фиксировано; Drive как параметр —
             // если по слуху окажется, что характер нужен, а не потолок.
-            float lineIn = dry + softLimit (recirculated);
+            float lineIn = dryIn[ch] + softLimit (recirculated[ch]);
 
             // Фильтры стоят на входе кольца, а не на выходе wet (#22). На выходе это
             // был бы просто эквалайзер; здесь первый хвост окрашен один раз, второй
@@ -1071,9 +1130,32 @@ void MidiDelayProcessor::setStateInformation (const void* data, int sizeInBytes)
     if (xml == nullptr || ! xml->hasTagName (apvts.state.getType()))
         return;
 
-    // Версия пока одна, и незнакомые поля APVTS игнорирует сама. Когда появится
-    // вторая — развилка миграции встанет ровно сюда, до replaceState.
-    const auto state = juce::ValueTree::fromXml (*xml);
+    auto state = juce::ValueTree::fromXml (*xml);
+
+    // Миграция версии 1 (#55): галка pingPong стала списком Stereo. Включённая — Ping-Pong.
+    // Выключенная — Choir, а не Auto: проект обязан открыться тем звуком, с которым сохранён,
+    // а без галки голоса расходились по слотам и в Free тоже. Старый узел удаляется:
+    // незнакомые поля APVTS игнорирует сама, но таскала бы галку в каждом сохранении.
+    if (static_cast<int> (state.getProperty ("stateVersion", 1)) < 2)
+    {
+        const auto legacy = state.getChildWithProperty ("id", "pingPong");
+
+        if (legacy.isValid())
+        {
+            auto stereo = state.getChildWithProperty ("id", "stereo");
+
+            if (! stereo.isValid())
+            {
+                stereo = juce::ValueTree (legacy.getType());
+                stereo.setProperty ("id", "stereo", nullptr);
+                state.appendChild (stereo, nullptr);
+            }
+
+            const bool wasOn = static_cast<float> (legacy.getProperty ("value", 0.0f)) > 0.5f;
+            stereo.setProperty ("value", wasOn ? 2.0f : 1.0f, nullptr);
+            state.removeChild (legacy, nullptr);
+        }
+    }
 
     // Индекс пресета — только подпись в окне: сами параметры приезжают из состояния,
     // и applyPreset здесь звать нельзя, иначе загрузка проекта затирала бы всё,

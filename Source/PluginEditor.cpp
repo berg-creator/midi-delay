@@ -52,7 +52,7 @@ namespace
         { "Envelope", "release"    },
         { "Envelope", "ducking"    },
         { "Mix",      "width"      },
-        { "Mix",      "pingPong"   },
+        { "Mix",      "stereo"     },
         { "Mix",      "mix"        },
         { "Mix",      "outputGain" },
         { "Mix",      "bypass"     },
@@ -602,12 +602,16 @@ void MidiDelayEditor::refreshContext()
     // ADR 0006 отменил свой движок Follow, и качество там выбирается ровно как в Free.
     const auto sync = proc.isSyncMode();
     const auto follow = proc.isFollowMode();
-    const auto pingPong = proc.apvts.getRawParameterValue ("pingPong")
-                              ->load (std::memory_order_relaxed) > 0.5f;
+    const auto choir = proc.isChoirStereo();
+    const auto autoStereo = proc.apvts.getRawParameterValue ("stereo")
+                                ->load (std::memory_order_relaxed) < 0.5f;
 
     setContext ("delayTime", sync, follow ? "Repeat Time" : "Delay Time");
     setContext ("division", ! sync, "Note Division");
-    setContext ("width", false, pingPong ? "Width - ping-pong" : "Width - spread");
+    setContext ("width", false, choir ? "Width - spread" : "Width - ping-pong");
+
+    // Auto звучит по-разному в Follow и во Free (#55) — подпись говорит, как именно (#26).
+    setContext ("stereo", false, ! autoStereo ? "Stereo" : choir ? "Stereo - choir" : "Stereo - ping-pong");
 
     // Age в Clean не делает ничего (#56) — гаснет, как Note Division без Sync.
     const auto clean = proc.apvts.getRawParameterValue ("character")
@@ -716,8 +720,8 @@ void MidiDelayEditor::timerCallback()
     const auto follow = proc.isFollowMode();
     const auto alignment = juce::roundToInt (proc.getAlignmentMs());
     const auto sync = proc.isSyncMode();
-    const auto pingPong = proc.apvts.getRawParameterValue ("pingPong")
-                              ->load (std::memory_order_relaxed) > 0.5f;
+    const auto stereo = static_cast<int> (proc.apvts.getRawParameterValue ("stereo")
+                                              ->load (std::memory_order_relaxed));
     const auto division = static_cast<int> (proc.apvts.getRawParameterValue ("division")
                                                 ->load (std::memory_order_relaxed));
     const auto bpm = juce::roundToInt (proc.getSyncBpm());
@@ -732,7 +736,7 @@ void MidiDelayEditor::timerCallback()
     }
 
     if (quality != shownQuality || clamped != shownClamped || follow != shownFollow
-        || alignment != shownAlignment || sync != shownSync || pingPong != shownPingPong
+        || alignment != shownAlignment || sync != shownSync || stereo != shownStereo
         || division != shownDivision || bpm != shownBpm || character != shownCharacter)
     {
         shownCharacter = character;
@@ -741,7 +745,7 @@ void MidiDelayEditor::timerCallback()
         shownFollow = follow;
         shownAlignment = alignment;
         shownSync = sync;
-        shownPingPong = pingPong;
+        shownStereo = stereo;
         shownDivision = division;
         shownBpm = bpm;
 

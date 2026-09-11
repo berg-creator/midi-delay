@@ -160,7 +160,7 @@ private:
     bool shownFollow = false;    // режим Follow: хвост стоит на ноте (ADR 0006)
     int shownAlignment = -1;     // сколько мс плагин просит скомпенсировать у хоста
     bool shownSync = false;      // время задано нотной длительностью, а не ручкой (#20)
-    bool shownPingPong = false;  // ноты уходят попеременно влево и вправо (#23)
+    int shownStereo = -1;        // Stereo Mode: подпись Auto зависит от Time Mode (#55)
     int shownDivision = -1;      // индекс делителя
     int shownCharacter = -1;     // характер хвоста: в Clean ручка Age гаснет (#56)
     int shownBpm = -1;           // темп хоста, округлённый: перерисовывать окно
