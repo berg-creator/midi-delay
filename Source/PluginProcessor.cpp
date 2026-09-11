@@ -124,6 +124,8 @@ MidiDelayProcessor::MidiDelayProcessor()
     pDucking    = apvts.getRawParameterValue ("ducking");
     pFilterLo   = apvts.getRawParameterValue ("filterLo");
     pFilterHi   = apvts.getRawParameterValue ("filterHi");
+    pCharacter  = apvts.getRawParameterValue ("character");
+    pAge        = apvts.getRawParameterValue ("age");
     bypassParam = apvts.getParameter ("bypass");
 
     publishVoiceSnapshot();   // окно открывается на пустом пуле, а не на мусоре (#27)
@@ -300,6 +302,23 @@ juce::AudioProcessorValueTreeState::ParameterLayout MidiDelayProcessor::createPa
         Range { -100.0f, 100.0f, 0.1f }, 0.0f,
         AudioParameterFloatAttributes().withLabel ("ms")));
 
+    // Характер хвоста (#56). Два параметра, а не десять ручек: пятнадцать почти одинаковых
+    // и так не объясняют себя (#26). Clean — прежний звук бит-в-бит, и он же по умолчанию:
+    // характер попадёт в пресеты только после вердикта уха. В конце списка, а не рядом
+    // с петлёй: хосты, которые помнят параметры по номеру, не должны съехать в старых
+    // проектах. Порядок в окне задаёт раскладка редактора, а не этот список.
+    params.push_back (std::make_unique<AudioParameterChoice> (
+        ParameterID { "character", 1 }, "Character",
+        StringArray { "Clean", "Tape", "Lo-Fi" }, 0));
+
+    // Глубина характера — одна ручка на всё, как Age у Valhalla: насыщение, полоса,
+    // разрядность, шум и wow едут вместе. В Clean не делает ничего, и окно её гасит.
+    // 30 по умолчанию — лёгкий износ: включил Tape — слышно сразу, но ещё не ломается.
+    params.push_back (std::make_unique<AudioParameterFloat> (
+        ParameterID { "age", 1 }, "Age",
+        Range { 0.0f, 100.0f, 0.1f }, 30.0f,
+        AudioParameterFloatAttributes().withLabel ("%")));
+
     return { params.begin(), params.end() };
 }
 
@@ -337,6 +356,12 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     diffuser.clear();
     loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
 
+    // Характер (#56). Встаёт сразу на выбранный, без рампы и без смены через ноль:
+    // первый блок не должен въезжать в окраску, как не въезжает ни во что другое.
+    character.prepare (currentSampleRate);
+    snapCharacter();
+    activeCharacter = blockCharacter;
+
     // Дрейф и детектор приседания (#46, #47). Фазы с нуля, огибающая с нуля:
     // после prepare плагин обязан быть в том же состоянии, что после конструктора.
     modPhaseA = modPhaseB = 0.0;
@@ -365,6 +390,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     hiCoeffSmoothed.reset (currentSampleRate, smoothingSeconds);
     loMixSmoothed.reset (currentSampleRate, smoothingSeconds);
     hiMixSmoothed.reset (currentSampleRate, smoothingSeconds);
+    characterSmoothed.reset (currentSampleRate, smoothingSeconds);
 
     // Темп снимается уже здесь, а не только в первом блоке. Иначе первый блок
     // отработал бы на фолбэке, и на больших размерах блока это слышно: голос берёт
@@ -388,6 +414,7 @@ void MidiDelayProcessor::prepareToPlay (double sampleRate, int maximumExpectedSa
     hiCoeffSmoothed.setCurrentAndTargetValue (onePoleCoeff (pFilterHi->load()));
     loMixSmoothed.setCurrentAndTargetValue (pFilterLo->load() > filterLoOff ? 1.0f : 0.0f);
     hiMixSmoothed.setCurrentAndTargetValue (pFilterHi->load() < filterHiOff ? 1.0f : 0.0f);
+    characterSmoothed.setCurrentAndTargetValue (blockCharacterDepth);
 
     // В Free с неотрицательным офсетом здесь ноль, и инвариант ANALYSIS §5 цел:
     // латентность питчера вычитается из позиции чтения, а не выставляется хосту.
@@ -404,6 +431,7 @@ void MidiDelayProcessor::releaseResources()
     delayBuffer.clear();
     dryDelay.clear();
     diffuser.clear();
+    character.clear();
     loState[0] = loState[1] = hiState[0] = hiState[1] = 0.0f;
     duckEnv[0] = duckEnv[1] = 0.0f;
     midiQueue.clear();
@@ -436,6 +464,18 @@ void MidiDelayProcessor::refreshHostBpm()
             if (const auto bpm = position->getBpm())
                 if (*bpm > 0.0)
                     hostBpm.store (juce::jlimit (20.0, 999.0, *bpm), std::memory_order_relaxed);
+}
+
+void MidiDelayProcessor::snapCharacter()
+{
+    // Кламп индекса по той же причине, что у делителя: значение приезжает из состояния
+    // проекта, и читать за концом списка из-за чужого файла плагин не должен.
+    blockCharacter = juce::jlimit (0, 2, static_cast<int> (pCharacter->load (std::memory_order_relaxed)));
+
+    // В Clean глубина ноль при любом Age: ручка там не делает ничего, и окно её гасит.
+    blockCharacterDepth = blockCharacter == Character::clean
+        ? 0.0f
+        : juce::jlimit (0.0f, 1.0f, pAge->load (std::memory_order_relaxed) * 0.01f);
 }
 
 double MidiDelayProcessor::engineLatencyMs() const
@@ -622,6 +662,12 @@ void MidiDelayProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::M
     loCoeffSmoothed.setTargetValue (onePoleCoeff (loHz));
     hiCoeffSmoothed.setTargetValue (onePoleCoeff (hiHz));
 
+    // Характер (#56). Пока выбран тот, что подмешан, рампа едет к его Age. Выбран другой —
+    // цель ноль: старый уходит в ноль, и только там renderSegment меняет характер и ведёт
+    // новый из нуля. Кроссфейда двух окрашенных версий нет.
+    snapCharacter();
+    characterSmoothed.setTargetValue (blockCharacter == activeCharacter ? blockCharacterDepth : 0.0f);
+
     voiceManager.setEnvelope (pAttack->load (std::memory_order_relaxed),
                               pRelease->load (std::memory_order_relaxed));
     voiceManager.setVoiceLimit (static_cast<int> (pVoices->load (std::memory_order_relaxed)));
@@ -739,6 +785,8 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
     const double modStepB = modulationRateB / currentSampleRate;
     const auto modScale = static_cast<float> (modulationMaxMs * 0.001 * currentSampleRate);
 
+    character.setSegmentDepth (characterSmoothed.getCurrentValue());
+
     for (int i = startSample; i < end; ++i)
     {
         const float delaySamples = delaySamplesSmoothed.getNextValue();
@@ -762,12 +810,25 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
             0.6 * std::sin (juce::MathConstants<double>::twoPi * modPhaseA)
           + 0.4 * std::sin (juce::MathConstants<double>::twoPi * modPhaseB));
 
+        // Смена характера (#56) — только когда глубина старого доехала до нуля ровно:
+        // множитель подмеса тогда ноль, и подмена не видна ни в одном сэмпле.
+        if (activeCharacter != blockCharacter && ! characterSmoothed.isSmoothing())
+        {
+            activeCharacter = blockCharacter;
+            characterSmoothed.setTargetValue (blockCharacterDepth);
+        }
+
+        // Wow характера живёт в той же позиции чтения петли, что и дрейф, и по той же
+        // причине не на чтении голоса. В Clean добавка ровно ноль: позиция бит-в-бит прежняя.
+        const float characterWow = character.advance (activeCharacter, characterSmoothed.getNextValue());
+
         // Смещение только в плюс, то есть петля дышит в сторону удлинения. Знакопеременное
         // на минимальном delay time упиралось бы в нижний предел кольца, и дрейф стал бы
         // односторонним сам — молча и только на коротких временах. Цена честного варианта:
         // постоянная составляющая в полглубины, до 2 мс на полной ручке. Против 400 мс
         // петли это не слышно, а вот разное поведение на разных временах слышно бы было.
-        const float modOffset = modDepthSmoothed.getNextValue() * modScale * (0.5f * (drift + 1.0f));
+        const float modOffset = modDepthSmoothed.getNextValue() * modScale * (0.5f * (drift + 1.0f))
+                              + characterWow;
 
         // Диффузия (#45). Цепочка алл-пассов крутится всегда, даже на нуле ручки:
         // так она остаётся прогретой, и ввод её в петлю не даёт ни щелчка, ни всплеска
@@ -840,6 +901,10 @@ void MidiDelayProcessor::renderSegment (const juce::AudioBuffer<float>& buffer,
 
             loState[ch] += loCoeff * (lineIn - loState[ch]);
             lineIn -= loMix * loState[ch];
+
+            // Характер (#56) — последним перед кольцом, после фильтров. Здесь, а не на отводе
+            // обратной связи: первый хвост окрашен уже на feedback 0, каждый круг ещё раз.
+            lineIn = character.process (ch, lineIn);
 
             lineInput.setSample (ch, i, lineIn);
         }

@@ -118,6 +118,9 @@ namespace
         самой сетки включают Sync сами. */
     void plainLoop (MidiDelayProcessor& proc)
     {
+        // Характер Clean (#56) закреплён явно, а не унаследован от умолчания: эталоны
+        // регрессии (#34) обязаны остаться бит-в-бит и тогда, когда умолчание сменят.
+        setParam (proc, "character", 0.0f);
         setParam (proc, "sync", 0.0f);
         setParam (proc, "diffusion", 0.0f);
         setParam (proc, "modulation", 0.0f);
@@ -562,6 +565,15 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
                  total / sr, hq ? "hq" : "fast", follow ? ", follow" : "",
                  colour ? ", colour" : "", pluck ? ", pluck" : "",
                  proc.apvts.getRawParameterValue ("formants")->load() > 0.5f ? "hold" : "shift");
+
+    // Уровень файла — в таблицу рендеров (#56). Характер меняет громкость хвоста: насыщение
+    // сжимает, полоса Lo-Fi срезает. Разницу в 3 dB ухо читает как «лучше» или «хуже»
+    // раньше, чем как тембр, и без числа рядом вердикт о тембре был бы вердиктом о громкости.
+    const auto rms = std::sqrt (0.5 * (std::pow (out.getRMSLevel (0, 0, total), 2.0f)
+                                       + std::pow (out.getRMSLevel (1, 0, total), 2.0f)));
+    std::printf ("  пик %.1f dBFS, RMS %.1f dBFS\n",
+                 juce::Decibels::gainToDecibels (out.getMagnitude (0, total), -120.0f),
+                 juce::Decibels::gainToDecibels (static_cast<float> (rms), -120.0f));
     return 0;
 }
 
@@ -920,6 +932,15 @@ int main (int argc, char* argv[])
         for (int i = 5; i < argc; ++i)
         {
             const juce::String flag (juce::String::fromUTF8 (argv[i]));
+
+            // Пробел внутри — это несколько ключей, слипшихся в один аргумент: так zsh
+            // подставляет `$VAR` без кавычек. Рендер молча прочёл «preset=0 character=1
+            // age=30» как пресет 0, и сессия 20 получила восемь одинаковых файлов.
+            if (flag.containsChar (' '))
+            {
+                std::printf ("ключи слиплись в один аргумент: %s\n", argv[i]);
+                return 1;
+            }
 
             if (flag.contains ("="))
                 overrides.set (flag.upToFirstOccurrenceOf ("=", false, false),
@@ -3567,6 +3588,7 @@ int main (int argc, char* argv[])
                 "diffusion", "modulation", "ducking", "filterLo", "filterHi",
                 "width", "pingPong", "quality", "formants", "midiOffset",
                 "rootKey", "pitchRange", "voices", "attack", "release", "bypass",
+                "character", "age",
             };
 
             // Шаг меряется за одно и то же ВРЕМЯ, а не за один отсчёт. Иначе замер
@@ -3901,6 +3923,264 @@ int main (int argc, char* argv[])
         const double hotLevel = tailLevel (95.0f, loud);
         std::printf ("  #44 уровень хвоста на входе 0,9 и feedback 95 %%: %.2f\n", hotLevel);
         CHECK (hotLevel < 1.9);
+    }
+
+    // --- Характер: Tape и Lo-Fi (#56) ------------------------------------------
+    // Критерии задачи по одному. Clean не слушает Age, а любой характер на Age 0 — это
+    // Clean бит-в-бит: на этом стоит смена характера через ноль. Характер слышен уже
+    // на feedback 0. На 95 % петля не разгоняется, а шум после хвоста гаснет вместе с ним.
+    // Смена характера и рывки Age на звучащем хвосте не щёлкают. Проект, сохранённый
+    // без этих параметров, открывается в Clean. Везде ноль аллокаций.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+
+        // Синус 196 Гц на ноте 60 — унисон при Root Key C: питчер не транспонирует,
+        // и в замер не лезет его собственная нелинейность. Free, mix 100 — меряется хвост,
+        // окраска петли выключена. Вход звучит первые burstBlocks блоков, дальше тишина;
+        // нота держится до конца. Возвращается левый канал целиком.
+        const auto run = [&] (float character, float age, float feedback, float delayMs,
+                              float amplitude, int blocks, int burstBlocks)
+        {
+            MidiDelayProcessor proc;
+            engineDefaults (proc);
+            plainLoop (proc);
+            setParam (proc, "character", character);
+            setParam (proc, "age", age);
+            setParam (proc, "delayTime", delayMs);
+            setParam (proc, "feedback", feedback);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "attack", 1.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            std::vector<float> out;
+            out.reserve (static_cast<size_t> (blocks) * blockSize);
+            juce::AudioBuffer<float> block (2, blockSize);
+            double phase = 0.0;
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = b < burstBlocks ? static_cast<float> (amplitude * std::sin (phase)) : 0.0f;
+                    phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                runBlock (proc, block, b == 0 ? noteOnAt (0) : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                    out.push_back (block.getSample (0, i));
+            }
+
+            return out;
+        };
+
+        // 1. Clean не слушает Age, и любой характер на Age 0 равен Clean бит-в-бит.
+        //    Второе не формальность: смена характера идёт через ноль глубины, и останься
+        //    на нуле хоть что-то, подмена была бы слышна. Петля на 60 %, чтобы сравнивались
+        //    и круги обратной связи, где живёт wow, а не только первый хвост.
+        {
+            const auto clean     = run (0.0f,   0.0f, 60.0f, 250.0f, 0.5f, 200, 100);
+            const auto cleanAged = run (0.0f, 100.0f, 60.0f, 250.0f, 0.5f, 200, 100);
+            const auto tapeZero  = run (1.0f,   0.0f, 60.0f, 250.0f, 0.5f, 200, 100);
+            const auto loFiZero  = run (2.0f,   0.0f, 60.0f, 250.0f, 0.5f, 200, 100);
+
+            CHECK (clean == cleanAged);
+            CHECK (clean == tapeZero);
+            CHECK (clean == loFiZero);
+        }
+
+        // 2. Характер слышен на feedback 0 — ради этого он и стоит на входе кольца.
+        //    Мера — всё, что в хвосте не основной тон, относительно основного (THD+N):
+        //    у чистого хвоста это пол питчера, у окрашенного — призвуки, ступеньки и шум.
+        //    Окно — последняя секунда из трёх, ровно 196 периодов: ДПФ в точке без утечки.
+        {
+            const auto distortion_dB = [] (const std::vector<float>& x)
+            {
+                constexpr int count = 48000;
+                const size_t from = x.size() - count;
+                double re = 0.0, im = 0.0, power = 0.0;
+
+                for (int i = 0; i < count; ++i)
+                {
+                    const double s = x[from + static_cast<size_t> (i)];
+                    const double a = juce::MathConstants<double>::twoPi * 196.0 * i / 48000.0;
+                    re += s * std::cos (a);
+                    im += s * std::sin (a);
+                    power += s * s;
+                }
+
+                const double tone = 2.0 * (re * re + im * im) / (static_cast<double> (count) * count);
+                return 10.0 * std::log10 (std::max (power / count - tone, 1.0e-30) / tone);
+            };
+
+            constexpr int blocks = 282;   // три секунды
+            const double clean  = distortion_dB (run (0.0f,  0.0f, 0.0f, 250.0f, 0.5f, blocks, blocks));
+            const double tape30 = distortion_dB (run (1.0f, 30.0f, 0.0f, 250.0f, 0.5f, blocks, blocks));
+            const double tape70 = distortion_dB (run (1.0f, 70.0f, 0.0f, 250.0f, 0.5f, blocks, blocks));
+            const double loFi50 = distortion_dB (run (2.0f, 50.0f, 0.0f, 250.0f, 0.5f, blocks, blocks));
+
+            std::printf ("  #56 THD+N хвоста на feedback 0, синус 0,5: Clean %.1f dB, Tape 30 %.1f dB, "
+                         "Tape 70 %.1f dB, Lo-Fi 50 %.1f dB\n", clean, tape30, tape70, loFi50);
+
+            // Порог -40 dB — один процент по амплитуде: ниже него «характер» на синусе
+            // был бы формальностью. Tape 70 обязан быть грязнее Tape 30 заметно, иначе
+            // Age не делает того, что обещает подпись.
+            CHECK (clean < -50.0);
+            CHECK (tape30 > -40.0);
+            CHECK (tape70 > tape30 + 6.0);
+            CHECK (loFi50 > -40.0);
+        }
+
+        // 3. Feedback 95 %: петля не разгоняется, шум в тишине после хвоста гаснет. Худший
+        //    случай для разгона — Age 100 и петля без фильтров: полосы петли снимают часть
+        //    усиления, без них характеру помочь нечем. Вход горячий, 0,9, одну секунду,
+        //    дальше тишина, нота держится. Петля 200 мс, а не короче: ниже 180 мс время
+        //    в Free молча подтягивается до латентности HQ (#17), и первая версия замера,
+        //    заказавшая 50 мс, насчитала триста кругов там, где их было восемьдесят.
+        //    Сорок пять секунд — двести двадцать кругов, чистый хвост за них уходит ниже
+        //    -90 dBFS. Потолок уровня тот же, что в #44: сухой 0,9 плюс потолок отвода 1,0.
+        {
+            constexpr int blocks = 4219, burst = 94;   // 45 с, звучит первая
+            static constexpr float cases[][2] { { 0.0f, 0.0f }, { 1.0f, 100.0f }, { 2.0f, 100.0f } };
+
+            const auto rms = [] (const std::vector<float>& x, size_t from, size_t count)
+            {
+                double sum = 0.0;
+                for (size_t i = from; i < from + count; ++i)
+                    sum += static_cast<double> (x[i]) * x[i];
+                return std::sqrt (sum / static_cast<double> (count));
+            };
+
+            for (const auto& c : cases)
+            {
+                const auto x = run (c[0], c[1], 95.0f, 200.0f, 0.9f, blocks, burst);
+
+                double loudest = 0.0;
+                for (size_t from = 0; from + 4800 <= x.size(); from += 4800)
+                    loudest = std::max (loudest, rms (x, from, 4800));
+
+                const double afterBurst = rms (x, 72000, 48000);          // 1,5-2,5 с
+                const double last = rms (x, x.size() - 48000, 48000);     // последняя секунда
+
+                std::printf ("  #56 feedback 95 %%, характер %.0f, Age %.0f: пик окна %.3f, "
+                             "после входа %.1f dBFS, в конце %.1f dBFS\n", c[0], c[1], loudest,
+                             20.0 * std::log10 (std::max (afterBurst, 1.0e-12)),
+                             20.0 * std::log10 (std::max (last, 1.0e-12)));
+
+                CHECK (loudest < 1.9);
+                CHECK (afterBurst > 1.0e-3);                // замер не пустой: хвост был
+                CHECK (last < afterBurst * 1.0e-3);         // гаснет, а не держится шумом
+                CHECK (last < 1.0e-4);                      // -80 dBFS: в тишине пусто
+            }
+        }
+
+        // 4. Смена Character и рывки Age на звучащем хвосте. Детектор тот же, что в стресс-
+        //    тесте (#25): отношение худшего шага к 99,9-му процентилю, порог 8. Дёргаются
+        //    только эти два параметра — в общем стрессе их вклад тонет в рывках двадцати
+        //    остальных. Раз в 106 мс: смена характера через ноль занимает 100, и следующий
+        //    рывок приходит, когда предыдущий едва доехал. Окраска петли по умолчанию.
+        {
+            MidiDelayProcessor proc;
+            engineDefaults (proc);
+            setParam (proc, "sync", 0.0f);
+            setParam (proc, "delayTime", 300.0f);
+            setParam (proc, "feedback", 60.0f);
+            setParam (proc, "mix", 100.0f);
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            constexpr int blocks = 2820;   // 30 с
+            juce::Random random (20260911);
+            juce::AudioBuffer<float> block (2, blockSize);
+            std::vector<float> steps;
+            steps.reserve (static_cast<size_t> (blocks) * blockSize);
+            float previous = 0.0f;
+            double phase = 0.0;
+
+            juce::MidiBuffer chord;
+            for (const int note : { 60, 64, 67 })
+                chord.addEvent (juce::MidiMessage::noteOn (1, note, 0.9f), 0);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = static_cast<float> (0.3 * std::sin (phase) + 0.15 * std::sin (2.7 * phase));
+                    phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                if (b > 0 && b % 10 == 0)
+                {
+                    if (random.nextBool())
+                        setParam (proc, "character", static_cast<float> (random.nextInt (3)));
+                    else
+                        proc.apvts.getParameter ("age")->setValueNotifyingHost (random.nextFloat());
+                }
+
+                runBlock (proc, block, b == 0 ? chord : juce::MidiBuffer {});
+                CHECK (allocations.load() == 0);
+
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const float value = block.getSample (0, i);
+                    CHECK (std::isfinite (value));
+                    CHECK (std::abs (value) < 8.0f);
+                    steps.push_back (std::abs (value - previous));
+                    previous = value;
+                }
+            }
+
+            const auto tail = steps.begin() + static_cast<long> (steps.size() * 999 / 1000);
+            std::nth_element (steps.begin(), tail, steps.end());
+            const double percentile = *tail;
+            const double worst = *std::max_element (tail, steps.end());
+            const double ratio = worst / juce::jmax (1.0e-6, percentile);
+
+            std::printf ("  #56 смена характера и рывки Age на хвосте: худший шаг %.4f, "
+                         "99,9%% %.4f, отношение %.1f\n", worst, percentile, ratio);
+
+            CHECK (percentile > 1.0e-5);
+            CHECK (ratio < 8.0);
+        }
+
+        // 5. Проект, сохранённый до сессии 20, этих параметров не содержит — и обязан
+        //    открыться в Clean, а не в том, что стояло в экземпляре до загрузки. Сессия 13
+        //    уже ломала пользователю проект в FL сменой идентификаторов; здесь идентификаторы
+        //    не меняются, но проверяется именно загрузка старого состояния, а не обещание.
+        {
+            MidiDelayProcessor source;
+            engineDefaults (source);
+            setParam (source, "feedback", 42.0f);
+
+            auto legacy = source.apvts.copyState();
+
+            for (const char* id : { "character", "age" })
+                legacy.removeChild (legacy.getChildWithProperty ("id", id), nullptr);
+
+            CHECK (! legacy.getChildWithProperty ("id", "character").isValid());
+
+            juce::MemoryBlock block;
+            if (auto xml = legacy.createXml())
+                juce::AudioProcessor::copyXmlToBinary (*xml, block);
+
+            MidiDelayProcessor restored;
+            engineDefaults (restored);
+            setParam (restored, "character", 2.0f);   // заведомо не Clean — чтобы было что вернуть
+            setParam (restored, "age", 90.0f);
+            restored.setStateInformation (block.getData(), static_cast<int> (block.getSize()));
+
+            CHECK (getParam (restored, "character") == 0.0f);
+            CHECK (getParam (restored, "age") == 30.0f);
+            CHECK (std::abs (getParam (restored, "feedback") - 42.0f) < 0.01f);
+        }
     }
 
     // --- Живой темп: сетка едет за хостом на ходу (#20) -------------------------

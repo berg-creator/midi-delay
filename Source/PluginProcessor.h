@@ -3,6 +3,7 @@
 
 #include "DSP/DelayBuffer.h"
 #include "DSP/Diffuser.h"
+#include "DSP/Character.h"
 #include "DSP/VoiceManager.h"
 
 /** MIDI-Driven Pitch Delay. Хвост существует только пока звучит MIDI-нота: wet
@@ -142,6 +143,10 @@ private:
         по старому времени, один по новому. На блоке 512 сэмплов это 10 мс, на 16384 —
         треть секунды, и второй случай замер поймал сразу. */
     void refreshHostBpm();
+
+    /** Снять выбранный характер и его глубину 0..1 в blockCharacter и blockCharacterDepth
+        (#56). Зовётся из prepareToPlay и раз на блок из processBlock. */
+    void snapCharacter();
 
     /** Пересчитать выравнивание и сказать его хосту. Только из потока сообщений:
         setLatencySamples дёргает хост, и звать его из processBlock нельзя. */
@@ -291,6 +296,19 @@ private:
     /** Диффузия хвоста (#45): алл-пассы на возврате обратной связи. */
     Diffuser diffuser;
 
+    /** Характер хвоста (#56): Tape и Lo-Fi на входе кольца. */
+    Character character;
+
+    /** Характер, который сейчас подмешан, и его глубина. Отдельно от выбранного
+        параметром: смена идёт через ноль — глубина старого плавно уходит в ноль,
+        только тогда activeCharacter меняется, и глубина нового едет из нуля.
+        Выбранный снимается раз на блок в blockCharacter и blockCharacterDepth;
+        в Clean глубина ноль при любом Age. */
+    int activeCharacter = Character::clean;
+    int blockCharacter = Character::clean;
+    float blockCharacterDepth = 0.0f;
+    juce::SmoothedValue<float> characterSmoothed;
+
     /** Линия сухого сигнала: держит его ровно столько же, сколько опаздывает
         обработанный. Без неё в Follow сухой шёл бы впереди хвоста на всю латентность
         питчера. Отдельное кольцо, потому что основное несёт dry + feedback. */
@@ -378,6 +396,8 @@ private:
     std::atomic<float>* pDucking    = nullptr;
     std::atomic<float>* pFilterLo   = nullptr;
     std::atomic<float>* pFilterHi   = nullptr;
+    std::atomic<float>* pCharacter  = nullptr;
+    std::atomic<float>* pAge        = nullptr;
 
     juce::AudioProcessorParameter* bypassParam = nullptr;
 

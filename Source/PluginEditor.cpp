@@ -41,6 +41,8 @@ namespace
         { "Delay",    "filterHi"   },
         { "Delay",    "diffusion"  },
         { "Delay",    "modulation" },
+        { "Delay",    "character"  },
+        { "Delay",    "age"        },
         { "Pitch",    "rootKey"    },
         { "Pitch",    "pitchRange" },
         { "Pitch",    "voices"     },
@@ -606,6 +608,11 @@ void MidiDelayEditor::refreshContext()
     setContext ("delayTime", sync, follow ? "Repeat Time" : "Delay Time");
     setContext ("division", ! sync, "Note Division");
     setContext ("width", false, pingPong ? "Width - ping-pong" : "Width - spread");
+
+    // Age в Clean не делает ничего (#56) — гаснет, как Note Division без Sync.
+    const auto clean = proc.apvts.getRawParameterValue ("character")
+                           ->load (std::memory_order_relaxed) < 0.5f;
+    setContext ("age", clean, {});
 }
 
 void MidiDelayEditor::setContext (const juce::String& parameterId, bool inert,
@@ -714,6 +721,8 @@ void MidiDelayEditor::timerCallback()
     const auto division = static_cast<int> (proc.apvts.getRawParameterValue ("division")
                                                 ->load (std::memory_order_relaxed));
     const auto bpm = juce::roundToInt (proc.getSyncBpm());
+    const auto character = static_cast<int> (proc.apvts.getRawParameterValue ("character")
+                                                 ->load (std::memory_order_relaxed));
 
     // Программу может сменить и хост — своим меню пресетов или автоматизацией.
     if (const auto preset = proc.getCurrentProgram(); preset != shownPreset)
@@ -724,8 +733,9 @@ void MidiDelayEditor::timerCallback()
 
     if (quality != shownQuality || clamped != shownClamped || follow != shownFollow
         || alignment != shownAlignment || sync != shownSync || pingPong != shownPingPong
-        || division != shownDivision || bpm != shownBpm)
+        || division != shownDivision || bpm != shownBpm || character != shownCharacter)
     {
+        shownCharacter = character;
         shownQuality = quality;
         shownClamped = clamped;
         shownFollow = follow;
