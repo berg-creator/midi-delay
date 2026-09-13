@@ -187,7 +187,7 @@ CI собирает VST3 и выкладывает артефактом `MIDI-De
 скопировать `MIDI Delay.vst3` в `C:\Program Files\Common Files\VST3`. Подпись
 Authenticode, SmartScreen и то, как Windows относится к плагину из скачанного архива,
 не проверялись: Windows-машины нет. CI в сессии 23: VST3 под Windows собирается,
-ProcessorTest там падает без вывода ([#34](ISSUES.md)).
+ProcessorTest там падает на стрессе анти-клика ([#25](ISSUES.md), [#34](ISSUES.md)).
 
 ## 7. До публичного релиза ещё
 
