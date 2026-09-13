@@ -937,6 +937,9 @@ static int regression (bool update, const juce::StringPairArray& overrides)
 
 int main (int argc, char* argv[])
 {
+    // Без буфера: в CI на Windows тест умер с кодом 127 через полминуты и не оставил
+    // ни строки — буфер stdout при падении теряется, и не видно, на каком разделе.
+    std::setvbuf (stdout, nullptr, _IONBF, 0);
     countedThread = std::this_thread::get_id();
 
     juce::ScopedJuceInitialiser_GUI juceInit;

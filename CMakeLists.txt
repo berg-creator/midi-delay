@@ -65,8 +65,7 @@ target_sources(MidiDelay PRIVATE
 target_compile_definitions(MidiDelay PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
-    JUCE_VST3_CAN_REPLACE_VST2=0
-    JUCE_DISPLAY_SPLASH_SCREEN=0)
+    JUCE_VST3_CAN_REPLACE_VST2=0)
 
 target_link_libraries(MidiDelay PRIVATE
     juce::juce_audio_utils
@@ -75,6 +74,69 @@ target_link_libraries(MidiDelay PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+
+# Тексты лицензий стороннего кода — внутрь бандлов (#42). Только силами сборки: файл,
+# положенный в бандл после подписи, ломает подпись. Тексты читаются из самих зависимостей,
+# а не переписываются: пропал файл — конфигурация падает. Список — это модули JUCE,
+# которые линкует juce_audio_utils, сверенные с libs/JUCE/JUCE.spdx.json; ASIO, Oboe,
+# LV2 и AAX не собираются, Box2D и QuickJS не линкуются. FLAC и Ogg линкер на macOS
+# выбрасывает, но на Windows это не проверено, и лишняя строка дешевле недостающей.
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/libs/JUCE/JUCE.spdx.json" juceSpdx)
+string(JSON juceVersion GET "${juceSpdx}" packages 0 versionInfo)
+if(NOT juceVersion STREQUAL "9.0.2")
+    message(FATAL_ERROR "JUCE обновилась до ${juceVersion}: сверить список лицензий ниже "
+        "с libs/JUCE/JUCE.spdx.json (#42) и поднять версию в этой проверке")
+endif()
+
+set(notices "${CMAKE_CURRENT_BINARY_DIR}/THIRD-PARTY-NOTICES.txt")
+set(noticesText "MIDI Delay includes the following third-party software.\n")
+foreach(entry IN ITEMS
+        "Signalsmith Stretch|libs/signalsmith-stretch/LICENSE.txt"
+        "Signalsmith Linear|libs/signalsmith-stretch/signalsmith-linear/LICENSE.txt"
+        "JUCE (used under the JUCE 9 EULA, Starter licence)|libs/JUCE/LICENSE.md"
+        "zlib|libs/JUCE/modules/juce_core/zip/zlib/LICENSE"
+        "HarfBuzz|libs/JUCE/modules/juce_graphics/fonts/harfbuzz/COPYING"
+        "SheenBidi|libs/JUCE/modules/juce_graphics/unicode/sheenbidi/LICENSE"
+        "LunaSVG|libs/JUCE/modules/juce_graphics/drawables/lunasvg/LICENSE"
+        "PlutoVG|libs/JUCE/modules/juce_graphics/drawables/lunasvg/plutovg/LICENSE"
+        "libpng|libs/JUCE/modules/juce_graphics/image_formats/pnglib/LICENSE"
+        "libjpeg. This software is based in part on the work of the Independent JPEG Group|libs/JUCE/modules/juce_graphics/image_formats/jpglib/README"
+        "FLAC|libs/JUCE/modules/juce_audio_formats/codecs/flac/Flac Licence.txt"
+        "libogg and libvorbis|libs/JUCE/modules/juce_audio_formats/codecs/oggvorbis/Ogg Vorbis Licence.txt"
+        "VST3 SDK|libs/JUCE/modules/juce_audio_processors_headless/format_types/VST3_SDK/LICENSE.txt"
+        "AudioUnitSDK|libs/JUCE/modules/juce_audio_plugin_client/AU/AudioUnitSDK/LICENSE.txt")
+    string(FIND "${entry}" "|" bar)
+    string(SUBSTRING "${entry}" 0 ${bar} name)
+    math(EXPR bar "${bar} + 1")
+    string(SUBSTRING "${entry}" ${bar} -1 path)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${path}")
+        message(FATAL_ERROR "Нет файла лицензии ${path} (#42)")
+    endif()
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${path}")
+    file(READ "${CMAKE_CURRENT_SOURCE_DIR}/${path}" text)
+    string(APPEND noticesText "\n\n==== ${name} ====\n\n${text}")
+endforeach()
+# Через COPYONLY, чтобы файл не перезаписывался без изменений и не пересобирал бандлы.
+file(WRITE "${notices}.in" "${noticesText}")
+configure_file("${notices}.in" "${notices}" COPYONLY)
+
+set_source_files_properties("${notices}" PROPERTIES
+    HEADER_FILE_ONLY TRUE
+    MACOSX_PACKAGE_LOCATION Resources)
+# Подписывает бандл JUCE, шагом после линковки. Изменись один только файл — линковки
+# нет, подписи нет, и бандл выходит с битой печатью: отсюда LINK_DEPENDS.
+foreach(format VST3 AU)
+    if(TARGET MidiDelay_${format})
+        target_sources(MidiDelay_${format} PRIVATE "${notices}")
+        set_property(TARGET MidiDelay_${format} APPEND PROPERTY LINK_DEPENDS "${notices}")
+    endif()
+endforeach()
+# На Windows MACOSX_PACKAGE_LOCATION молчит, а VST3 там тоже бандл-каталог.
+if(WIN32)
+    add_custom_command(TARGET MidiDelay_VST3 POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:MidiDelay_VST3>/../Resources"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different "${notices}" "$<TARGET_FILE_DIR:MidiDelay_VST3>/../Resources/")
+endif()
 
 # Офлайн-тест процессора: аллокации, смещение дилея, состояние, регрессионные рендеры
 # (#34). Из сборки по умолчанию исключён: у консольного приложения своя копия модулей
