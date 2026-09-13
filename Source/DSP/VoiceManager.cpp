@@ -13,9 +13,8 @@ void VoiceManager::prepare (double newSampleRate, int maxBlockSamples)
     for (auto& v : voices)
         v.prepare (sampleRate, blockSize);
 
-    // Единственная аллокация пула: три моно-буфера подряд на все голоса сразу — вход
-    // питчера, его выход и выход правого питчера классического ping-pong (#55).
-    scratch.assign (static_cast<size_t> (blockSize) * 3u, 0.0f);
+    // Единственная аллокация пула: два моно-буфера подряд на все голоса сразу.
+    scratch.assign (static_cast<size_t> (blockSize) * 2u, 0.0f);
     nextAge = 0;
     sustainDown = false;
 
@@ -69,30 +68,12 @@ void VoiceManager::setWidth (float widthPercent)
     spread = std::clamp (widthPercent, 0.0f, 200.0f) * 0.005f;
 }
 
-void VoiceManager::setStereoLayout (StereoLayout newLayout)
-{
-    if (newLayout == layout)
-        return;
+void VoiceManager::setChoir (bool shouldChoir) { choir = shouldChoir; }
 
-    layout = newLayout;
-
-    for (auto& v : voices)
-        v.setCrossed (newLayout == StereoLayout::crossed);
-}
-
-float VoiceManager::panForSlot (int slot) const
-{
-    const int half = std::max (1, voiceLimit / 2);
-    const int step = (slot + 1) / 2;
-    const float sign = (slot % 2) == 1 ? 1.0f : -1.0f;
-
-    return spread * sign * static_cast<float> (step) / static_cast<float> (half);
-}
-
-int VoiceManager::findVoiceFor (int)
+int VoiceManager::findVoiceFor (int exclude)
 {
     for (int i = 0; i < voiceLimit; ++i)
-        if (! voices[i].isActive())
+        if (i != exclude && ! voices[i].isActive())
             return i;
 
     // Свободных нет. Сначала самый старый голос в release, иначе самый тихий,
@@ -105,6 +86,9 @@ int VoiceManager::findVoiceFor (int)
 
     for (int i = 0; i < voiceLimit; ++i)
     {
+        if (i == exclude)
+            continue;
+
         const auto age = voices[i].getAge();
 
         if (voices[i].isReleasing() && age < oldestReleasingAge)
@@ -156,46 +140,32 @@ int VoiceManager::getLatencySamples (PitchEngine which) const
 
 void VoiceManager::noteOn (int midiNote, float velocity, float ratio)
 {
-    if (layout == StereoLayout::pairs)
-    {
-        // Хор парой (#55, развилка 1б — прототип до вердикта сессии 22): нота поётся двумя
-        // голосами по бортам, чуть расстроенными и сдвинутыми, — ширина с первой ноты
-        // ценой полифонии. Velocity пополам — это мощность пополам: две некоррелированные
-        // половины звучат как один голос, а не на 3 dB громче, и A/B не судит громкость.
-        // ponytail: без свободных голосов пара может украсть сама себя и прозвучать одним;
-        // если пары выиграют — искать второй слот в обход первого.
-        const float detune = std::exp2 (pairDetuneCents / 1200.0f);
-        const double offset = pairOffsetMs * 0.001 * sampleRate;
-
-        startVoice (findVoiceFor (midiNote), midiNote, velocity * 0.5f, ratio * detune, delaySamples, -spread);
-        startVoice (findVoiceFor (midiNote), midiNote, velocity * 0.5f, ratio / detune, delaySamples + offset, spread);
-        return;
-    }
-
     // Тишина проверяется до раздачи слота: после неё голос этой же ноты уже активен.
     const bool silent = std::none_of (voices.begin(), voices.end(),
                                       [] (const Voice& v) { return v.isActive(); });
-    const int slot = findVoiceFor (midiNote);
+    const int slot = findVoiceFor();
 
-    // Пан приходит не снаружи, а от раскладки и номера слота (#23): кто именно из голосов
-    // возьмёт ноту, знает только пул, и снаружи это число взять неоткуда.
-    float pan = panForSlot (slot);
+    if (choir && voiceLimit > 1)
+    {
+        // Хор (#55, вердикт сессии 22 — пара, а не разлёт по слотам): нота поётся двумя
+        // голосами по бортам, чуть расстроенными и сдвинутыми, — ширина с первой ноты
+        // ценой полифонии, 4 ноты на 8 голосов. Velocity пополам — это мощность пополам:
+        // две некоррелированные половины звучат как один голос, а не на 3 dB громче.
+        // При Voices 1 пары нет — нота одним голосом в центре, как в тишину у ping-pong.
+        const float detune = std::exp2 (pairDetuneCents / 1200.0f);
+        const double offset = pairOffsetMs * 0.001 * sampleRate;
 
-    if (layout == StereoLayout::alternate)
-    {
-        // Ping-pong по нотам: слот ни при чём, сторона чередуется по порядку нот. Нота
-        // в тишину — в центр (#55, развилка 2а): иначе одна удержанная нота в Free уходила
-        // в левый борт и там оставалась, а с Auto Free звучит ping-pong по умолчанию.
-        // Дальше чередование, начиная слева.
-        pan = silent ? 0.0f : (pingPongRight ? spread : -spread);
-        pingPongRight = ! silent && ! pingPongRight;
+        startVoice (slot, midiNote, velocity * 0.5f, ratio * detune, delaySamples, -spread);
+        startVoice (findVoiceFor (slot), midiNote, velocity * 0.5f, ratio / detune, delaySamples + offset, spread);
+        return;
     }
-    else if (layout == StereoLayout::crossed)
-    {
-        // Классический ping-pong: сторону задаёт кольцо, а не нота. Левое чтение голоса —
-        // на левый край размаха, правое зеркально (Voice::start).
-        pan = -spread;
-    }
+
+    // Ping-pong по нотам: сторона чередуется по порядку нот. Нота в тишину — в центр
+    // (#55, развилка 2а): иначе одна удержанная нота в Free уходила в левый борт и там
+    // оставалась, а с Auto Free звучит ping-pong по умолчанию. Дальше чередование,
+    // начиная слева. Одноголосный хор попадает сюда же и стоит в центре.
+    const float pan = silent || choir ? 0.0f : (pingPongRight ? spread : -spread);
+    pingPongRight = ! silent && ! choir && ! pingPongRight;
 
     startVoice (slot, midiNote, velocity, ratio, delaySamples, pan);
 }
@@ -248,8 +218,7 @@ void VoiceManager::process (float* const* out, int numOutChannels, int startSamp
 
     float* scratchIn  = scratch.data();
     float* scratchOut = scratchIn + blockSize;
-    float* scratchOutRight = scratchOut + blockSize;
 
     for (auto& v : voices)
-        v.addTo (out, numOutChannels, startSample, numSamples, source, scratchIn, scratchOut, scratchOutRight);
+        v.addTo (out, numOutChannels, startSample, numSamples, source, scratchIn, scratchOut);
 }

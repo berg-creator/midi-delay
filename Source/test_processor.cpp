@@ -121,9 +121,10 @@ namespace
         // Характер Clean (#56) закреплён явно, а не унаследован от умолчания: эталоны
         // регрессии (#34) обязаны остаться бит-в-бит и тогда, когда умолчание сменят.
         setParam (proc, "character", 0.0f);
-        // Stereo Choir (#55) — по той же причине: с Auto замеры в Free стали бы ping-pong,
-        // и ноты тестов разошлись бы по бортам не так, как были замерены.
-        setParam (proc, "stereo", 1.0f);
+        // Stereo Ping-Pong (#55) — по той же причине. Хор поёт ноту парой расстроенных голосов,
+        // а замерам тайминга и уровня нужен один голос: у ping-pong нота в тишину — один голос
+        // в центре, бит-в-бит как нулевой слот прежнего разлёта, на котором замеры сделаны.
+        setParam (proc, "stereo", 2.0f);
         setParam (proc, "sync", 0.0f);
         setParam (proc, "diffusion", 0.0f);
         setParam (proc, "modulation", 0.0f);
@@ -401,8 +402,7 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     for (const auto& id : overrides.getAllKeys())
     {
         if (id == "noteMs" || id == "startS" || id == "notes" || id == "bpm"
-            || id == "preset" || id == "drySeconds" || id == "seconds"
-            || id == "pairs" || id == "classic")
+            || id == "preset" || id == "drySeconds" || id == "seconds")
             continue;   // настройки рендера, а не параметры плагина
 
         if (proc.apvts.getParameter (id) == nullptr)
@@ -414,14 +414,6 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
         setParam (proc, id.toRawUTF8(), overrides[id].getFloatValue());
         std::printf ("  %s = %s\n", id.toRawUTF8(), overrides[id].toRawUTF8());
     }
-
-    // Прототипы развилок #55 — ключами pairs=1 и classic=1: это не параметры, и через
-    // setParam их не выставить.
-    proc.forks.choirPairs = overrides["pairs"].getIntValue() != 0;
-    proc.forks.classicPingPong = overrides["classic"].getIntValue() != 0;
-
-    if (proc.forks.choirPairs)      std::printf ("  прототип: хор парой голосов\n");
-    if (proc.forks.classicPingPong) std::printf ("  прототип: классический ping-pong\n");
 
     // Темп подсовывается плагину так же, как это делает хост: своим playhead.
     // Живёт до конца рендера — отсюда и не локальная переменная в if.
@@ -594,10 +586,8 @@ static int renderDemo (const juce::String& path, const juce::String& mode,
     одна нота — компенсация формант стоит только на сдвинутых голосах), 48 кГц,
     блок 512, окраска петли по умолчанию. Считается доля ядра: сколько реального
     времени ушло на обсчёт секунды звука.
-    Слово classic третьим аргументом включает прототип классического ping-pong (#55):
-    каждая нота там поёт двумя питчерами, и его цена — часть вердикта по развилке.
-    Запуск: ProcessorTest --bench [fast|hq] [hold|shift] [classic] */
-static int benchmark (const juce::String& mode, const juce::String& formants, const juce::String& fork)
+    Запуск: ProcessorTest --bench [fast|hq] [hold|shift] */
+static int benchmark (const juce::String& mode, const juce::String& formants)
 {
     constexpr double sr = 48000.0;
     constexpr int blockSize = 512;
@@ -613,7 +603,6 @@ static int benchmark (const juce::String& mode, const juce::String& formants, co
     setParam (proc, "voices", 8.0f);
     setParam (proc, "release", 2000.0f);
     setParam (proc, "formants", formants == "shift" ? 0.0f : 1.0f);
-    proc.forks.classicPingPong = fork == "classic";   // во Free Auto — ping-pong
 
     proc.setPlayConfigDetails (2, 2, sr, blockSize);
     proc.prepareToPlay (sr, blockSize);
@@ -654,9 +643,8 @@ static int benchmark (const juce::String& mode, const juce::String& formants, co
     const double elapsed = std::chrono::duration<double> (
         std::chrono::steady_clock::now() - started).count();
 
-    std::printf ("%s, formants %s%s: %.1f %% ядра (%.2f с на %.0f с звука)\n",
+    std::printf ("%s, formants %s: %.1f %% ядра (%.2f с на %.0f с звука)\n",
                  mode == "fast" ? "fast" : "hq", formants.toRawUTF8(),
-                 proc.forks.classicPingPong ? ", classic ping-pong" : "",
                  100.0 * elapsed / seconds, elapsed, seconds);
     return 0;
 }
@@ -746,9 +734,11 @@ static int regression (bool update, const juce::StringPairArray& overrides)
         setParam (proc, "character", c.character);
         setParam (proc, "age", c.age);
 
-        // Stereo Choir — разлёт по слотам, с которым записаны эталоны. С Auto сценарии
-        // в Free стали бы ping-pong (#55), и эталоны разошлись бы не из-за поломки.
-        setParam (proc, "stereo", 1.0f);
+        // Stereo Ping-Pong (#55): одна нота в тишину — один голос в центре, бит-в-бит как
+        // нулевой слот разлёта, на котором записаны эталоны. Хор пел бы её парой расстроенных
+        // голосов. Аккорд в ping-pong расходится иначе, чем расходился по слотам, — эталон
+        // chord переписан в сессии 22 вместе с уходом разлёта; прочие остались байт-в-байт.
+        setParam (proc, "stereo", 2.0f);
 
         for (const auto& id : overrides.getAllKeys())
             setParam (proc, id.toRawUTF8(), overrides[id].getFloatValue());
@@ -992,8 +982,7 @@ int main (int argc, char* argv[])
 
     if (argc >= 2 && juce::String (argv[1]) == "--bench")
         return benchmark (argc >= 3 ? juce::String (argv[2]) : juce::String ("hq"),
-                          argc >= 4 ? juce::String (argv[3]) : juce::String ("hold"),
-                          argc >= 5 ? juce::String (argv[4]) : juce::String());
+                          argc >= 4 ? juce::String (argv[3]) : juce::String ("hold"));
 
     if (argc >= 2 && juce::String (argv[1]) == "--regress")
     {
@@ -3011,7 +3000,7 @@ int main (int argc, char* argv[])
     }
 
     // --- Stereo Mode: куда уходят ноты и повторы (#55, #23) ---------------------
-    // Четыре раскладки, каждая проверяется буквально. Ноты 48, 60 и 72 при Root Key C
+    // Оба режима проверяются буквально. Ноты 48, 60 и 72 при Root Key C
     // поют синус 500 Гц на 250, 500 и 1000 Гц, и сторона каждой ноты читается своей
     // частотой: ноты звучат одновременно, и баланс суммы усреднился бы в центр. Fast:
     // варигонка на октаву даёт ровно эти частоты, и они ложатся в бины окна 0,2 с.
@@ -3098,10 +3087,8 @@ int main (int argc, char* argv[])
             return (r - l) / std::max (l + r, 1.0e-12);
         };
 
-        // 1-2. Три ноты по очереди, все держатся: 60 в тишину, 72 при звучащей 60, 48 при двух.
-        //      Choir раскладывает по слотам: 60 в центре, 72 правее, 48 левее — на восьмую
-        //      размаха, Width делится на половину пула. Ping-Pong по нотам: 60 в центр,
-        //      потому что в тишину, 72 влево, 48 вправо — на полразмаха.
+        // 1. Ping-Pong по нотам. Три ноты по очереди, все держатся: 60 в тишину — в центр,
+        //    72 при звучащей 60 — влево, 48 при двух — вправо, на полразмаха.
         const auto threeNotes = [&] (float stereo, double& note48, double& note60, double& note72)
         {
             MidiDelayProcessor proc;
@@ -3117,37 +3104,36 @@ int main (int argc, char* argv[])
 
         double note48 = 0.0, note60 = 0.0, note72 = 0.0;
 
-        threeNotes (1.0f, note48, note60, note72);
-        std::printf ("  #55 choir: нота 48 %+.2f, 60 %+.2f, 72 %+.2f (-1 слева, +1 справа)\n",
-                     note48, note60, note72);
-        CHECK (std::abs (note60) < 0.05 && note72 > 0.05 && note48 < -0.05);
-
         // Порог 0,2 — примерно четверть панорамы: меньше было бы «чуть шире», а не чередованием.
-        // Контроль — строка выше: там те же ноты расходятся иначе.
         threeNotes (2.0f, note48, note60, note72);
-        std::printf ("  #55 ping-pong по нотам: нота 48 %+.2f, 60 %+.2f, 72 %+.2f\n",
+        std::printf ("  #55 ping-pong по нотам: нота 48 %+.2f, 60 %+.2f, 72 %+.2f (-1 слева, +1 справа)\n",
                      note48, note60, note72);
         CHECK (std::abs (note60) < 0.05 && note72 < -0.2 && note48 > 0.2);
 
-        // 3. Хор парой (развилка 1б): одна нота занимает два голоса, и они стоят симметрично
-        //    по бортам — баланс ноль, как у одного голоса в центре, но голосов два.
+        // 2. Хор: одна нота занимает два голоса, и они стоят симметрично по бортам — баланс
+        //    ноль, как у одного голоса в центре, но голосов два. Контроль к строке выше.
+        const auto votersOn = [] (MidiDelayProcessor& proc, int note)
         {
-            MidiDelayProcessor proc;
-            setUp (proc, 1.0f, 0.0f);
-            proc.forks.choirPairs = true;
-
-            const auto out = run (proc, 6, 6 * blockSize, [] (int b) { return b == 1 ? 60 : -1; });
-
             int voices = 0;
 
             for (int slot = 0; slot < VoiceManager::maxVoices; ++slot)
-                if (proc.voiceNote[slot].load() == 60)
+                if (proc.voiceNote[slot].load() == note)
                     ++voices;
 
+            return voices;
+        };
+
+        {
+            MidiDelayProcessor proc;
+            setUp (proc, 1.0f, 0.0f);
+
+            const auto out = run (proc, 6, 6 * blockSize, [] (int b) { return b == 1 ? 60 : -1; });
+
+            const int voices = votersOn (proc, 60);
             const double balance = rmsBalance (out, 4 * blockSize, window);
             const double level = out.getRMSLevel (0, 4 * blockSize, window);
 
-            std::printf ("  #55 хор парой: голосов на ноту %d, баланс %+.3f, уровень %.3f\n",
+            std::printf ("  #55 хор: голосов на ноту %d, баланс %+.3f, уровень %.3f\n",
                          voices, balance, level);
 
             CHECK (voices == 2);
@@ -3155,24 +3141,27 @@ int main (int argc, char* argv[])
             CHECK (level > 0.05);
         }
 
-        // 4. Классический ping-pong (развилка 2б): одна нота, тон 100 мс, дальше тишина —
-        //    повторы стоят в выходе по отдельности. Первый обязан уйти влево, второй вправо.
+        // 3. Полный пул не даёт паре украсть саму себя: при Voices 2 новая нота крадёт обе
+        //    половины старой, а не первую свою половину. Свежий голос на нуле огибающей —
+        //    самый тихий в пуле, и без запрета второй голос пары забирал его. При Voices 1
+        //    пары нет вовсе — один голос.
         {
             MidiDelayProcessor proc;
-            setUp (proc, 2.0f, 50.0f);
-            proc.forks.classicPingPong = true;
+            setUp (proc, 1.0f, 0.0f);
+            setParam (proc, "voices", 2.0f);
 
-            constexpr int echo = 9600;   // 200 мс
-            const auto out = run (proc, 4, 4800, [] (int b) { return b == 0 ? 60 : -1; });
+            run (proc, 4, 4 * blockSize, [] (int b) { return b == 1 ? 60 : b == 2 ? 64 : -1; });
+            const int stolen = votersOn (proc, 64);
 
-            const double first  = rmsBalance (out, echo + 480, 3840);
-            const double second = rmsBalance (out, 2 * echo + 480, 3840);
+            setParam (proc, "voices", 1.0f);
+            run (proc, 3, 3 * blockSize, [] (int b) { return b == 1 ? 67 : -1; });
+            const int single = votersOn (proc, 67);
 
-            std::printf ("  #55 классический ping-pong: первый повтор %+.2f, второй %+.2f\n",
-                         first, second);
+            std::printf ("  #55 хор на полном пуле: Voices 2 — голосов на новой ноте %d, Voices 1 — %d\n",
+                         stolen, single);
 
-            CHECK (out.getRMSLevel (1, 2 * echo + 480, 3840) > 1.0e-3);   // второй повтор есть
-            CHECK (first < -0.2 && second > 0.2);
+            CHECK (stolen == 2);
+            CHECK (single == 1);
         }
     }
 
@@ -3191,8 +3180,7 @@ int main (int argc, char* argv[])
         // Возвращает корреляцию каналов и проседание моно-суммы в децибелах.
         // Проседание считается против среднего уровня каналов, а не против громкого:
         // вопрос ведь «сколько потеряется при сложении», а не «какой борт был громче».
-        const auto monoLoss = [&] (float width, float stereo, bool pairs, bool classic,
-                                   float diffusion, double& correlation)
+        const auto monoLoss = [&] (float width, float stereo, float diffusion, double& correlation)
         {
             MidiDelayProcessor proc;
             engineDefaults (proc);
@@ -3209,8 +3197,6 @@ int main (int argc, char* argv[])
             setParam (proc, "release", 300.0f);
             setParam (proc, "width", width);
             setParam (proc, "stereo", stereo);
-            proc.forks.choirPairs = pairs;
-            proc.forks.classicPingPong = classic;
 
             proc.setPlayConfigDetails (2, 2, sr, blockSize);
             proc.prepareToPlay (sr, blockSize);
@@ -3284,31 +3270,26 @@ int main (int argc, char* argv[])
         };
 
         // Положения, которые пользователь реально выставит. Width 200 — край ручки,
-        // ping-pong — то, что легло поверх стерео в сессии 13, прототипы — развилки #55:
-        // цена ширины в моно — часть вердикта по ним, а не то, что узнают после.
-        struct Case { const char* name; float width; float stereo; bool pairs; bool classic; float diffusion; };
+        // ping-pong — то, что легло поверх стерео в сессии 13, хор — пара голосов на ноту (#55).
+        struct Case { const char* name; float width; float stereo; float diffusion; };
 
         static constexpr Case cases[] {
-            { "width 100, choir, diffusion 50",               100.0f, 1.0f, false, false, 50.0f },
-            { "width 200, choir, diffusion 50",               200.0f, 1.0f, false, false, 50.0f },
-            { "width 200, choir, diffusion 100",              200.0f, 1.0f, false, false, 100.0f },
-            { "width 100, ping-pong, diffusion 50",           100.0f, 2.0f, false, false, 50.0f },
+            { "width 100, choir, diffusion 50",               100.0f, 1.0f, 50.0f },
+            { "width 200, choir, diffusion 50",               200.0f, 1.0f, 50.0f },
+            { "width 200, choir, diffusion 100",              200.0f, 1.0f, 100.0f },
+            { "width 100, ping-pong, diffusion 50",           100.0f, 2.0f, 50.0f },
             // Строка, из-за которой Sung Vocal в сессии 17 переехал на Width 100:
             // между замеренными 100 (-0,69 dB) и 200 (-3,02 dB) лежит вся разница
             // между «незаметно» и «в моно вдвое тише», и 150 отдаёт больше половины
             // пути. В пресете этого значения больше нет, в шкале — остаётся.
-            { "width 150, ping-pong, diffusion 50",           150.0f, 2.0f, false, false, 50.0f },
-            { "width 200, ping-pong, diffusion 100",          200.0f, 2.0f, false, false, 100.0f },
-            { "width 100, choir pairs, diffusion 50",         100.0f, 1.0f, true,  false, 50.0f },
-            { "width 200, choir pairs, diffusion 100",        200.0f, 1.0f, true,  false, 100.0f },
-            { "width 100, classic ping-pong, diffusion 50",   100.0f, 2.0f, false, true,  50.0f },
-            { "width 200, classic ping-pong, diffusion 100",  200.0f, 2.0f, false, true,  100.0f },
+            { "width 150, ping-pong, diffusion 50",           150.0f, 2.0f, 50.0f },
+            { "width 200, ping-pong, diffusion 100",          200.0f, 2.0f, 100.0f },
         };
 
         for (const auto& c : cases)
         {
             double correlation = 0.0;
-            const double loss = monoLoss (c.width, c.stereo, c.pairs, c.classic, c.diffusion, correlation);
+            const double loss = monoLoss (c.width, c.stereo, c.diffusion, correlation);
 
             std::printf ("  моно (%s): корреляция %+.3f, сумма %+.2f dB\n",
                          c.name, correlation, loss);
@@ -3316,15 +3297,7 @@ int main (int argc, char* argv[])
             // Фазового вычитания нет: отрицательная корреляция и означала бы, что каналы
             // гасят друг друга. Порог -0,1, а не ноль: слабый минус — это просто разные
             // длины звеньев диффузора, а не противофаза.
-            //
-            // Классический ping-pong (#55) из этой проверки выведен, и это замер, а не уступка.
-            // Он разводит соседние повторы по разным каналам, а соседние повторы установившегося
-            // тона сдвинуты на delay time: 330 Гц на 250 мс — 82,5 периода, ровно противофаза.
-            // На Width 200 корреляция −0,19; контроль на 240 мс, где сдвиг не половинный, дал
-            // +0,08, а прочие раскладки сдвинулись на сотые. Это цена классического ping-pong
-            // в моно на тоне, а не дефект, и пол по сумме ниже держит и его.
-            if (! c.classic)
-                CHECK (correlation > -0.1);
+            CHECK (correlation > -0.1);
 
             // Порог -3 dB — из критерия задачи, и замер встал ровно на него: width 200
             // с ping-pong даёт корреляцию 0,000 и сумму -3,02 dB. Это не дефект, а пол:
@@ -3343,8 +3316,8 @@ int main (int argc, char* argv[])
 
         // 1. Смена Stereo на звучащем хвосте не щёлкает — критерий задачи. Детектор тот же,
         //    что в стрессе (#25): отношение худшего шага к 99,9-му процентилю, порог 8.
-        //    Дёргаются Stereo и оба прототипа развилок: в общем стрессе вклад Stereo тонет
-        //    в рывках двадцати остальных, а прототипы там не дёргаются вовсе. Аккорд
+        //    Дёргается один Stereo: в общем стрессе его вклад тонет в рывках двадцати
+        //    остальных. Аккорд
         //    держится, поверх идёт мелодия: раскладку голос берёт в noteOn, и без новых нот
         //    смена раскладки на голосах не проверялась бы совсем. Окраска петли по умолчанию.
         {
@@ -3377,14 +3350,7 @@ int main (int argc, char* argv[])
                 }
 
                 if (b > 0 && b % 10 == 0)
-                {
-                    switch (random.nextInt (3))
-                    {
-                        case 0:  setParam (proc, "stereo", static_cast<float> (random.nextInt (3))); break;
-                        case 1:  proc.forks.choirPairs = ! proc.forks.choirPairs; break;
-                        default: proc.forks.classicPingPong = ! proc.forks.classicPingPong; break;
-                    }
-                }
+                    setParam (proc, "stereo", static_cast<float> (random.nextInt (3)));
 
                 juce::MidiBuffer midi;
 
@@ -3422,7 +3388,7 @@ int main (int argc, char* argv[])
             const double worst = *std::max_element (tail, steps.end());
             const double ratio = worst / juce::jmax (1.0e-6, percentile);
 
-            std::printf ("  #55 смена Stereo и прототипов на хвосте: худший шаг %.4f, "
+            std::printf ("  #55 смена Stereo на хвосте: худший шаг %.4f, "
                          "99,9%% %.4f, отношение %.1f\n", worst, percentile, ratio);
 
             CHECK (percentile > 1.0e-5);

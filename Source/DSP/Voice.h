@@ -42,12 +42,6 @@ public:
         на живом звуке безопасно, и слышать разницу переключателя надо сразу. */
     void setFormantHold (bool shouldHold);
 
-    /** Классический ping-pong (#55, развилка 2б — прототип до вердикта сессии 22): голос
-        читает каналы кольца порознь, каждый своим питчером; левое чтение стоит на пане
-        ноты, правое — зеркально. Латчится на старте ноты, как движок, и по той же причине:
-        второму питчеру посреди ноты нечем залить окно. */
-    void setCrossed (bool shouldCross);
-
     void noteOn (int midiNote, float velocity, float ratio, double delaySamples, float pan);
     void noteOff();
 
@@ -70,13 +64,11 @@ public:
     /** Push: голос подмешивает себя в out, а не отдаёт свой блок наружу (ADR 0001).
         scratchIn/scratchOut — общие на все голоса моно-буферы длиной maxBlockSamples,
         владелец VoiceManager. startSample/numSamples режут блок по MIDI-событиям.
-        scratchOutRight — выход правого питчера, нужен только ноте в crossed.
 
         Кольцо к этому моменту уже записано на весь сегмент, поэтому смещение чтения
         отсчитывается от его конца: сэмплу k соответствует readOffset + (numSamples - k). */
     void addTo (float* const* out, int numOutChannels, int startSample, int numSamples,
-                const DelayBuffer& source, float* scratchIn, float* scratchOut,
-                float* scratchOutRight);
+                const DelayBuffer& source, float* scratchIn, float* scratchOut);
 
 private:
     enum class Stage { idle, attack, sustain, release, stealing };
@@ -88,17 +80,10 @@ private:
     // в момент переключения нельзя, это аллокация из аудиопотока. Цена — память
     // неиспользуемого движка, около 250 КБ на голос.
     std::unique_ptr<PitchShifter> fastShifter, hqShifter;
-
-    // Правый канал классического ping-pong (#55). ponytail: вторая пара движков выделяется
-    // всем голосам всегда, около 250 КБ на голос; уходит вместе с прототипом, если вердикт
-    // сессии 22 — ping-pong по нотам.
-    std::unique_ptr<PitchShifter> fastShifterRight, hqShifterRight;
-    PitchShifter* engineFor (PitchEngine engine, bool right = false) const;
+    PitchShifter* engineFor (PitchEngine engine) const;
 
     PitchShifter* shifter = nullptr;   // активный; чей именно, решает старт ноты
-    PitchShifter* shifterRight = nullptr;       // не nullptr только у ноты, начатой в crossed
     PitchEngine wantEngine = PitchEngine::hq;   // то, что просят параметры прямо сейчас
-    bool wantCrossed = false;
 
     Stage stage = Stage::idle;
     float level = 0.0f;        // текущий уровень огибающей, он же выходной гейн
@@ -118,7 +103,6 @@ private:
     // молчал бы первые getLatencySamples() сэмплов — 30 мс дырки на каждой ноте.
     bool needsPrime = false;
     float gain[2] { 1.0f, 1.0f };
-    float gainRight[2] { 1.0f, 1.0f };   // пан правого чтения в crossed, зеркальный к gain
 
     // Нота, ждущая конца fade-out внутри этого же голоса. Очередь на один элемент.
     int pendingNote = -1;

@@ -45,16 +45,7 @@ void Voice::prepare (double sampleRate, int maxBlockSamples)
     hqShifter = std::make_unique<SignalsmithShifter>();
     hqShifter->prepare (sr, block);
 
-    // Вторая пара — правый канал классического ping-pong (#55). Зерно фазы у Signalsmith
-    // своё у каждого экземпляра, так что лишние движки не сдвигают чужой рендер.
-    fastShifterRight = std::make_unique<VarispeedShifter> (pitchWindowMs);
-    fastShifterRight->prepare (sr, block);
-
-    hqShifterRight = std::make_unique<SignalsmithShifter>();
-    hqShifterRight->prepare (sr, block);
-
     shifter = engineFor (wantEngine);
-    shifterRight = nullptr;
 
     stealSamples = std::max (1.0, sr * stealFadeMs * 0.001);
     setEnvelope (sr * 0.01, sr * 0.3);
@@ -74,20 +65,19 @@ void Voice::reset()
     sustained = false;
     needsPrime = false;
 
-    // Все: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
-    // выдать чужой хвост при следующем переключении Quality или Stereo.
-    for (auto* e : { fastShifter.get(), hqShifter.get(), fastShifterRight.get(), hqShifterRight.get() })
-        if (e != nullptr)
-            e->reset();
+    // Оба: неактивный движок тоже держит окно истории, и оставить его грязным значило бы
+    // выдать чужой хвост при следующем переключении Quality.
+    if (fastShifter != nullptr) fastShifter->reset();
+    if (hqShifter   != nullptr) hqShifter->reset();
 }
 
-PitchShifter* Voice::engineFor (PitchEngine engine, bool right) const
+PitchShifter* Voice::engineFor (PitchEngine engine) const
 {
     switch (engine)
     {
-        case PitchEngine::fast: return right ? fastShifterRight.get() : fastShifter.get();
+        case PitchEngine::fast: return fastShifter.get();
         case PitchEngine::hq:
-        default:                return right ? hqShifterRight.get() : hqShifter.get();
+        default:                return hqShifter.get();
     }
 }
 
@@ -105,14 +95,11 @@ void Voice::setEngine (PitchEngine engine)
 
 void Voice::setFormantHold (bool shouldHold)
 {
-    // Всем движкам, а не активному: варигонка про форманты ничего не знает и молча
+    // Обоим движкам, а не активному: варигонка про форманты ничего не знает и молча
     // проглотит вызов, зато переключение Quality посреди работы не потеряет настройку.
-    for (auto* e : { fastShifter.get(), hqShifter.get(), fastShifterRight.get(), hqShifterRight.get() })
-        if (e != nullptr)
-            e->setFormantHold (shouldHold);
+    if (fastShifter != nullptr) fastShifter->setFormantHold (shouldHold);
+    if (hqShifter   != nullptr) hqShifter->setFormantHold (shouldHold);
 }
-
-void Voice::setCrossed (bool shouldCross) { wantCrossed = shouldCross; }
 
 int Voice::getLatencySamples (PitchEngine engine) const
 {
@@ -163,16 +150,9 @@ void Voice::start (int midiNote, float velocity, float ratio, float pan)
 
     // Равномощный пан, нормированный на единицу в центре: без sqrt2 голос в центре
     // сел бы на 3 dB тише моно-суммы, из которой он и собран. Разводка по ширине — #23.
-    // Правое чтение crossed стоит зеркально (#55); остальным раскладкам оно не нужно.
-    const auto panGains = [] (float p, float* g)
-    {
-        const float angle = 0.25f * pi * (std::clamp (p, -1.0f, 1.0f) + 1.0f);
-        g[0] = std::cos (angle) * sqrt2;
-        g[1] = std::sin (angle) * sqrt2;
-    };
-
-    panGains (pan, gain);
-    panGains (-pan, gainRight);
+    const float angle = 0.25f * pi * (std::clamp (pan, -1.0f, 1.0f) + 1.0f);
+    gain[0] = std::cos (angle) * sqrt2;
+    gain[1] = std::sin (angle) * sqrt2;
 
     if (shifter != nullptr)
         shifter->setRatio (ratio);
@@ -183,15 +163,11 @@ void Voice::noteOn (int midiNote, float velocity, float ratio, double newDelaySa
     // Латч движка: только здесь, до расчёта позиции чтения — она считается
     // от латентности активного движка, а у движков она разная.
     shifter = engineFor (wantEngine);
-    shifterRight = wantCrossed ? engineFor (wantEngine, true) : nullptr;
 
     setDelaySamples (newDelaySamples);
 
     if (shifter != nullptr)
         shifter->reset();
-
-    if (shifterRight != nullptr)
-        shifterRight->reset();
 
     // Окно питчера сейчас пустое, залить его нечем: источник знает только addTo.
     needsPrime = true;
@@ -305,8 +281,7 @@ float Voice::nextEnvelope()
 }
 
 void Voice::addTo (float* const* out, int numOutChannels, int startSample, int numSamples,
-                   const DelayBuffer& source, float* scratchIn, float* scratchOut,
-                   float* scratchOutRight)
+                   const DelayBuffer& source, float* scratchIn, float* scratchOut)
 {
     if (stage == Stage::idle || numSamples <= 0 || shifter == nullptr)
         return;
@@ -314,17 +289,9 @@ void Voice::addTo (float* const* out, int numOutChannels, int startSample, int n
     const int numSourceChannels = source.getNumChannels();
     const float sourceScale = numSourceChannels > 0 ? 1.0f / static_cast<float> (numSourceChannels) : 0.0f;
 
-    // Каналы кольца порознь — только нота, начатая в классическом ping-pong (#55), и только
-    // на стереокольце: у моно читать порознь нечего, и голос поёт как обычно.
-    const bool split = shifterRight != nullptr && numSourceChannels > 1;
-
     // Голос читает моно-сумму: питчер у него один, стерео он делает паном (ADR 0001).
-    // В split side — номер канала, и у каждого канала свой питчер.
-    const auto read = [&source, numSourceChannels, sourceScale, split] (int side, double d)
+    const auto readMono = [&source, numSourceChannels, sourceScale] (double d)
     {
-        if (split)
-            return source.read (side, d);
-
         float s = 0.0f;
 
         for (int ch = 0; ch < numSourceChannels; ++ch)
@@ -333,60 +300,37 @@ void Voice::addTo (float* const* out, int numOutChannels, int startSample, int n
         return s * sourceScale;
     };
 
-    const auto pitch = [&] (PitchShifter& engine, int side, float* result)
+    // Заливка окна питчера историей, которая предшествует первому сэмплу сегмента.
+    // Без неё нота открывалась бы тишиной длиной в латентность движка — 30 мс.
+    // Выход выбрасывается: он и есть та самая тишина.
+    if (needsPrime)
     {
-        // Заливка окна питчера историей, которая предшествует первому сэмплу сегмента.
-        // Без неё нота открывалась бы тишиной длиной в латентность движка — 30 мс.
-        // Выход выбрасывается: он и есть та самая тишина.
-        if (needsPrime)
+        float primeIn[primeChunk], primeOut[primeChunk];
+
+        for (int j = shifter->getLatencySamples(); j > 0; )
         {
-            float primeIn[primeChunk], primeOut[primeChunk];
+            const int n = std::min (j, primeChunk);
 
-            for (int j = engine.getLatencySamples(); j > 0; )
-            {
-                const int n = std::min (j, primeChunk);
+            for (int k = 0; k < n; ++k)
+                primeIn[k] = readMono (readOffset + static_cast<double> (numSamples + j - k));
 
-                for (int k = 0; k < n; ++k)
-                    primeIn[k] = read (side, readOffset + static_cast<double> (numSamples + j - k));
-
-                engine.process (primeIn, primeOut, n);
-                j -= n;
-            }
+            shifter->process (primeIn, primeOut, n);
+            j -= n;
         }
 
-        for (int k = 0; k < numSamples; ++k)
-            scratchIn[k] = read (side, readOffset + static_cast<double> (numSamples - k));
-
-        engine.process (scratchIn, result, numSamples);
-    };
-
-    pitch (*shifter, 0, scratchOut);
-
-    if (split)
-        pitch (*shifterRight, 1, scratchOutRight);
-
-    needsPrime = false;
-
-    if (! split)
-    {
-        for (int k = 0; k < numSamples; ++k)
-        {
-            const float s = scratchOut[k] * nextEnvelope();
-
-            for (int ch = 0; ch < numOutChannels; ++ch)
-                out[ch][startSample + k] += s * gain[ch < 2 ? ch : 1];
-        }
-
-        return;
+        needsPrime = false;
     }
 
     for (int k = 0; k < numSamples; ++k)
+        scratchIn[k] = readMono (readOffset + static_cast<double> (numSamples - k));
+
+    shifter->process (scratchIn, scratchOut, numSamples);
+
+    for (int k = 0; k < numSamples; ++k)
     {
-        const float envelope = nextEnvelope();
-        const float left = scratchOut[k] * envelope;
-        const float right = scratchOutRight[k] * envelope;
+        const float s = scratchOut[k] * nextEnvelope();
 
         for (int ch = 0; ch < numOutChannels; ++ch)
-            out[ch][startSample + k] += left * gain[ch < 2 ? ch : 1] + right * gainRight[ch < 2 ? ch : 1];
+            out[ch][startSample + k] += s * gain[ch < 2 ? ch : 1];
     }
 }
