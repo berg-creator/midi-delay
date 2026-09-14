@@ -1647,6 +1647,7 @@ macOS в этом прогоне тоже красная, но на pluginval �
 та же траектория, разница в младших битах). pluginval на Windows зелёный.
 `THIRD-PARTY-NOTICES.txt` в Windows-артефакте есть: `VST3/MIDI Delay.vst3/Contents/Resources/`,
 1250 строк, как в macOS.
+Второй прогон (`c7a8a76`, run 34819948347) — зелёный на обеих, числа те же до цифры.
 
 ---
 
