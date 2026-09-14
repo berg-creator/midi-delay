@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MIDI Delay by Berg</title>
+<meta name="description" content="MIDI Delay is a free VST3/AU delay whose echoes follow the notes you play. macOS and Windows.">
+<!-- Все ссылки на свои файлы — относительные: страница переезжает в berg.audio/midi-delay/ без правок (#49). -->
+<style>
+  :root {
+    --bg: #16171b; --panel: #1f2026; --line: #2c2e35;
+    --text: #e8e8ea; --muted: #9c9ea6; --accent: #4ec3ab; --accent-ink: #0f2a24;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 17px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 20px 64px; }
+  a { color: var(--accent); }
+  h1 { font-size: 44px; line-height: 1.1; margin: 4px 0 12px; letter-spacing: -0.02em; }
+  h2 { font-size: 24px; margin: 56px 0 16px; }
+  .brand { color: var(--muted); font-size: 14px; letter-spacing: 0.2em; text-transform: uppercase; }
+  .lead { font-size: 20px; color: var(--text); margin: 0 0 8px; }
+  .muted { color: var(--muted); }
+  .small { font-size: 14px; }
+  .buttons { display: flex; flex-wrap: wrap; gap: 12px; margin: 24px 0 8px; }
+  .button {
+    display: inline-block; padding: 12px 22px; border-radius: 8px; font-weight: 600;
+    background: var(--accent); color: var(--accent-ink); text-decoration: none; border: 0; font-size: 16px;
+    cursor: pointer;
+  }
+  .button.secondary { background: transparent; color: var(--text); box-shadow: inset 0 0 0 1px var(--line); }
+  .shot { display: block; width: 100%; max-width: 672px; height: auto; margin: 40px auto 0;
+          border-radius: 10px; border: 1px solid var(--line); }
+  ul { padding-left: 20px; }
+  li { margin: 6px 0; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
+  .card h3 { margin: 0 0 4px; font-size: 18px; }
+  .card p { margin: 8px 0; }
+  code { font-size: 14px; background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+  form { display: flex; flex-wrap: wrap; gap: 10px; margin: 16px 0 8px; }
+  input[type=email] {
+    flex: 1 1 240px; min-width: 0; padding: 12px 14px; border-radius: 8px; font-size: 16px;
+    background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  }
+  input[type=email]:focus, .button:focus-visible, summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+  details { border-top: 1px solid var(--line); padding: 14px 0; }
+  details:last-of-type { border-bottom: 1px solid var(--line); }
+  summary { cursor: pointer; font-weight: 600; }
+  details p, details ol { margin: 10px 0 0; }
+  footer { margin-top: 56px; color: var(--muted); font-size: 14px; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <div class="brand">Berg</div>
+  <h1>MIDI Delay</h1>
+  <p class="lead">A delay whose echoes sing the notes you play.</p>
+  <p class="muted">Free VST3 and AU plugin for macOS and Windows. No account, no license key, no trial.</p>
+  <div class="buttons">
+    <a class="button" href="#download">Download</a>
+    <a class="button secondary" href="#subscribe">Get release news</a>
+  </div>
+</header>
+
+<img class="shot" src="editor.png" width="672" height="854"
+     alt="MIDI Delay plugin window: a keyboard strip with four held notes above the Delay, Pitch, Envelope and Mix controls">
+
+<section>
+  <h2>What it does</h2>
+  <p>Put MIDI Delay on a vocal, or on any sound, and play notes into it. Every note starts
+  its own echo, transposed to that note. The vocal stops repeating itself and starts
+  repeating your melody.</p>
+  <ul>
+    <li><strong>Pitch from the note, loudness from velocity, length from note length.</strong> Up to eight notes at once.</li>
+    <li><strong>Two ways to play it.</strong> Free: a real delay, the melody comes back after the echo time.
+      Follow: the melody sings along with the vocal at the same moment.</li>
+    <li><strong>Two pitch engines.</strong> Fast, a light varispeed; and HQ, based on Signalsmith Stretch, with formant control.</li>
+    <li><strong>Tails that sit in a mix.</strong> Feedback, low and high cut, diffusion, modulation, ducking,
+      tempo sync, ping-pong and a tape character.</li>
+    <li><strong>Six presets to start from:</strong> Chord Pad, Arp Echo, Octave Drop, Ghost Choir, Sung Vocal, Dense Rap.</li>
+  </ul>
+</section>
+
+<section id="download">
+  <h2>Download</h2>
+  <p class="muted small">MIDI Delay 0.1.0 is not released yet. The buttons open the releases page on GitHub,
+  where the first build will appear. No sign-up needed to download.</p>
+  <div class="cards">
+    <div class="card">
+      <h3>macOS</h3>
+      <p class="muted small">macOS 11 or later, Apple Silicon and Intel. VST3 and AU, one installer.</p>
+      <p><a class="button" href="https://github.com/berg-creator/midi-delay/releases">Download for macOS</a></p>
+      <p class="small"><strong>The installer is not signed by Apple yet</strong>, so macOS will refuse to open it
+      the first time. Open System Settings &rarr; Privacy &amp; Security, scroll down and click
+      <em>Open Anyway</em>. After installation the plugin loads normally.</p>
+    </div>
+    <div class="card">
+      <h3>Windows</h3>
+      <p class="muted small">Windows 10 or 11, 64-bit. VST3.</p>
+      <p><a class="button" href="https://github.com/berg-creator/midi-delay/releases">Download for Windows</a></p>
+      <p class="small">Copy <code>MIDI Delay.vst3</code> into <code>C:\Program Files\Common Files\VST3</code>
+      and rescan plugins in your host.</p>
+    </div>
+  </div>
+</section>
+
+<section id="subscribe">
+  <h2>Get release news</h2>
+  <p>An email when MIDI Delay is released, and when the next Berg plugin comes out. Rarely, and nothing else.
+  Optional: the download never asks for it.</p>
+  <!-- KIT_FORM_ID — номер формы из аккаунта Kit (kit.com), вписывает следующая сессия (#49). -->
+  <form action="https://app.kit.com/forms/KIT_FORM_ID/subscriptions" method="post">
+    <label class="sr-only" for="email">Email address</label>
+    <input id="email" type="email" name="email_address" placeholder="you@example.com" autocomplete="email" required>
+    <button class="button" type="submit">Subscribe</button>
+  </form>
+  <p class="muted small">You will get one email to confirm. Addresses are stored by Kit and used only for these emails.
+  Every email has an unsubscribe link.</p>
+</section>
+
+<section id="faq">
+  <h2>FAQ</h2>
+
+  <details>
+    <summary>Is it really free?</summary>
+    <p>Yes. No account, no license key, no time limit, no features held back. MIDI Delay is the first
+    Berg plugin, and it is free so that people can find out what Berg makes.</p>
+  </details>
+
+  <details>
+    <summary>Which hosts does it work in?</summary>
+    <p>Any host that loads VST3 or AU effects and can send MIDI notes to an effect.
+    <strong>Tested so far: FL Studio 20.8 on macOS, VST3.</strong></p>
+    <p>Logic Pro, Ableton Live, Reaper, Studio One and FL Studio on Windows are not tested yet.
+    They are expected to work, but I have not checked them, so I do not promise it.
+    If you try one, a short report on GitHub helps a lot.</p>
+  </details>
+
+  <details>
+    <summary>How do I send MIDI to it in FL Studio?</summary>
+    <ol>
+      <li>Put MIDI Delay in a mixer slot on your vocal track.</li>
+      <li>Add a <em>MIDI Out</em> channel in the Channel Rack and set its Port, for example 18.</li>
+      <li>In the plugin window open the wrapper settings (second icon from the left) and set
+        MIDI <em>Input</em> port to the same number.</li>
+      <li>Draw notes in the piano roll of the MIDI Out channel and press Play.</li>
+    </ol>
+    <p>While no notes arrive, the plugin says so in its own window.</p>
+  </details>
+
+  <details>
+    <summary>Which operating systems?</summary>
+    <p>macOS 11 or later on Apple Silicon and Intel (VST3, AU), and Windows 10 or 11, 64-bit (VST3).
+    Tested on macOS 26. The Windows build is compiled and passes automated tests on every change,
+    but has not been tried in a host on a real Windows machine yet.</p>
+  </details>
+
+  <details>
+    <summary>Why no Linux?</summary>
+    <p>I have no Linux machine to test on, and a plugin nobody tested is how someone's project crashes.
+    A Linux version is not planned for now.</p>
+  </details>
+
+  <details>
+    <summary>Why no AAX for Pro Tools?</summary>
+    <p>AAX needs a separate developer agreement and signing with Avid. Not planned for now.</p>
+  </details>
+
+  <details>
+    <summary>Does it add latency?</summary>
+    <p>In Free mode, no: the plugin reports zero latency to the host, and the pitch engine's own delay is
+    hidden inside the echo time. That is why the shortest echo in HQ quality is 180 ms.
+    Follow mode, where the melody plays together with the vocal, asks the host for latency compensation.</p>
+  </details>
+
+  <details>
+    <summary>I found a bug. Where do I report it?</summary>
+    <p>On GitHub: <a href="https://github.com/berg-creator/midi-delay/issues">github.com/berg-creator/midi-delay/issues</a>.
+    Please include your host and its version, your OS, and what you did right before it happened.</p>
+    <p>Berg is one person. Reports are read, and crashes and wrong notes come first.
+    There is no guaranteed reply time, and feature requests may wait a long time or not happen at all.</p>
+  </details>
+</section>
+
+<footer>
+  MIDI Delay 0.1.0 &middot; Berg &middot;
+  <a href="https://github.com/berg-creator/midi-delay/issues">Report a bug</a>
+</footer>
+
+</main>
+</body>
+</html>

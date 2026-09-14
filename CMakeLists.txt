@@ -1,4 +1,12 @@
 cmake_minimum_required(VERSION 3.22)
+
+# Минимальная macOS — до project(), иначе не доходит до проверок компилятора. Без неё
+# CMake берёт версию SDK, и сборка с macOS 26 не грузилась ни на какой другой (S25).
+# 11.0 — первая macOS на Apple Silicon; JUCE 9 держит и ниже.
+if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING "" FORCE)
+endif()
+
 project(MidiDelay VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
