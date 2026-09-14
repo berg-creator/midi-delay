@@ -107,4 +107,10 @@ private:
     // Нота, ждущая конца fade-out внутри этого же голоса. Очередь на один элемент.
     int pendingNote = -1;
     float pendingVelocity = 0.0f, pendingRatio = 1.0f, pendingPan = 0.0f;
+    double pendingDelay = 2.0;
+
+    /** Кража сменит позицию чтения: время успели повернуть, или это второй голос хоровой
+        пары со своим сдвигом. Тогда перезапуск идёт со сбросом питчера (#25, сессия 24). */
+    bool stealMovesRead() const;
+    int samplesUntilStealEnds() const;
 };

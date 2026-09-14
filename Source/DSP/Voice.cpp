@@ -196,7 +196,7 @@ void Voice::steal (int midiNote, float velocity, float ratio, double newDelaySam
     pendingVelocity = velocity;
     pendingRatio = ratio;
     pendingPan = pan;
-    delaySamples = newDelaySamples;
+    pendingDelay = newDelaySamples;
 
     sustained = false;
     stage = Stage::stealing;
@@ -253,14 +253,27 @@ float Voice::nextEnvelope()
 
                 if (stage == Stage::stealing && pendingNote >= 0)
                 {
-                    // Голос перезапускается сам, посреди сегмента. Питчер при этом не
-                    // сбрасывается, и с varispeed это уже не удобство, а необходимость:
-                    // его окно хранит валидную историю по тому же readOffset, а сброс
-                    // открыл бы 30 мс тишины, залить которые отсюда нечем — источника
-                    // здесь нет. По той же причине здесь не меняется и движок: смена
-                    // Quality доедет до этого голоса со следующей ноты с чистого листа.
+                    // Голос перезапускается сам, посреди сегмента. Если позиция чтения
+                    // та же, питчер не сбрасывается: его окно хранит валидную историю
+                    // по тому же readOffset. Движок здесь не меняется: смена Quality
+                    // доедет до этого голоса со следующей ноты с чистого листа.
                     // Огибающая тут ровно ноль, ratio доедет к сегменту.
-                    setDelaySamples (delaySamples);
+                    //
+                    // Если позиция другая, окно хранит историю со старого места, а вход
+                    // пойдёт с нового — склейка на входе питчера. Огибающая её не прячет:
+                    // ноль у неё сейчас, а склейка выйдет из питчера через латентность,
+                    // когда атака уже доехала. HQ с Formants Hold раздувал её вдесятеро,
+                    // +16 dB на один блок (сессия 24). Поэтому сброс и заливка, как в noteOn;
+                    // addTo режет сегмент ровно здесь, и заливка встаёт на этот сэмпл.
+                    const bool moved = stealMovesRead();
+                    setDelaySamples (pendingDelay);
+
+                    if (moved && shifter != nullptr)
+                    {
+                        shifter->reset();
+                        needsPrime = true;
+                    }
+
                     start (pendingNote, pendingVelocity, pendingRatio, pendingPan);
                 }
                 else
@@ -300,37 +313,70 @@ void Voice::addTo (float* const* out, int numOutChannels, int startSample, int n
         return s * sourceScale;
     };
 
-    // Заливка окна питчера историей, которая предшествует первому сэмплу сегмента.
-    // Без неё нота открывалась бы тишиной длиной в латентность движка — 30 мс.
-    // Выход выбрасывается: он и есть та самая тишина.
-    if (needsPrime)
+    // Сегмент идёт кусками, и кусок один, кроме случая, когда кража посреди него сменит
+    // позицию чтения: тогда он режется на её конце, и остаток читается уже с нового места.
+    for (int done = 0; done < numSamples && stage != Stage::idle; )
     {
-        float primeIn[primeChunk], primeOut[primeChunk];
+        const int n = stage == Stage::stealing && stealMovesRead()
+                          ? std::min (numSamples - done, samplesUntilStealEnds())
+                          : numSamples - done;
 
-        for (int j = shifter->getLatencySamples(); j > 0; )
+        // Смещение первого сэмпла куска от конца записанного кольца. Складывается целым
+        // и только потом с readOffset — тот дробный, и другой порядок сложения сдвинул бы
+        // младшие биты на каждой ноте, а с ними и эталоны регрессии (#34).
+        const int end = numSamples - done;
+
+        // Заливка окна питчера историей, которая предшествует первому сэмплу куска.
+        // Без неё нота открывалась бы тишиной длиной в латентность движка — 30 мс.
+        // Выход выбрасывается: он и есть та самая тишина.
+        if (needsPrime)
         {
-            const int n = std::min (j, primeChunk);
+            float primeIn[primeChunk], primeOut[primeChunk];
 
-            for (int k = 0; k < n; ++k)
-                primeIn[k] = readMono (readOffset + static_cast<double> (numSamples + j - k));
+            for (int j = shifter->getLatencySamples(); j > 0; )
+            {
+                const int m = std::min (j, primeChunk);
 
-            shifter->process (primeIn, primeOut, n);
-            j -= n;
+                for (int k = 0; k < m; ++k)
+                    primeIn[k] = readMono (readOffset + static_cast<double> (end + j - k));
+
+                shifter->process (primeIn, primeOut, m);
+                j -= m;
+            }
+
+            needsPrime = false;
         }
 
-        needsPrime = false;
+        for (int k = 0; k < n; ++k)
+            scratchIn[k] = readMono (readOffset + static_cast<double> (end - k));
+
+        shifter->process (scratchIn, scratchOut, n);
+
+        for (int k = 0; k < n; ++k)
+        {
+            const float s = scratchOut[k] * nextEnvelope();
+
+            for (int ch = 0; ch < numOutChannels; ++ch)
+                out[ch][startSample + done + k] += s * gain[ch < 2 ? ch : 1];
+        }
+
+        done += n;
     }
+}
 
-    for (int k = 0; k < numSamples; ++k)
-        scratchIn[k] = readMono (readOffset + static_cast<double> (numSamples - k));
+bool Voice::stealMovesRead() const
+{
+    return pendingNote >= 0 && pendingDelay != delaySamples;
+}
 
-    shifter->process (scratchIn, scratchOut, numSamples);
+int Voice::samplesUntilStealEnds() const
+{
+    // Та же арифметика, что в nextEnvelope, без побочных эффектов: перезапуск случится
+    // на n-м сэмпле. Не больше длины кражи, 5 мс.
+    float p = phase;
+    int n = 0;
 
-    for (int k = 0; k < numSamples; ++k)
-    {
-        const float s = scratchOut[k] * nextEnvelope();
+    do { p -= step; ++n; } while (p > 0.0f);
 
-        for (int ch = 0; ch < numOutChannels; ++ch)
-            out[ch][startSample + k] += s * gain[ch < 2 ? ch : 1];
-    }
+    return n;
 }

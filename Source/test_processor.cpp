@@ -20,6 +20,7 @@
 #include <chrono>
 #include <thread>
 #include <algorithm>
+#include <numeric>
 #include <vector>
 
 // Не assert: сборка Release определяет NDEBUG, и assert превратился бы в пустоту —
@@ -1970,6 +1971,21 @@ int main (int argc, char* argv[])
             juce::AudioProcessor::copyXmlToBinary (*xml, futureBlock);
 
         proc.setStateInformation (futureBlock.getData(), static_cast<int> (futureBlock.getSize()));
+
+        // Галка после восстановления — ровная единица, а не сырое число хоста (#54).
+        // Шаги те же, что у pluginval: состояние снято при «включено», хост пишет в галку
+        // 0,69 — тоже «включено», — и состояние возвращается.
+        {
+            auto* sync = proc.apvts.getParameter ("sync");
+            sync->setValueNotifyingHost (1.0f);
+
+            juce::MemoryBlock withSync;
+            proc.getStateInformation (withSync);
+
+            sync->setValue (0.69f);
+            proc.setStateInformation (withSync.getData(), static_cast<int> (withSync.getSize()));
+            CHECK (sync->getValue() == 1.0f);
+        }
     }
 
     // --- Переключатель Quality (#38) -------------------------------------------
@@ -3769,6 +3785,9 @@ int main (int argc, char* argv[])
     // Ревизия. Места, где сигнал может разорваться, и что с каждым сделано:
     //   старт и стоп голоса        — огибающая attack/release, замер в разделе #16
     //   voice stealing             — отдельная стадия stealing со спадом, замер в #13
+    //   кража со сменой позиции    — время повернули, или второй голос хоровой пары:
+    //                                перезапуск со сбросом и заливкой питчера (сессия 24),
+    //                                замер в разделе сразу после стресса
     //   скачок delay time          — голос забирает время в noteOn и до конца ноты
     //                                не меняет (сессия 14, замер в разделе #20);
     //                                петля при этом проезжает кольцо задом наперёд,
@@ -3849,6 +3868,13 @@ int main (int argc, char* argv[])
             std::vector<int> sounding;
             sounding.reserve (16);
 
+            // Журнал рывков и нот — чтобы про худший шаг было видно, что его вызвало,
+            // а не гадать (сессия 24: на MSVC отношение 9,7, и неизвестно от чего).
+            struct Jerk { int block; const char* id; float value; };
+            struct NoteEvent { int block; int offset; int note; bool on; };
+            std::vector<Jerk> jerks;
+            std::vector<NoteEvent> notes;
+
             for (int b = 0; b < totalBlocks; ++b)
             {
                 for (int i = 0; i < blockSize; ++i)
@@ -3877,6 +3903,7 @@ int main (int argc, char* argv[])
                     const float v = juce::String (id) == "midiOffset"
                                         ? 0.5f + 0.5f * random.nextFloat() : random.nextFloat();
                     p->setValueNotifyingHost (v);
+                    jerks.push_back ({ b, id, v });
                 }
 
                 juce::MidiBuffer midi;
@@ -3886,16 +3913,19 @@ int main (int argc, char* argv[])
                 if (random.nextInt (3) == 0)
                 {
                     const int note = 48 + random.nextInt (36);
-                    midi.addEvent (juce::MidiMessage::noteOn (1, note, random.nextFloat() * 0.9f + 0.1f),
-                                   random.nextInt (blockSize));
+                    const float velocity = random.nextFloat() * 0.9f + 0.1f;
+                    const int offset = random.nextInt (blockSize);
+                    midi.addEvent (juce::MidiMessage::noteOn (1, note, velocity), offset);
                     sounding.push_back (note);
+                    notes.push_back ({ b, offset, note, true });
                 }
 
                 if (! sounding.empty() && random.nextInt (3) == 0)
                 {
                     const int index = random.nextInt (static_cast<int> (sounding.size()));
-                    midi.addEvent (juce::MidiMessage::noteOff (1, sounding[static_cast<size_t> (index)]),
-                                   random.nextInt (blockSize));
+                    const int offset = random.nextInt (blockSize);
+                    midi.addEvent (juce::MidiMessage::noteOff (1, sounding[static_cast<size_t> (index)]), offset);
+                    notes.push_back ({ b, offset, sounding[static_cast<size_t> (index)], false });
                     sounding.erase (sounding.begin() + index);
                 }
 
@@ -3915,12 +3945,40 @@ int main (int argc, char* argv[])
                 }
             }
 
+            // Три худших шага до того, как nth_element перемешает массив: где они
+            // и что им предшествовало. Шаг под номером k относится к блоку k / blockSize.
+            std::vector<size_t> order (steps.size());
+            std::iota (order.begin(), order.end(), size_t { 0 });
+            std::partial_sort (order.begin(), order.begin() + 3, order.end(),
+                               [&] (size_t x, size_t y) { return steps[x] > steps[y]; });
+
             const auto tail = steps.begin() + static_cast<long> (steps.size() * 999 / 1000);
+            std::vector<float> worstThree { steps[order[0]], steps[order[1]], steps[order[2]] };
             std::nth_element (steps.begin(), tail, steps.end());
 
             const double percentile = *tail;
             const double worst = *std::max_element (tail, steps.end());
             const double ratio = percentile > 1.0e-9 ? worst / percentile : 0.0;
+
+            for (size_t k = 0; k < 3; ++k)
+            {
+                const int blk = static_cast<int> (order[k] / blockSize);
+                std::printf ("    шаг %.4f: блок %d, отсчёт %d\n",
+                             worstThree[k], blk, static_cast<int> (order[k] % blockSize));
+
+                int shown = 0;
+                for (auto j = jerks.rbegin(); j != jerks.rend() && shown < 3; ++j)
+                    if (j->block <= blk)
+                    {
+                        std::printf ("      рывок %-10s = %.3f, %d бл. назад\n", j->id, j->value, blk - j->block);
+                        ++shown;
+                    }
+
+                for (const auto& n : notes)
+                    if (n.block >= blk - 2 && n.block <= blk)
+                        std::printf ("      %s %d: блок %d, отсчёт %d\n",
+                                     n.on ? "noteOn " : "noteOff", n.note, n.block, n.offset);
+            }
 
             std::printf ("  анти-клик %.0f кГц, %.0f с: худший шаг %.4f, 99,9%% %.4f, отношение %.1f\n",
                          rate.sr / 1000.0, rate.seconds, worst, percentile, ratio);
@@ -3931,6 +3989,78 @@ int main (int argc, char* argv[])
             CHECK (percentile > 1.0e-5);
             CHECK (ratio < 8.0);
         }
+    }
+
+    // --- Кража после поворота времени: без склейки в питчере (#25, сессия 24) ----
+    // Стресс нашёл это только на траектории MSVC: голос украден, когда время уже другое,
+    // и перезапускался с новой позицией чтения, но со старым окном питчера. Склейка
+    // выходила из питчера через латентность, на полной огибающей, и HQ с Formants Hold
+    // раздувал её до +16 dB. Один голос — чтобы кража была гарантированно.
+    {
+        constexpr double sr = 48000.0;
+        constexpr int blockSize = 512;
+
+        // Величина склейки зависит от того, в какую фазу материала попал прыжок чтения,
+        // поэтому целевых времён несколько, шагом около четверти периода, и берётся худшее.
+        double worst = 0.0;
+
+        for (int t = 0; t < 8; ++t)
+        {
+            const float target = 1500.0f + 1.3f * static_cast<float> (t);
+
+            MidiDelayProcessor proc;
+            engineDefaults (proc);
+            plainLoop (proc);
+            setParam (proc, "quality", 1.0f);
+            setParam (proc, "formants", 1.0f);
+            setParam (proc, "voices", 1.0f);
+            setParam (proc, "attack", 20.0f);   // короче латентности HQ: склейку огибающая не прячет
+            setParam (proc, "delayTime", 200.0f);
+            setParam (proc, "feedback", 0.0f);
+            setParam (proc, "mix", 100.0f);
+            setParam (proc, "outputGain", 0.0f);
+
+            proc.setPlayConfigDetails (2, 2, sr, blockSize);
+            proc.prepareToPlay (sr, blockSize);
+
+            juce::AudioBuffer<float> block (2, blockSize);
+            double phase = 0.0;
+            float before = 0.0f, after = 0.0f, settled = 0.0f;
+            const int stealBlock = static_cast<int> (1.5 * sr / blockSize);
+            const int second = static_cast<int> (sr / blockSize);
+
+            for (int b = 0; b < stealBlock + 2 * second; ++b)
+            {
+                for (int i = 0; i < blockSize; ++i)
+                {
+                    const auto v = static_cast<float> (0.3 * std::sin (phase) + 0.15 * std::sin (2.7 * phase));
+                    phase += juce::MathConstants<double>::twoPi * 196.0 / sr;
+                    block.setSample (0, i, v);
+                    block.setSample (1, i, v);
+                }
+
+                // Время поворачивается за треть секунды до кражи: рампа 50 мс доехала.
+                if (b == stealBlock - second / 3)
+                    setParam (proc, "delayTime", target);
+
+                runBlock (proc, block, b == 0 ? noteOnAt (100, 67)
+                                              : b == stealBlock ? noteOnAt (300, 72) : juce::MidiBuffer {});
+
+                const float peak = block.getMagnitude (0, 0, blockSize);
+                const int since = b - stealBlock;
+
+                if (since < 0 && since >= -second / 2) before  = std::max (before, peak);
+                if (since >= 0 && since < second)      after   = std::max (after, peak);
+                if (since >= second)                   settled = std::max (settled, peak);
+            }
+
+            CHECK (before > 0.05f && settled > 0.05f);   // голос звучал и до, и после
+            worst = std::max (worst, static_cast<double> (after / std::max (before, settled)));
+        }
+
+        std::printf ("  #25 кража после смены времени, HQ + Hold: пик после кражи к пику до и после — %.2f\n", worst);
+
+        CHECK (worst < 1.5);
     }
 
     // --- Огибающая: velocity, длительность ноты, короткая нота (#16) -----------

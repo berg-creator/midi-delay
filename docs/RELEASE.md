@@ -37,8 +37,7 @@ cmake --build build --target ProcessorTest && ./build/ProcessorTest_artefacts/Re
 Включает регрессионные рендеры DSP ([#34](ISSUES.md)): звук сверяется с эталонами
 в `tests/regression/`. Тесты буфера и питчера — одной командой clang из шапки
 `Source/DSP/test_delay_buffer.cpp` и `test_pitch_shifter.cpp`. pluginval — только
-с `--skip-gui-tests`, команда и известное расхождение [#54](ISSUES.md) — в
-[README.md](../README.md).
+с `--skip-gui-tests`, команда — в [README.md](../README.md).
 
 ## 3. Упаковка macOS
 

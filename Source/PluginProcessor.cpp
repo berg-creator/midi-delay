@@ -1131,6 +1131,16 @@ void MidiDelayProcessor::setStateInformation (const void* data, int sizeInBytes)
                                 static_cast<float> (state.getProperty ("editorScale", 1.0)));
 
     apvts.replaceState (state);
+
+    // Галки сворачиваются в ровные 0 и 1 (#54). AudioParameterBool хранит то сырое число,
+    // что записал хост, — 0,69 значит «включено», но getValue отдаёт 0,69. Если состояние
+    // несёт то же «включено», replaceState ничего не пишет, и обёртка VST3 в setComponentState
+    // отдаёт хосту эти 0,69 вместо единицы. pluginval это и ловил: падали только bool
+    // и всегда с тем числом, которое сам же записал. setValue, а не setValueNotifyingHost:
+    // значение по смыслу не меняется, и загрузка проекта не должна выглядеть автоматизацией.
+    for (auto* parameter : getParameters())
+        if (auto* flag = dynamic_cast<juce::AudioParameterBool*> (parameter))
+            parameter->setValue (flag->get() ? 1.0f : 0.0f);
 }
 
 //==============================================================================
